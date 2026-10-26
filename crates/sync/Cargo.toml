@@ -1,0 +1,21 @@
+[package]
+name = "manifold-sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Directory synchronization, SHA-256/binary diff planner, and multi-rename batch transformation engine for Manifold"
+
+[dependencies]
+heck.workspace = true
+indexmap.workspace = true
+log.workspace = true
+manifold-vfs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+

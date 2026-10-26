@@ -1,0 +1,38 @@
+# Rust / Cargo
+/target/
+target/
+**/*.rs.bk
+*.pdb
+
+# Gitea template files
+.gitea/workflows/*.template
+
+# Environments
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+ENV/
+env/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# IDEs and OS files
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+
+# Logs
+*.log

@@ -1,0 +1,22 @@
+[package]
+name = "manifold-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Dual-pane GUI state store, virtualized 500k+ entry viewport, Slint declarative components, and modals for Manifold"
+
+[dependencies]
+fontique.workspace = true
+indexmap.workspace = true
+log.workspace = true
+manifold-config.workspace = true
+manifold-preview.workspace = true
+manifold-sync.workspace = true
+manifold-transfer.workspace = true
+manifold-vfs.workspace = true
+manifold-vfs-remote.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+slint.workspace = true
+

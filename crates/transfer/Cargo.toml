@@ -1,0 +1,20 @@
+[package]
+name = "manifold-transfer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Prioritized file transfer engine, 4-8 MB chunked I/O, bandwidth limiter, and conflict resolution modal for Manifold"
+
+[dependencies]
+indexmap.workspace = true
+log.workspace = true
+manifold-vfs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
