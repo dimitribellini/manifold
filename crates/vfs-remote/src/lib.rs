@@ -818,13 +818,17 @@ pub struct TerminalCommandSpec {
     pub program: String,
     pub args: Vec<String>,
     pub working_dir: Option<PathBuf>,
+    /// Set when the launch is degraded, e.g. no terminal emulator in `$TERMINAL`.
+    pub warning: Option<String>,
 }
 
 /// Constructs validated local shell and remote SSH terminal launch commands.
 pub struct TerminalIntegration;
 
 impl TerminalIntegration {
-    /// Builds the command to open a local shell in `local_dir`.
+    /// Builds the command to open a local shell in `local_dir` through the terminal
+    /// emulator named by `$TERMINAL` (`$TERM_PROGRAM` is not a launch command: it is
+    /// the emulator identifying itself to the programs running inside it).
     pub fn build_local_terminal(
         local_dir: impl AsRef<Path>,
     ) -> Result<TerminalCommandSpec, VfsError> {
@@ -833,11 +837,47 @@ impl TerminalIntegration {
             return Err(VfsError::NotFound(dir.display().to_string()));
         }
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        Ok(TerminalCommandSpec {
-            program: shell,
-            args: vec!["-l".to_string()],
+        let emulator = std::env::var("TERMINAL").ok();
+        Ok(Self::local_terminal_spec(dir, &shell, emulator.as_deref()))
+    }
+
+    /// Terminal launch spec for `dir`. The emulator inherits `dir` as its working
+    /// directory, so it must honour the inherited CWD.
+    pub fn local_terminal_spec(
+        dir: &Path,
+        shell: &str,
+        emulator: Option<&str>,
+    ) -> TerminalCommandSpec {
+        // shortcut: `$TERMINAL` is read as a bare executable name, not a command line.
+        let term = emulator.map(str::trim).filter(|t| !t.is_empty());
+        let Some(term) = term else {
+            return TerminalCommandSpec {
+                program: shell.to_string(),
+                args: vec!["-l".to_string()],
+                working_dir: Some(dir.to_path_buf()),
+                warning: Some(
+                    "$TERMINAL is not set, opening $SHELL without a terminal emulator".to_string(),
+                ),
+            };
+        };
+        // NOTE: gnome-terminal, foot and xdg-terminal-exec take the command as
+        // trailing argv (foot ignores -e outright, xdg-terminal-exec rewrites the
+        // command line for the terminal it picks); the -e family (xterm, konsole,
+        // ghostty) execs the argv directly.
+        // shortcut: kitty is unverified; if `$TERMINAL` points there and the spawn
+        // fails, give it its own syntax instead of the -e form.
+        let args = match term.rsplit('/').next().unwrap_or(term) {
+            "gnome-terminal" | "foot" | "xdg-terminal-exec" => {
+                vec!["--".to_string(), shell.to_string(), "-l".to_string()]
+            }
+            _ => vec!["-e".to_string(), shell.to_string(), "-l".to_string()],
+        };
+        TerminalCommandSpec {
+            program: term.to_string(),
+            args,
             working_dir: Some(dir.to_path_buf()),
-        })
+            warning: None,
+        }
     }
 
     /// Builds the SSH command for a remote SFTP connection profile (`Section 3.8` of `BRIEF.md`):
@@ -878,6 +918,7 @@ impl TerminalIntegration {
             program: "ssh".to_string(),
             args,
             working_dir: None,
+            warning: None,
         })
     }
 }
@@ -912,6 +953,45 @@ mod tests {
 
         staging.purge_session("sess-1").unwrap();
         assert!(!staged_path.exists());
+    }
+
+    #[test]
+    fn test_local_terminal_spec_emulator_and_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        let shell = "/bin/bash";
+
+        // The -e family execs the argv directly.
+        let spec = TerminalIntegration::local_terminal_spec(dir, shell, Some("xterm"));
+        assert_eq!(spec.program, "xterm");
+        assert_eq!(spec.args, ["-e", shell, "-l"]);
+        assert_eq!(spec.working_dir, Some(dir.to_path_buf()));
+        assert_eq!(spec.warning, None);
+
+        // These three take the command as trailing argv, so `-l` needs the `--` guard.
+        for term in ["gnome-terminal", "foot", "xdg-terminal-exec"] {
+            let spec = TerminalIntegration::local_terminal_spec(dir, shell, Some(term));
+            assert_eq!(spec.program, term);
+            assert_eq!(spec.args, ["--", shell, "-l"]);
+        }
+
+        // `$TERMINAL` may be an absolute path; only the basename selects the syntax.
+        let spec = TerminalIntegration::local_terminal_spec(dir, shell, Some("/usr/bin/foot"));
+        assert_eq!(spec.program, "/usr/bin/foot");
+        assert_eq!(spec.args, ["--", shell, "-l"]);
+
+        // No emulator: plain shell fallback, flagged as a warning.
+        let plain = TerminalIntegration::local_terminal_spec(dir, shell, None);
+        assert_eq!(plain.program, shell);
+        assert_eq!(plain.args, ["-l"]);
+        assert_eq!(plain.working_dir, Some(dir.to_path_buf()));
+        assert!(plain.warning.is_some());
+        assert!(
+            TerminalIntegration::local_terminal_spec(dir, shell, Some("  "))
+                .warning
+                .is_some()
+        );
     }
 
     #[test]

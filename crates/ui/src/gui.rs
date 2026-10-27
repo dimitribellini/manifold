@@ -26,7 +26,7 @@ use manifold_vfs::{
     ArchiveBackend, ArchiveFormat, ColorLabel, FileMetadata, FileSystemBackend, LocalFsBackend,
     PermissionsMatrix,
 };
-use manifold_vfs_remote::{RemoteVfsBackend, TerminalIntegration};
+use manifold_vfs_remote::{RemoteVfsBackend, TerminalCommandSpec, TerminalIntegration};
 use slint::{Color, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
 use crate::{profile_to_vfs_url, ActivePane, ManifoldAppState, PanesLayout, SidebarItem};
@@ -1291,6 +1291,19 @@ fn reveal_in_system_file_manager(path: &str) {
         let _ = Command::new("open").args(["-R", path]).spawn();
     } else if let Some(parent) = Path::new(path).parent().and_then(|p| p.to_str()) {
         let _ = Command::new("xdg-open").arg(parent).spawn();
+    }
+}
+
+/// Spawns a terminal spec, returning the warning to surface when the launch was
+/// degraded (no `$TERMINAL`) or failed.
+fn spawn_terminal_spec(spec: &TerminalCommandSpec) -> Option<String> {
+    let spawn_res = Command::new(&spec.program)
+        .args(&spec.args)
+        .current_dir(spec.working_dir.as_deref().unwrap_or(Path::new(".")))
+        .spawn();
+    match spawn_res {
+        Err(err) => Some(format!("Failed to open terminal: {err}")),
+        Ok(_) => spec.warning.clone(),
     }
 }
 
@@ -2625,7 +2638,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                         guard.logs.push(format!("[SSH] {toast}"));
                         guard.show_toast("info", toast);
                     } else {
-                        if cfg!(target_os = "macos") {
+                        let warning: Option<String> = if cfg!(target_os = "macos") {
                             let target = if Path::new(&target_path).exists() {
                                 &target_path
                             } else {
@@ -2633,14 +2646,26 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                             };
                             let args = ["-a", "Terminal", target];
                             let _ = Command::new("open").args(args).spawn();
-                        } else if let Ok(spec) =
-                            TerminalIntegration::build_local_terminal(&target_path)
-                        {
-                            let _ = Command::new(&spec.program).args(&spec.args).spawn();
+                            None
+                        } else {
+                            match TerminalIntegration::build_local_terminal(&target_path) {
+                                Ok(spec) => spawn_terminal_spec(&spec),
+                                Err(err) => {
+                                    Some(format!("Cannot open terminal at {target_path}: {err}"))
+                                }
+                            }
+                        };
+                        match warning {
+                            Some(warning) => {
+                                guard.logs.push(format!("[TERM] {warning}"));
+                                guard.show_toast("warning", warning);
+                            }
+                            None => {
+                                let toast = format!("Opened terminal at {target_path}");
+                                guard.logs.push(format!("[TERM] {toast}"));
+                                guard.show_toast("info", toast);
+                            }
                         }
-                        let toast = format!("Opened terminal at {target_path}");
-                        guard.logs.push(format!("[TERM] {toast}"));
-                        guard.show_toast("info", toast);
                     }
                 }
                 "refresh" => {
@@ -4366,15 +4391,24 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
             let mut guard = rt.borrow_mut();
             let is_right = guard.is_right_effective();
             let dir = guard.current_pane_path(is_right);
-            if cfg!(target_os = "macos") {
+            let warning: Option<String> = if cfg!(target_os = "macos") {
                 let target = if Path::new(&dir).exists() { &dir } else { "/" };
                 let args = ["-a", "Terminal", target];
                 let _ = Command::new("open").args(args).spawn();
-            } else if let Ok(spec) = TerminalIntegration::build_local_terminal(".") {
-                let _ = Command::new(&spec.program).args(&spec.args).spawn();
+                None
+            } else {
+                match TerminalIntegration::build_local_terminal(&dir) {
+                    Ok(spec) => spawn_terminal_spec(&spec),
+                    Err(err) => Some(format!("Cannot open terminal at {dir}: {err}")),
+                }
+            };
+            match warning {
+                Some(warning) => {
+                    guard.logs.push(format!("[TERM] {warning}"));
+                    guard.show_toast("warning", warning);
+                }
+                None => guard.logs.push(format!("[TERM] Opened terminal at {dir}")),
             }
-            let msg = format!("[TERM] Opened terminal at {dir}");
-            guard.logs.push(msg);
             if let Some(w) = win_weak.upgrade() {
                 sync_window_from_runtime(&w, &mut guard);
             }
