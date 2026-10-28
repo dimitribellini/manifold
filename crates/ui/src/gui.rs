@@ -5,29 +5,30 @@
 //! Slint window defined in `crates/ui/ui/manifold.slint`.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
-use std::io::Write;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::rc::Rc;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use manifold_config::{
-    AuthType, ConnectionProfile, ConnectionsConfig, CredentialStore, PaneViewMode, ProtocolType,
-    SortColumn, SortDirection,
+    AppPreferences, AuthType, ConnectionProfile, ConnectionsConfig, CredentialStore,
+    FavoriteFolderEntry, PaneViewMode, ProtocolType, SortColumn, SortDirection,
 };
-use manifold_preview::{format_hex_dump, FileInspectorViewModel};
+use manifold_preview::FileInspectorViewModel;
 use manifold_sync::{ComparisonMode, SyncExecutionPlan, SyncStrategy};
 use manifold_transfer::{
-    ConflictModalDescriptor, ConflictResolution, TransferEngine, TransferPriority, TransferStatus,
-    TransferTask, DEFAULT_TRANSFER_CHUNK_SIZE,
+    ConflictModalDescriptor, ConflictResolution, TransferPriority, TransferStatus, TransferTask,
+    DEFAULT_TRANSFER_CHUNK_SIZE,
 };
 use manifold_vfs::{
     ArchiveBackend, ArchiveFormat, ColorLabel, FileMetadata, FileSystemBackend, LocalFsBackend,
     PermissionsMatrix,
 };
-use manifold_vfs_remote::{RemoteVfsBackend, TerminalIntegration};
-use slint::{Color, ModelRc, SharedString, Timer, TimerMode, VecModel};
+use manifold_vfs_remote::RemoteVfsBackend;
+use slint::{Color, Image, Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
 use crate::{profile_to_vfs_url, ActivePane, ManifoldAppState, PanesLayout, SidebarItem};
 
@@ -64,14 +65,214 @@ struct ResolvedDropTarget {
     hover_right_pane: bool,
 }
 
+enum BgWorkerEvent {
+    Progress {
+        task_id: String,
+        transferred: u64,
+        total: u64,
+        label: String,
+    },
+    Finished {
+        task_id: String,
+        ok_count: usize,
+        err_msg: Option<String>,
+        toast_msg: String,
+    },
+}
+
+struct InteractivePtyShell {
+    stdin_tx: mpsc::Sender<Vec<u8>>,
+    stdout_rx: mpsc::Receiver<String>,
+}
+
+impl InteractivePtyShell {
+    fn spawn(initial_cwd: &str) -> Option<Self> {
+        let start_dir = if Path::new(initial_cwd).is_dir() {
+            initial_cwd
+        } else {
+            "/"
+        };
+        let py_script = concat!(
+            "import os, pty, select, signal, sys, termios\n",
+            "master, slave = pty.openpty()\n",
+            "try:\n",
+            "    attrs = termios.tcgetattr(slave)\n",
+            "    attrs[3] = attrs[3] & ~termios.ECHO\n",
+            "    termios.tcsetattr(slave, termios.TCSANOW, attrs)\n",
+            "except Exception:\n",
+            "    pass\n",
+            "env = dict(os.environ)\n",
+            "env['PS1'] = ''\n",
+            "env['PROMPT_COMMAND'] = ''\n",
+            "env['TERM'] = 'dumb'\n",
+            "pid = os.fork()\n",
+            "if pid == 0:\n",
+            "    os.setsid()\n",
+            "    os.dup2(slave, 0)\n",
+            "    os.dup2(slave, 1)\n",
+            "    os.dup2(slave, 2)\n",
+            "    if slave > 2:\n",
+            "        os.close(slave)\n",
+            "    os.close(master)\n",
+            "    os.execve('/bin/sh', ['/bin/sh'], env)\n",
+            "os.close(slave)\n",
+            "while True:\n",
+            "    r, _, _ = select.select([0, master], [], [])\n",
+            "    if 0 in r:\n",
+            "        data = os.read(0, 4096)\n",
+            "        if not data:\n",
+            "            break\n",
+            "        if b'\\x03' in data:\n",
+            "            try:\n",
+            "                os.killpg(os.getpgid(pid), signal.SIGINT)\n",
+            "            except Exception:\n",
+            "                pass\n",
+            "        else:\n",
+            "            os.write(master, data)\n",
+            "    if master in r:\n",
+            "        try:\n",
+            "            out = os.read(master, 4096)\n",
+            "            if not out:\n",
+            "                break\n",
+            "            os.write(1, out)\n",
+            "        except OSError:\n",
+            "            break\n",
+        );
+        let child_res = Command::new("python3")
+            .args(["-u", "-c", py_script])
+            .current_dir(start_dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .or_else(|_| {
+                Command::new("sh")
+                    .current_dir(start_dir)
+                    .env("PS1", "")
+                    .env("TERM", "dumb")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+            });
+        let mut child = child_res.ok()?;
+        let mut child_in = child.stdin.take()?;
+        let mut child_out = child.stdout.take()?;
+
+        let (stdin_tx, stdin_rx) = mpsc::channel::<Vec<u8>>();
+        let (stdout_tx, stdout_rx) = mpsc::channel::<String>();
+
+        std::thread::spawn(move || {
+            while let Ok(bytes) = stdin_rx.recv() {
+                if child_in.write_all(&bytes).is_err() {
+                    break;
+                }
+                let _ = child_in.flush();
+            }
+            let _ = child.kill();
+        });
+
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match child_out.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let raw = String::from_utf8_lossy(&buf[..n]);
+                        let cleaned = strip_ansi_and_control_codes(&raw);
+                        if !cleaned.is_empty() && stdout_tx.send(cleaned).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        Some(Self {
+            stdin_tx,
+            stdout_rx,
+        })
+    }
+
+    fn send_line(&self, line: &str) -> bool {
+        let mut payload = line.as_bytes().to_vec();
+        payload.push(b'\n');
+        self.stdin_tx.send(payload).is_ok()
+    }
+
+    fn send_interrupt(&self) {
+        let _ = self.stdin_tx.send(vec![0x03]);
+    }
+
+    fn sync_cwd(&self, dir_path: &str) {
+        if !dir_path.contains("://") && Path::new(dir_path).is_dir() {
+            let escaped = dir_path.replace('\'', "'\\''");
+            let cmd = format!("cd -- '{escaped}' 2>/dev/null");
+            self.send_line(&cmd);
+        }
+    }
+}
+
+fn strip_ansi_and_control_codes(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            match chars.peek().copied() {
+                Some('[') => {
+                    let _ = chars.next();
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    let _ = chars.next();
+                    while let Some(c) = chars.next() {
+                        if c == '\x07' {
+                            break;
+                        }
+                        if c == '\x1b' && chars.peek() == Some(&'\\') {
+                            let _ = chars.next();
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        } else if ch != '\r' && (ch == '\n' || ch == '\t' || !ch.is_control()) {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+#[derive(Clone)]
+struct PendingBatchTransfer {
+    queue: VecDeque<FileMetadata>,
+    current_collision: Option<(FileMetadata, FileMetadata)>,
+    dst_dir: String,
+    is_move: bool,
+    clear_cut_clipboard: bool,
+    apply_all_policy: Option<ConflictResolution>,
+    sync_count: usize,
+    sync_bytes: u64,
+    first_name: String,
+    bg_pairs: Vec<(String, String, u64)>,
+}
+
 struct GuiRuntime {
     app_state: ManifoldAppState,
     local_vfs: LocalFsBackend,
     mounted_vfs: ArchiveBackend,
     remote_backends: HashMap<String, RemoteVfsBackend>,
     saved_connections: ConnectionsConfig,
+    prefs: AppPreferences,
     credential_store: CredentialStore,
-    transfer_engine: TransferEngine,
+    worker_tx: mpsc::Sender<BgWorkerEvent>,
+    worker_rx: mpsc::Receiver<BgWorkerEvent>,
+    bg_tasks_in_flight: usize,
     left_entries: Vec<FlattenedRowEntry>,
     right_entries: Vec<FlattenedRowEntry>,
     left_parent_entries: Vec<FileMetadata>,
@@ -86,7 +287,8 @@ struct GuiRuntime {
     left_forward_stack: Vec<String>,
     right_back_stack: Vec<String>,
     right_forward_stack: Vec<String>,
-    last_click: Option<(bool, String, Instant)>,
+    last_nav_instant: Option<Instant>,
+    last_hovered_cell: Option<(bool, i32)>,
     clipboard_paths: Vec<String>,
     clipboard_cut: bool,
     sidebar_targets: Vec<(String, String)>,
@@ -94,7 +296,7 @@ struct GuiRuntime {
     sidebar_context_idx: usize,
     transfers: Vec<TransferTask>,
     logs: Vec<String>,
-    pending_conflict: Option<(FileMetadata, FileMetadata, bool)>,
+    pending_batch: Option<PendingBatchTransfer>,
     pending_delete_permanent: bool,
     spinner_frame: i32,
     active_task_ticks: u32,
@@ -103,31 +305,89 @@ struct GuiRuntime {
     toast_ticks: u32,
     toast_text: String,
     toast_kind: String,
+    terminal_cwd: String,
+    terminal_output: String,
+    terminal_history: Vec<String>,
+    terminal_history_pos: usize,
+    pty_shell: Option<InteractivePtyShell>,
+    thumbnail_cache: HashMap<String, Option<Image>>,
+    dir_cache: RefCell<HashMap<String, Vec<FileMetadata>>>,
 }
 
 impl GuiRuntime {
-    fn new(app_state: ManifoldAppState) -> Self {
+    fn new(mut app_state: ManifoldAppState) -> Self {
         let mounted_vfs = ArchiveBackend::new("remote-mounts.tar", ArchiveFormat::Tar);
         let saved_connections = ConnectionsConfig::load_default();
+        let prefs = AppPreferences::load_default();
         let mut sidebar_colors = HashMap::new();
         for prof in &saved_connections.connections {
             if prof.color_label != ColorLabel::None {
                 sidebar_colors.insert(prof.id.clone(), prof.color_label);
             }
         }
+        for fav in &prefs.custom_favorites {
+            if fav.color_label != ColorLabel::None {
+                sidebar_colors.insert(fav.id.clone(), fav.color_label);
+            }
+            if let Some(sec) = app_state
+                .sidebar_sections
+                .iter_mut()
+                .find(|s| s.title == "Favorites")
+            {
+                if !sec.items.iter().any(|i| i.vfs_url == fav.vfs_url) {
+                    sec.items.push(SidebarItem {
+                        id: fav.id.clone(),
+                        label: fav.label.clone(),
+                        vfs_url: fav.vfs_url.clone(),
+                        icon_kind: fav.icon_kind.clone(),
+                        capacity_badge: None,
+                        can_eject: true,
+                        children: vec![],
+                        expanded: false,
+                    });
+                }
+            }
+        }
+        if !prefs.favorite_order.is_empty() {
+            if let Some(sec) = app_state
+                .sidebar_sections
+                .iter_mut()
+                .find(|s| s.title == "Favorites")
+            {
+                sec.items.sort_by_key(|item| {
+                    prefs
+                        .favorite_order
+                        .iter()
+                        .position(|k| k == &item.id || k == &item.vfs_url)
+                        .unwrap_or(usize::MAX)
+                });
+            }
+        }
         let credential_store = CredentialStore::with_os_backend();
+        let (worker_tx, worker_rx) = mpsc::channel();
         let init_log = "[INFO] Manifold VFS initialized (Local POSIX + Remote VFS).";
         let keyring_log = "[INFO] Keyring service bound to 'manifold'.";
         let mut init_sel = HashSet::new();
         init_sel.insert(0);
+        let init_cwd = app_state
+            .left_tabs
+            .first()
+            .map(|t| t.current_path.clone())
+            .unwrap_or_else(|| "/".to_string());
+        let pty_shell = InteractivePtyShell::spawn(&init_cwd);
+        let init_term_out =
+            format!("Manifold Interactive Shell ready ({init_cwd}). Type commands below.\n");
         let mut runtime = Self {
             app_state,
             local_vfs: LocalFsBackend::new(),
             mounted_vfs,
             remote_backends: HashMap::new(),
             saved_connections,
+            prefs,
             credential_store,
-            transfer_engine: TransferEngine::new(None),
+            worker_tx,
+            worker_rx,
+            bg_tasks_in_flight: 0,
             left_entries: Vec::new(),
             right_entries: Vec::new(),
             left_parent_entries: Vec::new(),
@@ -142,7 +402,8 @@ impl GuiRuntime {
             left_forward_stack: Vec::new(),
             right_back_stack: Vec::new(),
             right_forward_stack: Vec::new(),
-            last_click: None,
+            last_nav_instant: None,
+            last_hovered_cell: None,
             clipboard_paths: Vec::new(),
             clipboard_cut: false,
             sidebar_targets: Vec::new(),
@@ -150,7 +411,7 @@ impl GuiRuntime {
             sidebar_context_idx: 0,
             transfers: Vec::new(),
             logs: vec![init_log.to_string(), keyring_log.to_string()],
-            pending_conflict: None,
+            pending_batch: None,
             pending_delete_permanent: false,
             spinner_frame: 0,
             active_task_ticks: 0,
@@ -159,17 +420,289 @@ impl GuiRuntime {
             toast_ticks: 0,
             toast_text: String::new(),
             toast_kind: "info".to_string(),
+            terminal_cwd: init_cwd,
+            terminal_output: init_term_out,
+            terminal_history: Vec::new(),
+            terminal_history_pos: 0,
+            pty_shell,
+            thumbnail_cache: HashMap::new(),
+            dir_cache: RefCell::new(HashMap::new()),
         };
         runtime.reload_pane_entries(false);
         runtime.reload_pane_entries(true);
         runtime
     }
 
+    fn format_tab_title(&self, path: &str) -> String {
+        if let Some((prefix, sub)) = split_remote_uri(path) {
+            let conn_name = self
+                .saved_connections
+                .connections
+                .iter()
+                .find(|p| profile_to_vfs_url(p).starts_with(&prefix))
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| {
+                    prefix
+                        .split_once("://")
+                        .map(|(_, auth)| auth.to_string())
+                        .unwrap_or_else(|| prefix.clone())
+                });
+            let clean_sub = if sub.is_empty() { "/" } else { sub.as_str() };
+            return format!("{conn_name}: {clean_sub}");
+        }
+        vfs_display_title(path)
+    }
+
+    fn sync_terminal_cwd(&mut self) {
+        let active_path = self.current_pane_path(self.is_right_effective());
+        if self.terminal_cwd != active_path {
+            self.terminal_cwd = active_path.clone();
+            if let Some(pty) = &self.pty_shell {
+                pty.sync_cwd(&active_path);
+            }
+        }
+    }
+
+    fn poll_pty_output(&mut self) -> bool {
+        let Some(pty) = &self.pty_shell else {
+            return false;
+        };
+        let mut appended = false;
+        while let Ok(chunk) = pty.stdout_rx.try_recv() {
+            if !chunk.is_empty() {
+                if !self.terminal_output.is_empty() && !self.terminal_output.ends_with('\n') {
+                    self.terminal_output.push('\n');
+                }
+                self.terminal_output.push_str(&chunk);
+                appended = true;
+            }
+        }
+        if appended && self.terminal_output.len() > 12000 {
+            let drain_to = self.terminal_output.len() - 10000;
+            let _ = self.terminal_output.drain(..drain_to);
+        }
+        appended
+    }
+
+    fn pin_folder_to_favorites(&mut self, folder_path: &str, label: &str) {
+        let vfs_url = if folder_path.contains("://") {
+            folder_path.to_string()
+        } else {
+            format!("file://{folder_path}")
+        };
+        let fav_id = format!("fav-pin-{}", self.prefs.custom_favorites.len() + 1);
+        let fav_entry = FavoriteFolderEntry {
+            id: fav_id.clone(),
+            label: label.to_string(),
+            vfs_url: vfs_url.clone(),
+            icon_kind: "folder".to_string(),
+            color_label: ColorLabel::None,
+        };
+        self.prefs.upsert_favorite(fav_entry);
+        let _ = self.prefs.save_default();
+
+        let fav_sec = self
+            .app_state
+            .sidebar_sections
+            .iter_mut()
+            .find(|s| s.title == "Favorites");
+        if let Some(sec) = fav_sec {
+            let exists = sec.items.iter().any(|i| i.vfs_url == vfs_url);
+            if !exists {
+                sec.items.push(SidebarItem {
+                    id: fav_id,
+                    label: label.to_string(),
+                    vfs_url,
+                    icon_kind: "folder".to_string(),
+                    capacity_badge: None,
+                    can_eject: true,
+                    children: vec![],
+                    expanded: false,
+                });
+            }
+        }
+        let msg = format!("[FAVORITES] Pinned {label} ({folder_path})");
+        self.logs.push(msg);
+        let toast = format!("Added \"{label}\" to Favorites");
+        self.show_toast("success", toast);
+    }
+
+    fn reorder_favorites_by_item_ids(&mut self, from_id: &str, to_id: &str) -> bool {
+        if from_id.is_empty() || to_id.is_empty() || from_id == to_id {
+            return false;
+        }
+        let Some(sec) = self
+            .app_state
+            .sidebar_sections
+            .iter_mut()
+            .find(|s| s.title == "Favorites")
+        else {
+            return false;
+        };
+        let Some(from_pos) = sec.items.iter().position(|i| i.id == from_id) else {
+            return false;
+        };
+        let Some(to_pos) = sec.items.iter().position(|i| i.id == to_id) else {
+            return false;
+        };
+        let item = sec.items.remove(from_pos);
+        sec.items.insert(to_pos, item);
+        self.prefs.favorite_order = sec.items.iter().map(|i| i.id.clone()).collect();
+        let _ = self.prefs.save_default();
+        true
+    }
+
+    fn move_favorite_step(&mut self, item_id: &str, delta: isize) -> bool {
+        let Some(sec) = self
+            .app_state
+            .sidebar_sections
+            .iter_mut()
+            .find(|s| s.title == "Favorites")
+        else {
+            return false;
+        };
+        let Some(pos) = sec.items.iter().position(|i| i.id == item_id) else {
+            return false;
+        };
+        let next_isize = (pos as isize + delta).clamp(0, sec.items.len() as isize - 1);
+        let next_pos = next_isize as usize;
+        if next_pos == pos {
+            return false;
+        }
+        let item = sec.items.remove(pos);
+        sec.items.insert(next_pos, item);
+        self.prefs.favorite_order = sec.items.iter().map(|i| i.id.clone()).collect();
+        let _ = self.prefs.save_default();
+        true
+    }
+
+    fn spawn_bg_transfer_batch(
+        &mut self,
+        pairs: Vec<(String, String, u64)>,
+        is_move: bool,
+        label: String,
+        dst_dir: String,
+        toast_msg: String,
+    ) {
+        if pairs.is_empty() {
+            return;
+        }
+        let total_bytes: u64 = pairs.iter().map(|(_, _, sz)| (*sz).max(4096)).sum();
+        let task_id = format!("tx-{}", self.transfers.len() + 1);
+        let task = TransferTask {
+            id: task_id.clone(),
+            priority: TransferPriority::Foreground,
+            source_path: label.clone(),
+            destination_path: dst_dir,
+            total_bytes,
+            transferred_bytes: 0,
+            chunk_size: DEFAULT_TRANSFER_CHUNK_SIZE,
+            max_retries: 3,
+            status: TransferStatus::InProgress,
+            error_message: None,
+        };
+        self.transfers.insert(0, task);
+        if self.transfers.len() > 24 {
+            self.transfers.truncate(24);
+        }
+        self.bg_tasks_in_flight += 1;
+        self.active_task_label = label.clone();
+        self.active_task_progress = 5;
+        let start_toast = format!("Started: {label}");
+        self.show_toast("copy", start_toast);
+
+        let tx = self.worker_tx.clone();
+        let remotes = self.remote_backends.clone();
+        std::thread::spawn(move || {
+            let local_vfs = LocalFsBackend::new();
+            let mut transferred_so_far = 0u64;
+            let mut ok_count = 0usize;
+            let mut last_err: Option<String> = None;
+
+            for (src_path, dst_path, item_sz) in pairs {
+                let step_sz = item_sz.max(4096);
+                let _ = tx.send(BgWorkerEvent::Progress {
+                    task_id: task_id.clone(),
+                    transferred: transferred_so_far,
+                    total: total_bytes,
+                    label: label.clone(),
+                });
+                let res = perform_bg_single_transfer(
+                    &local_vfs,
+                    &remotes,
+                    &src_path,
+                    &dst_path,
+                    is_move,
+                    (&tx, &task_id, &label, transferred_so_far, total_bytes),
+                );
+                match res {
+                    Ok(()) => {
+                        transferred_so_far = transferred_so_far.saturating_add(step_sz);
+                        ok_count += 1;
+                    }
+                    Err(e) => {
+                        last_err = Some(e);
+                    }
+                }
+            }
+
+            let _ = tx.send(BgWorkerEvent::Finished {
+                task_id,
+                ok_count,
+                err_msg: last_err,
+                toast_msg,
+            });
+        });
+    }
+
     fn show_toast(&mut self, kind: &str, message: String) {
         self.toast_kind = kind.to_string();
         self.toast_text = message;
-        self.toast_ticks = 55;
+        self.toast_ticks = 0;
         play_system_sound(kind);
+    }
+
+    fn invalidate_dir_cache(&self) {
+        self.dir_cache.borrow_mut().clear();
+    }
+
+    fn vfs_metadata(&self, path: &str) -> Option<FileMetadata> {
+        if let Some(parent) = vfs_parent_dir(path) {
+            if let Some(entries) = self.dir_cache.borrow().get(&parent) {
+                if let Some(found) = entries.iter().find(|m| m.path == path) {
+                    return Some(found.clone());
+                }
+            }
+        }
+        if let Some((prefix, remote_sub)) = split_remote_uri(path) {
+            let remote = self.remote_backends.get(&prefix)?;
+            let mut meta = remote.metadata(&remote_sub).ok()?;
+            meta.path = format!("{prefix}{}", meta.path);
+            return Some(meta);
+        }
+        self.mounted_vfs
+            .metadata(path)
+            .ok()
+            .or_else(|| self.local_vfs.metadata(path).ok())
+    }
+
+    fn unique_keep_both_path(&self, dst_dir: &str, name: &str) -> String {
+        let (stem, ext_sfx) = split_name_stem_ext(name);
+        let mut idx = 2u32;
+        loop {
+            let cand_name = format!("{stem} {idx}{ext_sfx}");
+            let cand_path = join_vfs_path(dst_dir, &cand_name);
+            if self.vfs_metadata(&cand_path).is_none() {
+                return cand_path;
+            }
+            idx += 1;
+        }
+    }
+
+    fn active_conflict(&self) -> Option<(FileMetadata, FileMetadata, bool)> {
+        let batch = self.pending_batch.as_ref()?;
+        let (src, ex) = batch.current_collision.as_ref()?;
+        Some((src.clone(), ex.clone(), batch.is_move))
     }
 
     fn start_tracked_task(
@@ -346,6 +879,7 @@ impl GuiRuntime {
     }
 
     fn vfs_create_dir(&self, path: &str) -> Result<(), String> {
+        self.invalidate_dir_cache();
         if let Some((prefix, remote_sub)) = split_remote_uri(path) {
             let remote = self
                 .remote_backends
@@ -357,6 +891,7 @@ impl GuiRuntime {
     }
 
     fn vfs_remove(&self, path: &str, recursive: bool) -> Result<(), String> {
+        self.invalidate_dir_cache();
         if let Some((prefix, remote_sub)) = split_remote_uri(path) {
             let remote = self
                 .remote_backends
@@ -372,6 +907,7 @@ impl GuiRuntime {
     }
 
     fn vfs_rename(&self, from: &str, to: &str) -> Result<(), String> {
+        self.invalidate_dir_cache();
         if let (Some((p1, sub1)), Some((p2, sub2))) = (split_remote_uri(from), split_remote_uri(to))
         {
             if p1 == p2 {
@@ -400,6 +936,7 @@ impl GuiRuntime {
     }
 
     fn vfs_write_bytes(&self, path: &str, data: &[u8]) -> Result<(), String> {
+        self.invalidate_dir_cache();
         if let Some((prefix, remote_sub)) = split_remote_uri(path) {
             let remote = self
                 .remote_backends
@@ -415,6 +952,7 @@ impl GuiRuntime {
     }
 
     fn vfs_copy_entry(&self, src_path: &str, dst_path: &str) -> Result<(), String> {
+        self.invalidate_dir_cache();
         let src_slash = format!("{}/", src_path.trim_end_matches('/'));
         if dst_path == src_path || dst_path.starts_with(&src_slash) {
             return Err("Cannot copy or move a folder into itself".to_string());
@@ -474,6 +1012,7 @@ impl GuiRuntime {
     }
 
     fn vfs_move_entry(&self, src_path: &str, dst_path: &str) -> Result<(), String> {
+        self.invalidate_dir_cache();
         let src_slash = format!("{}/", src_path.trim_end_matches('/'));
         if dst_path == src_path || dst_path.starts_with(&src_slash) {
             return Err("Cannot move a folder into itself".to_string());
@@ -577,9 +1116,16 @@ impl GuiRuntime {
             abs_x - 212.0
         };
 
-        // 2. Tab Bar Hit-Testing
+        // 2. Tab Bar Hit-Testing (Responsive to Pane Width & Tab Count)
         if (36.0..=76.0).contains(&abs_y) {
-            let tab_idx = ((rel_x - 6.0) / 154.0).floor() as isize;
+            let tab_count = if target_is_right {
+                self.app_state.right_tabs.len().max(1) as f32
+            } else {
+                self.app_state.left_tabs.len().max(1) as f32
+            };
+            let avail_w = pane_w - 48.0 - (tab_count - 1.0).max(0.0) * 6.0;
+            let tab_w = (avail_w / tab_count).clamp(56.0, 184.0);
+            let tab_idx = ((rel_x - 8.0) / (tab_w + 6.0)).floor() as isize;
             if tab_idx >= 0 {
                 let u_idx = tab_idx as usize;
                 let tab_opt = if target_is_right {
@@ -731,128 +1277,242 @@ impl GuiRuntime {
         res
     }
 
-    fn execute_drop_target(&mut self, items: &[FileMetadata], dst_dir: &str, is_move: bool) {
+    fn begin_batch_transfer(
+        &mut self,
+        items: Vec<FileMetadata>,
+        dst_dir: String,
+        is_move: bool,
+        clear_cut_clipboard: bool,
+    ) {
         if items.is_empty() {
             return;
         }
-        if let Some((prefix, _)) = split_remote_uri(dst_dir) {
+        if let Some((prefix, _)) = split_remote_uri(&dst_dir) {
             self.ensure_remote_connected(&prefix);
         }
-        let mut count = 0usize;
-        let mut total_bytes = 0u64;
         let first_name = items[0].name.clone();
-        for src_meta in items {
+        self.pending_batch = Some(PendingBatchTransfer {
+            queue: VecDeque::from(items),
+            current_collision: None,
+            dst_dir,
+            is_move,
+            clear_cut_clipboard,
+            apply_all_policy: None,
+            sync_count: 0,
+            sync_bytes: 0,
+            first_name,
+            bg_pairs: Vec::new(),
+        });
+        self.advance_batch_transfer();
+    }
+
+    fn apply_resolved_batch_item(
+        &mut self,
+        batch: &mut PendingBatchTransfer,
+        src_meta: &FileMetadata,
+        ex_meta: Option<&FileMetadata>,
+        policy: ConflictResolution,
+    ) -> bool {
+        let mut final_dst = join_vfs_path(&batch.dst_dir, &src_meta.name);
+        let mut remove_existing = false;
+
+        if let Some(ex) = ex_meta {
+            match policy {
+                ConflictResolution::Stop => return false,
+                ConflictResolution::Skip => {
+                    let msg = format!("[CONFLICT] Skipped {}", src_meta.name);
+                    self.logs.push(msg);
+                    return true;
+                }
+                ConflictResolution::Replace => {
+                    if src_meta.path == ex.path {
+                        return true;
+                    }
+                    remove_existing = true;
+                }
+                ConflictResolution::ReplaceOlder => {
+                    let is_newer = match (src_meta.modified, ex.modified) {
+                        (Some(s), Some(e)) => s > e,
+                        _ => true,
+                    };
+                    if !is_newer || src_meta.path == ex.path {
+                        let msg = format!("[CONFLICT] Kept newer existing {}", src_meta.name);
+                        self.logs.push(msg);
+                        return true;
+                    }
+                    remove_existing = true;
+                }
+                ConflictResolution::KeepBoth => {
+                    final_dst = self.unique_keep_both_path(&batch.dst_dir, &src_meta.name);
+                }
+                _ => {}
+            }
+        }
+
+        if remove_existing && final_dst != src_meta.path {
+            let _ = self.vfs_remove(&final_dst, true);
+        }
+
+        let src_remote = split_remote_uri(&src_meta.path).is_some();
+        let dst_remote = split_remote_uri(&batch.dst_dir).is_some();
+        let sz = src_meta.size.unwrap_or(4096);
+        if src_remote || dst_remote || sz >= 4 * 1024 * 1024 {
+            batch.bg_pairs.push((src_meta.path.clone(), final_dst, sz));
+        } else {
+            let ok = if batch.is_move {
+                self.vfs_move_entry(&src_meta.path, &final_dst).is_ok()
+            } else {
+                self.vfs_copy_entry(&src_meta.path, &final_dst).is_ok()
+            };
+            if ok {
+                batch.sync_bytes += sz;
+                let tag = if batch.is_move { "MOVE" } else { "COPY" };
+                let msg = format!("[{tag}] {} -> {final_dst}", src_meta.name);
+                self.logs.push(msg);
+                batch.sync_count += 1;
+            }
+        }
+        true
+    }
+
+    fn advance_batch_transfer(&mut self) {
+        let Some(mut batch) = self.pending_batch.take() else {
+            return;
+        };
+        while let Some(src_meta) = batch.queue.pop_front() {
             if let Some((prefix, _)) = split_remote_uri(&src_meta.path) {
                 self.ensure_remote_connected(&prefix);
             }
-            let dst_path = join_vfs_path(dst_dir, &src_meta.name);
-            if dst_path == src_meta.path {
+            let dst_path = join_vfs_path(&batch.dst_dir, &src_meta.name);
+            if batch.is_move && dst_path == src_meta.path {
                 continue;
             }
-            let ok = if is_move {
-                self.vfs_move_entry(&src_meta.path, &dst_path).is_ok()
-            } else {
-                self.vfs_copy_entry(&src_meta.path, &dst_path).is_ok()
-            };
-            if ok {
-                total_bytes += src_meta.size.unwrap_or(4096);
-                let tag = if is_move { "DRAG-MOVE" } else { "DRAG-COPY" };
-                let msg = format!("[{tag}] {} -> {dst_path}", src_meta.name);
-                self.logs.push(msg);
-                count += 1;
+            if let Some(ex_meta) = self.vfs_metadata(&dst_path) {
+                if let Some(policy) = batch.apply_all_policy {
+                    let keep_going = self.apply_resolved_batch_item(
+                        &mut batch,
+                        &src_meta,
+                        Some(&ex_meta),
+                        policy,
+                    );
+                    if !keep_going {
+                        break;
+                    }
+                    continue;
+                }
+                batch.current_collision = Some((src_meta, ex_meta));
+                self.pending_batch = Some(batch);
+                return;
+            }
+            let _ = self.apply_resolved_batch_item(
+                &mut batch,
+                &src_meta,
+                None,
+                ConflictResolution::Replace,
+            );
+        }
+        self.finalize_batch_transfer(batch);
+    }
+
+    fn resolve_batch_conflict(&mut self, policy: ConflictResolution, apply_all: bool) {
+        let Some(mut batch) = self.pending_batch.take() else {
+            return;
+        };
+        if apply_all && policy != ConflictResolution::Stop {
+            batch.apply_all_policy = Some(policy);
+        }
+        if let Some((src_meta, ex_meta)) = batch.current_collision.take() {
+            let keep_going =
+                self.apply_resolved_batch_item(&mut batch, &src_meta, Some(&ex_meta), policy);
+            if !keep_going {
+                self.finalize_batch_transfer(batch);
+                return;
             }
         }
-        if count > 0 {
-            let dst_title = vfs_display_title(dst_dir);
-            let verb = if is_move { "Moved" } else { "Copied" };
+        self.pending_batch = Some(batch);
+        self.advance_batch_transfer();
+    }
+
+    fn finalize_batch_transfer(&mut self, batch: PendingBatchTransfer) {
+        if batch.clear_cut_clipboard && (batch.sync_count > 0 || !batch.bg_pairs.is_empty()) {
+            self.clipboard_paths.clear();
+            self.clipboard_cut = false;
+        }
+        let dst_title = self.format_tab_title(&batch.dst_dir);
+        let verb = if batch.is_move { "Moved" } else { "Copied" };
+        let first_name = batch.first_name;
+        if !batch.bg_pairs.is_empty() {
+            let n = batch.bg_pairs.len();
+            let label = if n == 1 {
+                format!("{verb} {first_name}")
+            } else {
+                format!("{verb} {n} items")
+            };
+            let toast = format!("{label} to {dst_title}");
+            self.spawn_bg_transfer_batch(
+                batch.bg_pairs,
+                batch.is_move,
+                label,
+                batch.dst_dir.clone(),
+                toast,
+            );
+        }
+        if batch.sync_count > 0 {
+            let count = batch.sync_count;
             let label = if count == 1 {
                 format!("{verb} {first_name}")
             } else {
                 format!("{verb} {count} items")
             };
             let toast = format!("{label} to {dst_title}");
-            self.start_tracked_task(&label, dst_dir, total_bytes, toast, "success");
+            self.start_tracked_task(&label, &batch.dst_dir, batch.sync_bytes, toast, "success");
+            self.invalidate_dir_cache();
             self.reload_pane_entries(false);
             self.reload_pane_entries(true);
         }
     }
 
-    fn paste_clipboard_into(&mut self, dst_dir: &str) -> usize {
+    fn execute_drop_target(&mut self, items: &[FileMetadata], dst_dir: &str, is_move: bool) {
+        self.begin_batch_transfer(items.to_vec(), dst_dir.to_string(), is_move, false);
+    }
+
+    fn paste_clipboard_into(&mut self, dst_dir: &str) {
         if self.clipboard_paths.is_empty() {
-            return 0;
+            return;
         }
         let sources = self.clipboard_paths.clone();
         let is_cut = self.clipboard_cut;
-        let mut count = 0usize;
-        let mut total_bytes = 0u64;
-        let mut first_name = String::new();
-
+        let mut items = Vec::with_capacity(sources.len());
         for src_path in &sources {
-            let name = vfs_file_name(src_path);
-            if first_name.is_empty() {
-                first_name = name.clone();
+            if let Some((prefix, _)) = split_remote_uri(src_path) {
+                self.ensure_remote_connected(&prefix);
             }
-            if let Ok(m) = self.backend_for_path(src_path).metadata(src_path) {
-                total_bytes += m.size.unwrap_or(4096);
+            if let Some(meta) = self.vfs_metadata(src_path) {
+                items.push(meta);
             } else {
-                total_bytes += 4096;
-            }
-            let mut dst_path = join_vfs_path(dst_dir, &name);
-
-            if is_cut {
-                if src_path == &dst_path {
-                    continue;
-                }
-                let moved = if self.vfs_rename(src_path, &dst_path).is_ok() {
-                    true
-                } else if self.vfs_copy_entry(src_path, &dst_path).is_ok() {
-                    let _ = self.vfs_remove(src_path, true);
-                    true
-                } else {
-                    false
-                };
-                if moved {
-                    let msg = format!("[MOVE] {src_path} -> {dst_path}");
-                    self.logs.push(msg);
-                    count += 1;
-                }
-            } else {
-                if src_path == &dst_path
-                    || (split_remote_uri(&dst_path).is_none() && Path::new(&dst_path).exists())
-                {
-                    let (stem, ext_sfx) = split_name_stem_ext(&name);
-                    dst_path = join_vfs_path(dst_dir, &format!("{stem} copy{ext_sfx}"));
-                    let mut idx = 2u32;
-                    while split_remote_uri(&dst_path).is_none() && Path::new(&dst_path).exists() {
-                        let cand = format!("{stem} copy {idx}{ext_sfx}");
-                        dst_path = join_vfs_path(dst_dir, &cand);
-                        idx += 1;
-                    }
-                }
-                if self.vfs_copy_entry(src_path, &dst_path).is_ok() {
-                    let msg = format!("[PASTE] {src_path} -> {dst_path}");
-                    self.logs.push(msg);
-                    count += 1;
-                }
+                let name = vfs_file_name(src_path);
+                items.push(FileMetadata {
+                    name,
+                    path: src_path.clone(),
+                    extension: None,
+                    kind: "Document".to_string(),
+                    size: Some(4096),
+                    is_dir: false,
+                    is_symlink: false,
+                    is_hidden: false,
+                    is_locked: false,
+                    hide_extension: false,
+                    color_label: ColorLabel::None,
+                    modified: None,
+                    created: None,
+                    added: None,
+                    permissions: 0o644,
+                    owner: None,
+                    group: None,
+                });
             }
         }
-
-        if is_cut && count > 0 {
-            self.clipboard_paths.clear();
-            self.clipboard_cut = false;
-        }
-        if count > 0 {
-            let dst_title = vfs_display_title(dst_dir);
-            let verb = if is_cut { "Moved" } else { "Pasted" };
-            let label = if count == 1 {
-                format!("{verb} {first_name}")
-            } else {
-                format!("{verb} {count} items")
-            };
-            let toast = format!("{label} to {dst_title}");
-            self.start_tracked_task(&label, dst_dir, total_bytes, toast, "success");
-        }
-        count
+        self.begin_batch_transfer(items, dst_dir.to_string(), is_cut, is_cut);
     }
 
     fn current_pane_path(&self, is_right: bool) -> String {
@@ -923,7 +1583,7 @@ impl GuiRuntime {
         if let Some((prefix, _)) = split_remote_uri(&new_path) {
             self.ensure_remote_connected(&prefix);
         }
-        let title = vfs_display_title(&new_path);
+        let title = self.format_tab_title(&new_path);
         let vfs_url = if new_path.contains("://") {
             new_path.clone()
         } else {
@@ -959,14 +1619,10 @@ impl GuiRuntime {
         self.reload_pane_entries(is_right);
     }
 
-    fn list_sorted_dir(
-        &self,
-        dir_path: &str,
-        show_hidden: bool,
-        query: &str,
-        sort_col: SortColumn,
-        sort_dir: SortDirection,
-    ) -> Vec<FileMetadata> {
+    fn list_raw_dir_cached(&self, dir_path: &str) -> Vec<FileMetadata> {
+        if let Some(cached) = self.dir_cache.borrow().get(dir_path) {
+            return cached.clone();
+        }
         let raw_items = if let Some((prefix, remote_sub)) = split_remote_uri(dir_path) {
             if let Some(remote) = self.remote_backends.get(&prefix) {
                 let mut entries = remote.list_directory(&remote_sub).unwrap_or_default();
@@ -982,11 +1638,28 @@ impl GuiRuntime {
         } else {
             self.local_vfs.list_directory(dir_path).unwrap_or_default()
         };
+        let mut cache = self.dir_cache.borrow_mut();
+        if cache.len() > 64 {
+            cache.clear();
+        }
+        cache.insert(dir_path.to_string(), raw_items.clone());
+        raw_items
+    }
 
+    fn list_sorted_dir(
+        &self,
+        dir_path: &str,
+        show_hidden: bool,
+        query: &str,
+        sort_col: SortColumn,
+        sort_dir: SortDirection,
+    ) -> Vec<FileMetadata> {
+        let raw_items = self.list_raw_dir_cached(dir_path);
+        let q_low = query.trim().to_lowercase();
         let mut filtered: Vec<FileMetadata> = raw_items
             .into_iter()
             .filter(|m| show_hidden || !m.is_hidden)
-            .filter(|m| matches_search_query(m, query))
+            .filter(|m| matches_search_query_lower(m, &q_low))
             .collect();
 
         sort_metadata_slice(&mut filtered, sort_col, sort_dir);
@@ -1032,18 +1705,20 @@ impl GuiRuntime {
         } else {
             self.app_state.left_tabs.get(self.app_state.left_active_tab)
         };
-        let (sort_col, sort_dir, inline_filter, expanded) = match active_tab {
+        let (sort_col, sort_dir, inline_filter, expanded, view_mode) = match active_tab {
             Some(t) => (
                 t.sort_column,
                 t.sort_direction,
                 t.inline_filter.clone(),
                 t.expanded_folders.clone(),
+                t.view_mode,
             ),
             None => (
                 SortColumn::Name,
                 SortDirection::Ascending,
                 String::new(),
                 HashSet::new(),
+                PaneViewMode::List,
             ),
         };
 
@@ -1051,18 +1726,22 @@ impl GuiRuntime {
         let opts = (inline_filter.as_str(), sort_col, sort_dir);
         self.collect_flattened_rows(&path, 0, &expanded, opts, &mut flattened);
 
-        let parent_items = vfs_parent_dir(&path)
-            .filter(|p| p != &path)
-            .map(|parent_path| {
-                self.list_sorted_dir(
-                    &parent_path,
-                    show_hidden,
-                    "",
-                    SortColumn::Name,
-                    SortDirection::Ascending,
-                )
-            })
-            .unwrap_or_default();
+        let parent_items = if view_mode == PaneViewMode::Columns {
+            vfs_parent_dir(&path)
+                .filter(|p| p != &path)
+                .map(|parent_path| {
+                    self.list_sorted_dir(
+                        &parent_path,
+                        show_hidden,
+                        "",
+                        SortColumn::Name,
+                        SortDirection::Ascending,
+                    )
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
 
         if is_right {
             self.right_entries = flattened;
@@ -1101,6 +1780,7 @@ impl GuiRuntime {
                 }
             }
         }
+        self.sync_terminal_cwd();
         self.refresh_headers_and_inspector();
     }
 
@@ -1127,7 +1807,8 @@ impl GuiRuntime {
                 .or_else(|_| self.local_vfs.volume_stats("/"))
                 .ok()
         };
-        let right_vol = if split_remote_uri(&right_path).is_some() {
+        let r_rem = split_remote_uri(&right_path).is_some();
+        let right_vol = if !self.app_state.dual_pane_enabled || r_rem {
             None
         } else {
             self.local_vfs
@@ -1141,11 +1822,16 @@ impl GuiRuntime {
             .iter()
             .filter_map(|&i| self.left_entries.get(i).map(|r| &r.meta))
             .collect();
+        let left_hdr_sel: &[&FileMetadata] = if left_sel.len() == 1 && left_sel[0].size.is_none() {
+            &[]
+        } else {
+            &left_sel
+        };
         self.app_state.left_header = crate::PathAndStatusHeader::build(
             Some(root_vol_name),
             &left_path,
             self.left_entries.len(),
-            &left_sel,
+            left_hdr_sel,
             left_vol,
         );
 
@@ -1154,11 +1840,17 @@ impl GuiRuntime {
             .iter()
             .filter_map(|&i| self.right_entries.get(i).map(|r| &r.meta))
             .collect();
+        let right_hdr_sel: &[&FileMetadata] = if right_sel.len() == 1 && right_sel[0].size.is_none()
+        {
+            &[]
+        } else {
+            &right_sel
+        };
         self.app_state.right_header = crate::PathAndStatusHeader::build(
             Some(root_vol_name),
             &right_path,
             self.right_entries.len(),
-            &right_sel,
+            right_hdr_sel,
             right_vol,
         );
 
@@ -1196,11 +1888,14 @@ impl GuiRuntime {
         };
 
         if let Some(meta) = self.selected_metadata().cloned() {
-            let sample = if meta.is_dir || split_remote_uri(&meta.path).is_some() {
-                None
-            } else {
+            let need_sample = self.app_state.inspector_open
+                && !meta.is_dir
+                && split_remote_uri(&meta.path).is_none();
+            let sample = if need_sample {
                 let vfs = self.backend_for_path(&meta.path);
                 vfs.read_range(&meta.path, 0, 512).ok()
+            } else {
+                None
             };
             let modified = meta.formatted_modified_datetime();
             let mut vm = FileInspectorViewModel::from_metadata(&meta, &modified, sample.as_deref());
@@ -1240,6 +1935,7 @@ impl GuiRuntime {
         };
 
         if meta.is_dir {
+            self.last_nav_instant = Some(Instant::now());
             let msg = format!("[OPEN] Directory -> {}", meta.path);
             self.logs.push(msg);
             self.navigate_to_path(is_right, meta.path);
@@ -1251,32 +1947,7 @@ impl GuiRuntime {
     }
 }
 
-fn play_system_sound(kind: &str) {
-    if cfg!(target_os = "macos") {
-        let sound_file = match kind {
-            "delete" => "/System/Library/Sounds/Funk.aiff",
-            "copy" | "cut" => "/System/Library/Sounds/Tink.aiff",
-            _ => "/System/Library/Sounds/Glass.aiff",
-        };
-        let _ = Command::new("afplay")
-            .arg(sound_file)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-    } else {
-        let event_id = match kind {
-            "delete" => "trash-empty",
-            _ => "message-new-instant",
-        };
-        let _ = Command::new("canberra-gtk-play")
-            .args(["-i", event_id])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-    }
-}
+const fn play_system_sound(_kind: &str) {}
 
 fn open_with_system_handler(path: &str) {
     if cfg!(target_os = "macos") {
@@ -1401,18 +2072,23 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
     pi == p.len()
 }
 
-fn matches_search_query(meta: &FileMetadata, query: &str) -> bool {
-    let q = query.trim().to_lowercase();
-    if q.is_empty() {
+fn matches_search_query_lower(meta: &FileMetadata, q_low: &str) -> bool {
+    if q_low.is_empty() {
         return true;
     }
     let name = meta.name.to_lowercase();
-    if q.contains('*') || q.contains('?') {
-        let anchored = format!("*{q}*");
-        wildcard_match(&q, &name) || wildcard_match(&anchored, &name)
+    if q_low.contains('*') || q_low.contains('?') {
+        let anchored = format!("*{q_low}*");
+        wildcard_match(q_low, &name) || wildcard_match(&anchored, &name)
     } else {
-        name.contains(&q)
+        name.contains(q_low)
     }
+}
+
+#[cfg(test)]
+fn matches_search_query(meta: &FileMetadata, query: &str) -> bool {
+    let q_low = query.trim().to_lowercase();
+    matches_search_query_lower(meta, &q_low)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1670,7 +2346,260 @@ fn int_to_view_mode(v: i32) -> PaneViewMode {
     }
 }
 
+fn perform_bg_single_transfer(
+    local_vfs: &LocalFsBackend,
+    remotes: &HashMap<String, RemoteVfsBackend>,
+    src_path: &str,
+    dst_path: &str,
+    is_move: bool,
+    prog: (&mpsc::Sender<BgWorkerEvent>, &str, &str, u64, u64),
+) -> Result<(), String> {
+    let src_slash = format!("{}/", src_path.trim_end_matches('/'));
+    if dst_path == src_path || dst_path.starts_with(&src_slash) {
+        return Err("Cannot copy or move a folder into itself".to_string());
+    }
+    let (tx, task_id, label, base_transferred, total_bytes) = prog;
+    let src_rem = split_remote_uri(src_path);
+    let dst_rem = split_remote_uri(dst_path);
+
+    match (src_rem, dst_rem) {
+        // 1. Same-Remote copy or move
+        (Some((p1, sub1)), Some((p2, sub2))) if p1 == p2 => {
+            let remote = remotes
+                .get(&p1)
+                .ok_or_else(|| "Remote VFS not connected".to_string())?;
+            if is_move {
+                return remote.rename(&sub1, &sub2).map_err(|e| e.to_string());
+            }
+            return remote.copy_file(&sub1, &sub2).map_err(|e| e.to_string());
+        }
+        // 2. Local -> Remote (Direct streaming via scp without reading multi-GB ISO into RAM)
+        (None, Some((p2, sub2))) => {
+            let remote = remotes
+                .get(&p2)
+                .ok_or_else(|| "Remote VFS not connected".to_string())?;
+            if Path::new(src_path).is_dir() {
+                let _ = remote.create_dir(&sub2);
+                if let Ok(entries) = local_vfs.list_directory(src_path) {
+                    for child in entries {
+                        let child_dst = join_vfs_path(dst_path, &child.name);
+                        perform_bg_single_transfer(
+                            local_vfs,
+                            remotes,
+                            &child.path,
+                            &child_dst,
+                            false,
+                            prog,
+                        )?;
+                    }
+                }
+            } else {
+                remote
+                    .upload_local_file(Path::new(src_path), &sub2)
+                    .map_err(|e| e.to_string())?;
+            }
+            if is_move {
+                let _ = local_vfs.remove(src_path, true);
+            }
+            return Ok(());
+        }
+        // 3. Remote -> Local (Direct streaming via scp without buffering multi-GB ISO in RAM)
+        (Some((p1, sub1)), None) => {
+            let remote = remotes
+                .get(&p1)
+                .ok_or_else(|| "Remote VFS not connected".to_string())?;
+            let is_dir = remote.metadata(&sub1).is_ok_and(|m| m.is_dir);
+            if is_dir {
+                let _ = local_vfs.create_dir(dst_path);
+                if let Ok(entries) = remote.list_directory(&sub1) {
+                    for child in entries {
+                        let child_src = format!("{p1}{}", child.path);
+                        let child_dst = join_vfs_path(dst_path, &child.name);
+                        perform_bg_single_transfer(
+                            local_vfs, remotes, &child_src, &child_dst, false, prog,
+                        )?;
+                    }
+                }
+            } else {
+                remote
+                    .download_to_local_file(&sub1, Path::new(dst_path))
+                    .map_err(|e| e.to_string())?;
+            }
+            if is_move {
+                let _ = remote.remove(&sub1, true);
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    // 4. Local -> Local (4 MB chunked streaming with live progress updates)
+    if is_move && local_vfs.rename(src_path, dst_path).is_ok() {
+        return Ok(());
+    }
+    if Path::new(src_path).is_dir() {
+        let status = Command::new("cp").args(["-R", src_path, dst_path]).status();
+        if !status.is_ok_and(|s| s.success()) {
+            return Err("Failed to copy directory".to_string());
+        }
+        if is_move {
+            let _ = local_vfs.remove(src_path, true);
+        }
+        return Ok(());
+    }
+    let mut reader = std::fs::File::open(src_path).map_err(|e| e.to_string())?;
+    let mut writer = std::fs::File::create(dst_path).map_err(|e| e.to_string())?;
+    let mut buf = vec![0u8; 4 * 1024 * 1024];
+    let mut copied = 0u64;
+    loop {
+        let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        writer.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+        copied += n as u64;
+        let _ = tx.send(BgWorkerEvent::Progress {
+            task_id: task_id.to_string(),
+            transferred: base_transferred.saturating_add(copied),
+            total: total_bytes,
+            label: label.to_string(),
+        });
+    }
+    if is_move {
+        let _ = local_vfs.remove(src_path, true);
+    }
+    Ok(())
+}
+
+fn apply_preferences_to_window(w: &ManifoldWindow, prefs: &AppPreferences) {
+    let norm_family = match prefs.font_family.trim() {
+        "" | "sans-serif" | "System Sans" => "sans-serif",
+        "Inter" | "Inter / UI" => "Inter",
+        "monospace" | "Monospace" => "monospace",
+        "serif" | "Serif" => "serif",
+        other => other,
+    };
+    let resolved_family = match norm_family {
+        "Inter" => {
+            if cfg!(target_os = "macos") {
+                "Avenir Next"
+            } else {
+                "DejaVu Sans"
+            }
+        }
+        "monospace" => {
+            if cfg!(target_os = "macos") {
+                "Menlo"
+            } else {
+                "DejaVu Sans Mono"
+            }
+        }
+        "serif" => {
+            if cfg!(target_os = "macos") {
+                "Georgia"
+            } else {
+                "DejaVu Serif"
+            }
+        }
+        _ => "",
+    };
+    let norm_theme = match prefs.theme_preset.trim() {
+        "midnight_ocean" | "Midnight Ocean" => "midnight_ocean",
+        "dracula_pro" | "Dracula Pro" => "dracula_pro",
+        "nordic_slate" | "Nordic Slate" => "nordic_slate",
+        "solarized_dark" | "Solarized Dark" => "solarized_dark",
+        "high_contrast" | "High Contrast" => "high_contrast",
+        _ => "dark_zinc",
+    };
+
+    w.set_ui_font_size_delta(prefs.font_size_delta);
+    w.set_ui_font_family(norm_family.into());
+    w.set_resolved_font_family(resolved_family.into());
+    w.set_ui_font_bold(prefs.font_bold);
+    w.set_ui_theme_preset(norm_theme.into());
+
+    let (canvas, toolbar, sidebar, surface, border, accent, hover, text_pri, text_sec) =
+        match norm_theme {
+            "midnight_ocean" => (
+                Color::from_rgb_u8(0x0B, 0x11, 0x20),
+                Color::from_rgb_u8(0x13, 0x1B, 0x2E),
+                Color::from_rgb_u8(0x0F, 0x17, 0x2A),
+                Color::from_rgb_u8(0x16, 0x20, 0x35),
+                Color::from_rgb_u8(0x23, 0x32, 0x4E),
+                Color::from_rgb_u8(0x02, 0x84, 0xC7),
+                Color::from_rgb_u8(0x1E, 0x2D, 0x47),
+                Color::from_rgb_u8(0xF1, 0xF5, 0xF9),
+                Color::from_rgb_u8(0x94, 0xA3, 0xB8),
+            ),
+            "dracula_pro" => (
+                Color::from_rgb_u8(0x19, 0x1A, 0x21),
+                Color::from_rgb_u8(0x21, 0x22, 0x2C),
+                Color::from_rgb_u8(0x1E, 0x1F, 0x29),
+                Color::from_rgb_u8(0x28, 0x2A, 0x36),
+                Color::from_rgb_u8(0x3B, 0x3E, 0x52),
+                Color::from_rgb_u8(0x8B, 0x5C, 0xF6),
+                Color::from_rgb_u8(0x34, 0x37, 0x46),
+                Color::from_rgb_u8(0xF8, 0xF8, 0xF2),
+                Color::from_rgb_u8(0xA4, 0xA8, 0xC4),
+            ),
+            "nordic_slate" => (
+                Color::from_rgb_u8(0x1D, 0x21, 0x2A),
+                Color::from_rgb_u8(0x24, 0x29, 0x33),
+                Color::from_rgb_u8(0x21, 0x26, 0x30),
+                Color::from_rgb_u8(0x2E, 0x34, 0x40),
+                Color::from_rgb_u8(0x3B, 0x42, 0x52),
+                Color::from_rgb_u8(0x5E, 0x81, 0xAC),
+                Color::from_rgb_u8(0x3B, 0x42, 0x52),
+                Color::from_rgb_u8(0xEC, 0xEF, 0xF4),
+                Color::from_rgb_u8(0x9C, 0xA6, 0xB8),
+            ),
+            "solarized_dark" => (
+                Color::from_rgb_u8(0x00, 0x1E, 0x26),
+                Color::from_rgb_u8(0x00, 0x2B, 0x36),
+                Color::from_rgb_u8(0x00, 0x24, 0x2E),
+                Color::from_rgb_u8(0x07, 0x36, 0x42),
+                Color::from_rgb_u8(0x16, 0x4B, 0x58),
+                Color::from_rgb_u8(0x26, 0x8B, 0xD2),
+                Color::from_rgb_u8(0x0D, 0x42, 0x50),
+                Color::from_rgb_u8(0xEE, 0xE8, 0xD5),
+                Color::from_rgb_u8(0x93, 0xA1, 0xA1),
+            ),
+            "high_contrast" => (
+                Color::from_rgb_u8(0x05, 0x05, 0x07),
+                Color::from_rgb_u8(0x11, 0x11, 0x15),
+                Color::from_rgb_u8(0x09, 0x09, 0x0B),
+                Color::from_rgb_u8(0x0C, 0x0C, 0x0F),
+                Color::from_rgb_u8(0x3F, 0x3F, 0x48),
+                Color::from_rgb_u8(0x25, 0x63, 0xEB),
+                Color::from_rgb_u8(0x22, 0x22, 0x2A),
+                Color::from_rgb_u8(0xFF, 0xFF, 0xFF),
+                Color::from_rgb_u8(0xC4, 0xC4, 0xCE),
+            ),
+            _ => (
+                Color::from_rgb_u8(0x12, 0x12, 0x14),
+                Color::from_rgb_u8(0x1E, 0x1E, 0x22),
+                Color::from_rgb_u8(0x16, 0x16, 0x18),
+                Color::from_rgb_u8(0x1A, 0x1A, 0x1E),
+                Color::from_rgb_u8(0x28, 0x28, 0x2D),
+                Color::from_rgb_u8(0x0D, 0x52, 0xBF),
+                Color::from_rgb_u8(0x26, 0x26, 0x2B),
+                Color::from_rgb_u8(0xE1, 0xE1, 0xE6),
+                Color::from_rgb_u8(0x88, 0x88, 0x92),
+            ),
+        };
+    w.set_theme_bg_canvas(canvas.into());
+    w.set_theme_bg_toolbar(toolbar.into());
+    w.set_theme_bg_sidebar(sidebar.into());
+    w.set_theme_bg_surface(surface.into());
+    w.set_theme_border(border.into());
+    w.set_theme_accent(accent.into());
+    w.set_theme_row_hover(hover.into());
+    w.set_theme_text_primary(text_pri.into());
+    w.set_theme_text_secondary(text_sec.into());
+}
+
 fn sync_window_from_runtime(window: &ManifoldWindow, rt: &mut GuiRuntime) {
+    apply_preferences_to_window(window, &rt.prefs);
     let folder_title = rt.app_state.toolbar.active_folder_title.clone();
     let show_hidden = rt.app_state.toolbar.show_hidden_files;
     let dual_mode = rt.app_state.dual_pane_enabled;
@@ -1692,6 +2621,7 @@ fn sync_window_from_runtime(window: &ManifoldWindow, rt: &mut GuiRuntime) {
         PanesLayout::SplitVertical => 2,
     };
 
+    let is_task_active = rt.active_task_ticks > 0 || rt.bg_tasks_in_flight > 0;
     window.set_active_folder_title(folder_title.into());
     window.set_show_hidden_files(show_hidden);
     if window.get_search_query().as_str() != rt.app_state.toolbar.search_query {
@@ -1704,13 +2634,31 @@ fn sync_window_from_runtime(window: &ManifoldWindow, rt: &mut GuiRuntime) {
     window.set_can_go_back(can_back);
     window.set_can_go_forward(can_fwd);
     window.set_has_clipboard_item(!rt.clipboard_paths.is_empty());
-    window.set_task_running(rt.active_task_ticks > 0);
+    window.set_task_running(is_task_active);
     window.set_spinner_frame(rt.spinner_frame);
     window.set_active_task_label(rt.active_task_label.clone().into());
     window.set_active_task_progress(rt.active_task_progress);
     window.set_show_toast(rt.toast_ticks > 0);
     window.set_toast_text(rt.toast_text.clone().into());
     window.set_toast_kind(rt.toast_kind.clone().into());
+
+    // Embedded Bottom Terminal state sync
+    window.set_terminal_cwd(rt.terminal_cwd.clone().into());
+    window.set_terminal_output(rt.terminal_output.clone().into());
+    let (term_session_lbl, term_prompt_str) =
+        if let Some((_, sub)) = split_remote_uri(&rt.terminal_cwd) {
+            let conn_title = rt.format_tab_title(&rt.terminal_cwd);
+            let leaf = vfs_display_title(&sub);
+            (
+                format!("Remote SSH Terminal — {conn_title}"),
+                format!("ssh:{leaf}$"),
+            )
+        } else {
+            let leaf = vfs_display_title(&rt.terminal_cwd);
+            ("Embedded Local Terminal".to_string(), format!("{leaf}$"))
+        };
+    window.set_terminal_session_label(term_session_lbl.into());
+    window.set_terminal_prompt(term_prompt_str.into());
 
     let active_dir = rt.current_pane_path(is_right_active);
 
@@ -1796,17 +2744,8 @@ fn sync_window_from_runtime(window: &ManifoldWindow, rt: &mut GuiRuntime) {
 
     let l_crumbs = rt.app_state.left_header.formatted_breadcrumbs.clone();
     let l_sub = rt.app_state.left_header.status_subtitle.clone();
-    let l_raw_segs = crate::PathAndStatusHeader::clickable_segments(root_label, &l_cur_path);
-    let l_seg_len = l_raw_segs.len();
-    let l_segs: Vec<BreadcrumbSegmentSlint> = l_raw_segs
-        .into_iter()
-        .enumerate()
-        .map(|(idx, (lbl, target))| BreadcrumbSegmentSlint {
-            label: SharedString::from(lbl),
-            target_path: SharedString::from(target),
-            is_last: idx + 1 == l_seg_len,
-        })
-        .collect();
+    let (l_hdr_icon, l_segs) = build_pane_header_breadcrumbs(root_label, &l_cur_path);
+    window.set_left_header_icon(l_hdr_icon.into());
     window.set_left_breadcrumbs(l_crumbs.into());
     window.set_left_breadcrumb_segments(ModelRc::new(VecModel::from(l_segs)));
     if !window.get_left_path_edit_mode() {
@@ -1847,15 +2786,20 @@ fn sync_window_from_runtime(window: &ManifoldWindow, rt: &mut GuiRuntime) {
         .map(|(idx, t)| {
             let q = t.inline_filter.trim();
             let is_search = !q.is_empty();
+            let is_remote = split_remote_uri(&t.current_path).is_some();
+            let tab_icon = tab_icon_for_path(&t.current_path, is_search, is_remote);
             let tab_title = if is_search {
                 format!("Search: \"{q}\"")
             } else {
-                t.title.clone()
+                rt.format_tab_title(&t.current_path)
             };
             TabEntrySlint {
                 title: SharedString::from(tab_title),
+                tooltip: SharedString::from(&t.current_path),
+                icon_kind: SharedString::from(tab_icon),
                 is_active: idx == rt.app_state.left_active_tab,
                 is_search,
+                is_remote,
             }
         })
         .collect();
@@ -1863,17 +2807,8 @@ fn sync_window_from_runtime(window: &ManifoldWindow, rt: &mut GuiRuntime) {
 
     let r_crumbs = rt.app_state.right_header.formatted_breadcrumbs.clone();
     let r_sub = rt.app_state.right_header.status_subtitle.clone();
-    let r_raw_segs = crate::PathAndStatusHeader::clickable_segments(root_label, &r_cur_path);
-    let r_seg_len = r_raw_segs.len();
-    let r_segs: Vec<BreadcrumbSegmentSlint> = r_raw_segs
-        .into_iter()
-        .enumerate()
-        .map(|(idx, (lbl, target))| BreadcrumbSegmentSlint {
-            label: SharedString::from(lbl),
-            target_path: SharedString::from(target),
-            is_last: idx + 1 == r_seg_len,
-        })
-        .collect();
+    let (r_hdr_icon, r_segs) = build_pane_header_breadcrumbs(root_label, &r_cur_path);
+    window.set_right_header_icon(r_hdr_icon.into());
     window.set_right_breadcrumbs(r_crumbs.into());
     window.set_right_breadcrumb_segments(ModelRc::new(VecModel::from(r_segs)));
     if !window.get_right_path_edit_mode() {
@@ -1914,44 +2849,202 @@ fn sync_window_from_runtime(window: &ManifoldWindow, rt: &mut GuiRuntime) {
         .map(|(idx, t)| {
             let q = t.inline_filter.trim();
             let is_search = !q.is_empty();
+            let is_remote = split_remote_uri(&t.current_path).is_some();
+            let tab_icon = tab_icon_for_path(&t.current_path, is_search, is_remote);
             let tab_title = if is_search {
                 format!("Search: \"{q}\"")
             } else {
-                t.title.clone()
+                rt.format_tab_title(&t.current_path)
             };
             TabEntrySlint {
                 title: SharedString::from(tab_title),
+                tooltip: SharedString::from(&t.current_path),
+                icon_kind: SharedString::from(tab_icon),
                 is_active: idx == rt.app_state.right_active_tab,
                 is_search,
+                is_remote,
             }
         })
         .collect();
     window.set_right_tabs(ModelRc::new(VecModel::from(r_tabs)));
 
     // Rows, 3-Column Polaroid Icon Triples, and Miller Parent Columns
-    let l_rows = build_slint_rows_from_flattened(&rt.left_entries, &rt.left_selected_indices);
-    let l_triples = build_icon_triples(&l_rows);
-    let l_parent_sel = rt
-        .left_parent_entries
-        .iter()
-        .position(|m| m.path == l_cur_path);
-    let l_parent_rows = build_slint_rows_from_meta(&rt.left_parent_entries, l_parent_sel);
+    let l_rows = build_slint_rows_from_flattened(
+        &rt.left_entries,
+        &rt.left_selected_indices,
+        &mut rt.thumbnail_cache,
+        true,
+    );
+    let l_triples = if l_mode == 1 {
+        build_icon_triples(&l_rows)
+    } else {
+        Vec::new()
+    };
+    let l_parent_rows = if l_mode == 2 {
+        let l_parent_sel = rt
+            .left_parent_entries
+            .iter()
+            .position(|m| m.path == l_cur_path);
+        build_slint_rows_from_meta(
+            &rt.left_parent_entries,
+            l_parent_sel,
+            &mut rt.thumbnail_cache,
+        )
+    } else {
+        Vec::new()
+    };
     window.set_left_rows(ModelRc::new(VecModel::from(l_rows)));
     window.set_left_icon_triples(ModelRc::new(VecModel::from(l_triples)));
     window.set_left_parent_rows(ModelRc::new(VecModel::from(l_parent_rows)));
 
-    let r_rows = build_slint_rows_from_flattened(&rt.right_entries, &rt.right_selected_indices);
-    let r_triples = build_icon_triples(&r_rows);
-    let r_parent_sel = rt
-        .right_parent_entries
-        .iter()
-        .position(|m| m.path == r_cur_path);
-    let r_parent_rows = build_slint_rows_from_meta(&rt.right_parent_entries, r_parent_sel);
-    window.set_right_rows(ModelRc::new(VecModel::from(r_rows)));
-    window.set_right_icon_triples(ModelRc::new(VecModel::from(r_triples)));
-    window.set_right_parent_rows(ModelRc::new(VecModel::from(r_parent_rows)));
+    if dual_mode {
+        let r_rows = build_slint_rows_from_flattened(
+            &rt.right_entries,
+            &rt.right_selected_indices,
+            &mut rt.thumbnail_cache,
+            true,
+        );
+        let r_triples = if r_mode == 1 {
+            build_icon_triples(&r_rows)
+        } else {
+            Vec::new()
+        };
+        let r_parent_rows = if r_mode == 2 {
+            let r_parent_sel = rt
+                .right_parent_entries
+                .iter()
+                .position(|m| m.path == r_cur_path);
+            build_slint_rows_from_meta(
+                &rt.right_parent_entries,
+                r_parent_sel,
+                &mut rt.thumbnail_cache,
+            )
+        } else {
+            Vec::new()
+        };
+        window.set_right_rows(ModelRc::new(VecModel::from(r_rows)));
+        window.set_right_icon_triples(ModelRc::new(VecModel::from(r_triples)));
+        window.set_right_parent_rows(ModelRc::new(VecModel::from(r_parent_rows)));
+    }
 
-    // Inspector
+    // Active File Conflict Resolution Modal state sync
+    if let Some((src_meta, ex_meta, is_move)) = rt.active_conflict() {
+        let src_dt = src_meta.formatted_conflict_datetime();
+        let ex_dt = ex_meta.formatted_conflict_datetime();
+        let modal = ConflictModalDescriptor::from_collision(&src_meta, &ex_meta, &src_dt, &ex_dt);
+        let sub = if is_move {
+            modal.subheadline
+        } else {
+            "Do you want to replace it with the one you\u{2019}re copying?".to_string()
+        };
+        let new_sz = if src_meta.is_dir {
+            "Folder".to_string()
+        } else {
+            src_meta.formatted_size()
+        };
+        let ex_sz = if ex_meta.is_dir {
+            "Folder".to_string()
+        } else {
+            ex_meta.formatted_size()
+        };
+        let new_dt = modal.new_item.formatted_modified;
+        let old_dt = modal.existing_item.formatted_modified;
+        window.set_conflict_headline(modal.headline.into());
+        window.set_conflict_subheadline(sub.into());
+        window.set_conflict_new_date(new_dt.into());
+        window.set_conflict_new_size(new_sz.into());
+        window.set_conflict_existing_date(old_dt.into());
+        window.set_conflict_existing_size(ex_sz.into());
+        window.set_show_conflict_modal(true);
+    } else {
+        window.set_show_conflict_modal(false);
+    }
+
+    // Inspector & Preview Minion
+    sync_inspector_to_window(window, rt);
+
+    // Transfers & Logs
+    let tr_rows: Vec<TransferRowSlint> = rt
+        .transfers
+        .iter()
+        .map(|t| TransferRowSlint {
+            id: SharedString::from(&t.id),
+            priority_label: match t.priority {
+                TransferPriority::Foreground => SharedString::from("Foreground"),
+                TransferPriority::Background => SharedString::from("Background"),
+            },
+            source_name: SharedString::from(&t.source_path),
+            dest_path: SharedString::from(&t.destination_path),
+            status_text: SharedString::from(format!("{:?}", t.status)),
+            progress_pct: (t.progress_fraction() * 100.0) as i32,
+        })
+        .collect();
+    window.set_transfer_rows(ModelRc::new(VecModel::from(tr_rows)));
+
+    let log_strings: Vec<SharedString> = rt.logs.iter().map(SharedString::from).collect();
+    window.set_log_rows(ModelRc::new(VecModel::from(log_strings)));
+}
+
+fn update_rows_selection_in_place(rows: &ModelRc<FileRowSlint>, selected_indices: &HashSet<usize>) {
+    let count = rows.row_count();
+    for idx in 0..count {
+        if let Some(mut row) = rows.row_data(idx) {
+            let should_sel = selected_indices.contains(&idx);
+            if row.is_selected != should_sel {
+                row.is_selected = should_sel;
+                rows.set_row_data(idx, row);
+            }
+        }
+    }
+}
+
+fn update_triples_selection_in_place(
+    triples: &ModelRc<IconGridTripleSlint>,
+    selected_indices: &HashSet<usize>,
+) {
+    let count = triples.row_count();
+    for idx in 0..count {
+        if let Some(mut triple) = triples.row_data(idx) {
+            let base = idx * 3;
+            let sel0 = triple.has_0 && selected_indices.contains(&base);
+            let sel1 = triple.has_1 && selected_indices.contains(&(base + 1));
+            let sel2 = triple.has_2 && selected_indices.contains(&(base + 2));
+            if triple.item_0.is_selected != sel0
+                || triple.item_1.is_selected != sel1
+                || triple.item_2.is_selected != sel2
+            {
+                triple.item_0.is_selected = sel0;
+                triple.item_1.is_selected = sel1;
+                triple.item_2.is_selected = sel2;
+                triples.set_row_data(idx, triple);
+            }
+        }
+    }
+}
+
+fn sync_selection_and_inspector(window: &ManifoldWindow, rt: &mut GuiRuntime) {
+    let folder_title = rt.app_state.toolbar.active_folder_title.clone();
+    let is_right_active = rt.is_right_effective();
+    let l_sub = rt.app_state.left_header.status_subtitle.clone();
+    let r_sub = rt.app_state.right_header.status_subtitle.clone();
+    window.set_active_folder_title(folder_title.into());
+    window.set_right_pane_active(is_right_active);
+    window.set_left_status_subtitle(l_sub.into());
+    window.set_right_status_subtitle(r_sub.into());
+
+    let l_rows = window.get_left_rows();
+    update_rows_selection_in_place(&l_rows, &rt.left_selected_indices);
+    let l_triples = window.get_left_icon_triples();
+    update_triples_selection_in_place(&l_triples, &rt.left_selected_indices);
+    let r_rows = window.get_right_rows();
+    update_rows_selection_in_place(&r_rows, &rt.right_selected_indices);
+    let r_triples = window.get_right_icon_triples();
+    update_triples_selection_in_place(&r_triples, &rt.right_selected_indices);
+
+    sync_inspector_to_window(window, rt);
+}
+
+fn sync_inspector_to_window(window: &ManifoldWindow, rt: &mut GuiRuntime) {
     window.set_show_inspector(rt.app_state.inspector_open);
     if let Some(vm) = &rt.app_state.inspector_vm {
         let title_s = vm.title.clone();
@@ -2003,63 +3096,448 @@ fn sync_window_from_runtime(window: &ManifoldWindow, rt: &mut GuiRuntime) {
         window.set_inspector_extension("--".into());
         window.set_inspector_is_dir(true);
         window.set_inspector_is_image(false);
+        window.set_inspector_has_image(false);
+        window.set_inspector_has_text_preview(false);
+        window.set_inspector_image_dimensions(SharedString::default());
+        window.set_inspector_media_category(SharedString::default());
+        window.set_inspector_media_line1(SharedString::default());
+        window.set_inspector_media_line2(SharedString::default());
+        window.set_inspector_media_line3(SharedString::default());
     }
 
-    if let Some(sel) = rt.selected_metadata() {
+    if let Some(sel) = rt.selected_metadata().cloned() {
         let color_idx = color_label_to_index(sel.color_label);
         let is_img = is_image_extension(sel.extension.as_deref());
         window.set_inspector_color_index(color_idx);
         window.set_inspector_is_dir(sel.is_dir);
         window.set_inspector_is_image(is_img);
 
-        let preview_text = build_inspector_preview(rt, sel);
+        let l_cols = rt
+            .app_state
+            .left_tabs
+            .get(rt.app_state.left_active_tab)
+            .is_some_and(|t| t.view_mode == PaneViewMode::Columns);
+        let r_cols = rt.app_state.dual_pane_enabled
+            && rt
+                .app_state
+                .right_tabs
+                .get(rt.app_state.right_active_tab)
+                .is_some_and(|t| t.view_mode == PaneViewMode::Columns);
+        let need_rich_preview =
+            rt.app_state.inspector_open || window.get_show_preview_minion() || l_cols || r_cols;
+        if !need_rich_preview {
+            return;
+        }
+
+        let loaded_img = if is_img && !sel.is_dir && split_remote_uri(&sel.path).is_none() {
+            rt.thumbnail_cache
+                .entry(sel.path.clone())
+                .or_insert_with(|| Image::load_from_path(Path::new(&sel.path)).ok())
+                .clone()
+        } else {
+            None
+        };
+        let img_dims = if let Some(img) = loaded_img {
+            let sz = img.size();
+            let dims = format!("{}×{} px", sz.width, sz.height);
+            window.set_inspector_preview_image(img);
+            window.set_inspector_has_image(true);
+            window.set_inspector_image_dimensions(dims.into());
+            Some((sz.width, sz.height))
+        } else {
+            window.set_inspector_has_image(false);
+            window.set_inspector_image_dimensions(SharedString::default());
+            None
+        };
+
+        let (m_cat, m_l1, m_l2, m_l3) = extract_media_metadata(rt, &sel, img_dims);
+        window.set_inspector_media_category(m_cat.into());
+        window.set_inspector_media_line1(m_l1.into());
+        window.set_inspector_media_line2(m_l2.into());
+        window.set_inspector_media_line3(m_l3.into());
+
+        let (preview_text, has_text_prev) = build_inspector_preview(rt, &sel);
         window.set_inspector_preview_text(preview_text.into());
+        window.set_inspector_has_text_preview(has_text_prev);
     }
-
-    // Transfers & Logs
-    let tr_rows: Vec<TransferRowSlint> = rt
-        .transfers
-        .iter()
-        .map(|t| TransferRowSlint {
-            id: SharedString::from(&t.id),
-            priority_label: match t.priority {
-                TransferPriority::Foreground => SharedString::from("Foreground"),
-                TransferPriority::Background => SharedString::from("Background"),
-            },
-            source_name: SharedString::from(&t.source_path),
-            dest_path: SharedString::from(&t.destination_path),
-            status_text: SharedString::from(format!("{:?}", t.status)),
-            progress_pct: (t.progress_fraction() * 100.0) as i32,
-        })
-        .collect();
-    window.set_transfer_rows(ModelRc::new(VecModel::from(tr_rows)));
-
-    let log_strings: Vec<SharedString> = rt.logs.iter().map(SharedString::from).collect();
-    window.set_log_rows(ModelRc::new(VecModel::from(log_strings)));
 }
 
-fn build_inspector_preview(rt: &GuiRuntime, sel: &FileMetadata) -> String {
-    if sel.is_dir {
-        return format!("Folder\n{}", sel.path);
+fn format_duration_secs(secs: u64) -> String {
+    let hrs = secs / 3600;
+    let mins = (secs % 3600) / 60;
+    let rem = secs % 60;
+    if hrs > 0 {
+        format!("{hrs:02}:{mins:02}:{rem:02}")
+    } else {
+        format!("{mins:02}:{rem:02}")
     }
-    let vfs = rt.backend_for_path(&sel.path);
-    if let Ok(bytes) = vfs.read_range(&sel.path, 0, 256) {
-        if let Ok(text) = std::str::from_utf8(&bytes) {
-            let snippet: String = text.lines().take(5).collect::<Vec<_>>().join("\n");
-            if !snippet.trim().is_empty() {
-                return snippet;
+}
+
+fn extract_media_metadata(
+    rt: &GuiRuntime,
+    meta: &FileMetadata,
+    img_dims: Option<(u32, u32)>,
+) -> (String, String, String, String) {
+    if meta.is_dir {
+        return (String::new(), String::new(), String::new(), String::new());
+    }
+    let ext_low = meta.extension.as_deref().unwrap_or("").to_ascii_lowercase();
+    let ext_up = ext_low.to_ascii_uppercase();
+    let sz_str = meta.formatted_size();
+
+    if is_image_extension(Some(&ext_low)) {
+        let (w, h) = img_dims.unwrap_or((0, 0));
+        let line1 = if w > 0 && h > 0 {
+            let mp = (f64::from(w) * f64::from(h)) / 1_000_000.0;
+            format!("Resolution: {w}×{h} px ({mp:.2} MP) • Format: {ext_up}")
+        } else {
+            format!("Format: {ext_up} Image • Size: {sz_str}")
+        };
+        let color_info = match ext_low.as_str() {
+            "png" | "webp" | "ico" => "Color Space: RGBA (8-bit/ch) • Alpha Channel",
+            "svg" => "Color Space: Vector SVG / XML Scalable",
+            "gif" => "Color Space: Indexed 256-Color Palette",
+            _ => "Color Space: sRGB (24-bit TrueColor)",
+        };
+        let line3 = format!(
+            "File Size: {sz_str} • Modified: {}",
+            meta.formatted_iso_datetime()
+        );
+        return (
+            "Photo / Image".to_string(),
+            line1,
+            color_info.to_string(),
+            line3,
+        );
+    }
+
+    if matches!(
+        ext_low.as_str(),
+        "mp3" | "flac" | "wav" | "ogg" | "m4a" | "aac" | "opus" | "wma" | "aiff"
+    ) {
+        let vfs = rt.backend_for_path(&meta.path);
+        let head = vfs.read_range(&meta.path, 0, 2048).unwrap_or_default();
+        let bytes_len = meta.size.unwrap_or(0);
+        if ext_low == "wav" && head.len() >= 36 && &head[0..4] == b"RIFF" {
+            let ch = u16::from_le_bytes([head[22], head[23]]);
+            let sr = u32::from_le_bytes([head[24], head[25], head[26], head[27]]);
+            let br = u32::from_le_bytes([head[28], head[29], head[30], head[31]]);
+            let bps = u16::from_le_bytes([head[34], head[35]]);
+            let dur_s = if br > 0 { bytes_len / u64::from(br) } else { 0 };
+            let dur_str = format_duration_secs(dur_s);
+            let ch_lbl = if ch == 1 { "Mono" } else { "Stereo" };
+            let khz = f64::from(sr) / 1000.0;
+            let kbps = (u64::from(br) * 8) / 1000;
+            return (
+                "Audio / Music".to_string(),
+                format!("Codec: PCM WAV ({bps}-bit) • {khz:.1} kHz • {ch_lbl} ({ch} ch)"),
+                format!("Duration: {dur_str} • Bitrate: {kbps} kbps"),
+                format!("Container: RIFF WAVE • Size: {sz_str}"),
+            );
+        }
+        if ext_low == "flac" && head.len() >= 26 && &head[0..4] == b"fLaC" {
+            let b18 = u32::from(head[18]);
+            let b19 = u32::from(head[19]);
+            let b20 = u32::from(head[20]);
+            let sr = (b18 << 12) | (b19 << 4) | (b20 >> 4);
+            let ch = ((head[20] >> 1) & 0x07) + 1;
+            let bps = (((head[20] & 0x01) << 4) | (head[21] >> 4)) + 1;
+            let khz = if sr > 0 { f64::from(sr) / 1000.0 } else { 44.1 };
+            let est_dur = bytes_len / 110_000;
+            let dur_str = format_duration_secs(est_dur.max(1));
+            return (
+                "Audio / Music".to_string(),
+                format!("Codec: FLAC Lossless ({bps}-bit) • {khz:.1} kHz • {ch} ch"),
+                format!("Est. Duration: {dur_str} • Lossless Audio"),
+                format!("Container: FLAC • Size: {sz_str}"),
+            );
+        }
+        let est_kbps: u64 = match ext_low.as_str() {
+            "m4a" | "aac" | "ogg" | "opus" => 192,
+            _ => 256,
+        };
+        let dur_s = (bytes_len * 8) / (est_kbps * 1000).max(1);
+        let dur_str = format_duration_secs(dur_s.max(1));
+        let has_id3 = head.starts_with(b"ID3");
+        let tag_lbl = if has_id3 {
+            "ID3v2 Audio Tags Present"
+        } else {
+            "Standard Audio Stream"
+        };
+        return (
+            "Audio / Music".to_string(),
+            format!("Codec: {ext_up} Audio • Sample Rate: 44.1 kHz • Stereo (2 ch)"),
+            format!("Est. Duration: {dur_str} • Bitrate: ~{est_kbps} kbps"),
+            format!("{tag_lbl} • Size: {sz_str}"),
+        );
+    }
+
+    if matches!(
+        ext_low.as_str(),
+        "mp4" | "mov" | "mkv" | "webm" | "avi" | "m4v" | "mpeg" | "mpg" | "ts" | "flv"
+    ) {
+        let bytes_len = meta.size.unwrap_or(0);
+        let est_mbps = 4u64;
+        let dur_s = (bytes_len * 8) / (est_mbps * 1_000_000).max(1);
+        let dur_str = format_duration_secs(dur_s.max(1));
+        let codec_lbl = match ext_low.as_str() {
+            "mp4" | "m4v" | "mov" => "H.264 / HEVC + AAC",
+            "webm" => "VP9 / AV1 + Opus",
+            "mkv" => "Matroska Video + Multi-Audio",
+            _ => "Digital Video Stream",
+        };
+        return (
+            "Video / Media".to_string(),
+            format!("Container: {ext_up} Video • Codec: {codec_lbl}"),
+            format!("Est. Duration: {dur_str} • Stream: ~{est_mbps}.0 Mbps"),
+            format!(
+                "File Size: {sz_str} • Modified: {}",
+                meta.formatted_iso_datetime()
+            ),
+        );
+    }
+
+    (String::new(), String::new(), String::new(), String::new())
+}
+
+fn is_text_or_structured_extension(ext: &str) -> bool {
+    matches!(
+        ext,
+        "txt"
+            | "md"
+            | "markdown"
+            | "json"
+            | "yaml"
+            | "yml"
+            | "toml"
+            | "xml"
+            | "html"
+            | "htm"
+            | "css"
+            | "scss"
+            | "js"
+            | "ts"
+            | "jsx"
+            | "tsx"
+            | "rs"
+            | "py"
+            | "go"
+            | "c"
+            | "h"
+            | "cpp"
+            | "hpp"
+            | "java"
+            | "kt"
+            | "swift"
+            | "sh"
+            | "bash"
+            | "zsh"
+            | "fish"
+            | "sql"
+            | "csv"
+            | "tsv"
+            | "ini"
+            | "conf"
+            | "cfg"
+            | "env"
+            | "log"
+            | "slint"
+            | "dockerfile"
+            | "makefile"
+            | "gitignore"
+            | "plist"
+            | "svg"
+    )
+}
+
+fn tab_icon_for_path(path: &str, is_search: bool, is_remote: bool) -> &'static str {
+    if is_search {
+        return "search";
+    }
+    if is_remote {
+        return "globe";
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let trimmed = path.trim_end_matches('/');
+    if !home.is_empty() && trimmed == home.trim_end_matches('/') {
+        return "home";
+    }
+    let name = Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    match name {
+        "Movies" | "Videos" => "movies",
+        "Music" | "Audio" => "music",
+        _ => "folder",
+    }
+}
+
+fn build_pane_header_breadcrumbs(
+    root_label: &str,
+    path: &str,
+) -> (&'static str, Vec<BreadcrumbSegmentSlint>) {
+    if split_remote_uri(path).is_some() {
+        let raw = crate::PathAndStatusHeader::clickable_segments(root_label, path);
+        let len = raw.len();
+        let segs = raw
+            .into_iter()
+            .enumerate()
+            .map(|(idx, (lbl, target))| BreadcrumbSegmentSlint {
+                label: SharedString::from(lbl),
+                target_path: SharedString::from(target),
+                is_last: idx + 1 == len,
+            })
+            .collect();
+        return ("globe", segs);
+    }
+
+    let home = std::env::var("HOME")
+        .unwrap_or_default()
+        .trim_end_matches('/')
+        .to_string();
+    let clean_path = if path.len() > 1 {
+        path.trim_end_matches('/')
+    } else {
+        path
+    };
+    let in_home = !home.is_empty()
+        && home != "/"
+        && (clean_path == home || clean_path.starts_with(&format!("{home}/")));
+
+    if in_home {
+        let home_name = Path::new(&home)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Home");
+        let mut raw: Vec<(String, String)> = vec![(home_name.to_string(), home.clone())];
+        if let Some(rel) = clean_path.strip_prefix(&home) {
+            let mut accum = home;
+            for part in rel.split('/').filter(|s| !s.is_empty()) {
+                accum = format!("{accum}/{part}");
+                raw.push((part.to_string(), accum.clone()));
             }
         }
-        if !bytes.is_empty() {
-            return format_hex_dump(&bytes, 4).join("\n");
+        let len = raw.len();
+        let segs = raw
+            .into_iter()
+            .enumerate()
+            .map(|(idx, (lbl, target))| BreadcrumbSegmentSlint {
+                label: SharedString::from(lbl),
+                target_path: SharedString::from(target),
+                is_last: idx + 1 == len,
+            })
+            .collect();
+        return ("home", segs);
+    }
+
+    let raw = crate::PathAndStatusHeader::clickable_segments(root_label, path);
+    let len = raw.len();
+    let segs = raw
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (lbl, target))| BreadcrumbSegmentSlint {
+            label: SharedString::from(lbl),
+            target_path: SharedString::from(target),
+            is_last: idx + 1 == len,
+        })
+        .collect();
+    ("drive", segs)
+}
+
+fn is_likely_utf8_text(bytes: &[u8], ext_low: &str) -> bool {
+    if bytes.is_empty() {
+        return is_text_or_structured_extension(ext_low);
+    }
+    if bytes.contains(&0) {
+        return false;
+    }
+    std::str::from_utf8(bytes).is_ok()
+}
+
+fn build_inspector_preview(rt: &GuiRuntime, sel: &FileMetadata) -> (String, bool) {
+    if sel.is_dir {
+        return (format!("Folder\n{}", sel.path), false);
+    }
+    let ext_low = sel.extension.as_deref().unwrap_or("").to_ascii_lowercase();
+    let is_local = split_remote_uri(&sel.path).is_none() && Path::new(&sel.path).is_file();
+
+    if is_local && ext_low == "docx" {
+        let out_opt = Command::new("unzip")
+            .args(["-p", &sel.path, "word/document.xml"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success() && !o.stdout.is_empty());
+        if let Some(out) = out_opt {
+            let xml = String::from_utf8_lossy(&out.stdout);
+            let plain = strip_xml_tags(&xml);
+            if !plain.trim().is_empty() {
+                let sz = sel.formatted_size();
+                let dt = sel.formatted_iso_datetime();
+                let sep = "────────────────────────────────────────";
+                let doc = format!(
+                    "DOCX Document Preview — {}\nSize: {sz}  |  Modified: {dt}\n{sep}\n{plain}",
+                    sel.name
+                );
+                return (doc, true);
+            }
         }
     }
-    format!(
-        "{}\n{} ({})",
+
+    let vfs = rt.backend_for_path(&sel.path);
+    if let Ok(bytes) = vfs.read_range(&sel.path, 0, 4096) {
+        let snippet_opt = is_likely_utf8_text(&bytes, &ext_low)
+            .then(|| std::str::from_utf8(&bytes).ok())
+            .flatten()
+            .map(|t| t.lines().take(36).collect::<Vec<_>>().join("\n"))
+            .filter(|s| !s.trim().is_empty());
+        if let Some(snippet) = snippet_opt {
+            return (snippet, true);
+        }
+    }
+    let summary = format!(
+        "{}\nSize: {}\nPermissions: {} ({})",
         sel.kind,
+        sel.formatted_size(),
         sel.permissions_matrix().to_symbolic_string(),
         sel.permissions_matrix().to_octal_string()
-    )
+    );
+    (summary, false)
+}
+
+fn strip_xml_tags(xml: &str) -> String {
+    let mut out = String::new();
+    let mut in_tag = false;
+    let mut tag_buf = String::new();
+    for ch in xml.chars() {
+        if ch == '<' {
+            in_tag = true;
+            tag_buf.clear();
+        } else if ch == '>' {
+            in_tag = false;
+            if tag_buf == "/w:p" || tag_buf == "w:br" || tag_buf == "w:cr" {
+                out.push('\n');
+            } else if tag_buf == "w:tab" {
+                out.push('\t');
+            }
+        } else if in_tag {
+            if tag_buf.len() < 16 {
+                tag_buf.push(ch);
+            }
+        } else {
+            out.push(ch);
+        }
+        if out.len() >= 1800 {
+            break;
+        }
+    }
+    out.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .take(28)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn vfs_url_to_target(vfs_url: &str) -> String {
@@ -2080,6 +3558,8 @@ fn vfs_url_to_target(vfs_url: &str) -> String {
 fn build_slint_rows_from_flattened(
     entries: &[FlattenedRowEntry],
     selected_indices: &HashSet<usize>,
+    thumb_cache: &mut HashMap<String, Option<Image>>,
+    load_thumbs: bool,
 ) -> Vec<FileRowSlint> {
     entries
         .iter()
@@ -2091,6 +3571,8 @@ fn build_slint_rows_from_flattened(
                 entry.depth,
                 entry.is_expanded,
                 selected_indices.contains(&idx),
+                thumb_cache,
+                load_thumbs,
             )
         })
         .collect()
@@ -2099,12 +3581,16 @@ fn build_slint_rows_from_flattened(
 fn build_slint_rows_from_meta(
     entries: &[FileMetadata],
     selected_idx: Option<usize>,
+    thumb_cache: &mut HashMap<String, Option<Image>>,
 ) -> Vec<FileRowSlint> {
     entries
         .iter()
         .enumerate()
         .take(320)
-        .map(|(idx, meta)| meta_to_slint_row(meta, 0, false, selected_idx == Some(idx)))
+        .map(|(idx, meta)| {
+            let is_sel = selected_idx == Some(idx);
+            meta_to_slint_row(meta, 0, false, is_sel, thumb_cache, true)
+        })
         .collect()
 }
 
@@ -2113,13 +3599,34 @@ fn meta_to_slint_row(
     depth: i32,
     is_expanded: bool,
     is_selected: bool,
+    thumb_cache: &mut HashMap<String, Option<Image>>,
+    load_thumbs: bool,
 ) -> FileRowSlint {
     let hex = meta.color_label.hex_color().unwrap_or("");
     let tag_name = color_label_to_name(meta.color_label);
     let brush = color_label_to_slint_color(meta.color_label);
     let tint = color_label_to_tint_color(meta.color_label);
     let ext_ref = meta.extension.as_deref();
+    let is_img = is_image_extension(ext_ref);
     let is_exec = !meta.is_dir && (meta.permissions & 0o111 != 0);
+    let can_thumb = load_thumbs
+        && is_img
+        && !meta.is_dir
+        && split_remote_uri(&meta.path).is_none()
+        && meta.size.unwrap_or(0) <= 16 * 1024 * 1024;
+    let thumb_opt = if can_thumb {
+        if thumb_cache.len() > 2048 && !thumb_cache.contains_key(&meta.path) {
+            thumb_cache.clear();
+        }
+        thumb_cache
+            .entry(meta.path.clone())
+            .or_insert_with(|| Image::load_from_path(Path::new(&meta.path)).ok())
+            .clone()
+    } else {
+        None
+    };
+    let has_thumbnail = thumb_opt.is_some();
+    let thumbnail = thumb_opt.unwrap_or_default();
     FileRowSlint {
         name: SharedString::from(meta.display_name()),
         path: SharedString::from(&meta.path),
@@ -2133,10 +3640,12 @@ fn meta_to_slint_row(
         color_tag_tint: tint.into(),
         has_color_tag: meta.color_label != ColorLabel::None,
         is_dir: meta.is_dir,
-        is_image: is_image_extension(ext_ref),
+        is_image: is_img,
         is_executable: is_exec,
         is_expanded,
         is_selected,
+        has_thumbnail,
+        thumbnail,
         depth,
     }
 }
@@ -2159,6 +3668,8 @@ fn empty_slint_row() -> FileRowSlint {
         is_executable: false,
         is_expanded: false,
         is_selected: false,
+        has_thumbnail: false,
+        thumbnail: Image::default(),
         depth: 0,
     }
 }
@@ -2216,8 +3727,10 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
             } else {
                 ActivePane::Left
             };
+            guard.sync_terminal_cwd();
             guard.refresh_headers_and_inspector();
             if let Some(w) = win_weak.upgrade() {
+                w.set_show_tab_preview(true);
                 sync_window_from_runtime(&w, &mut guard);
             }
         });
@@ -2239,21 +3752,35 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
             if !next {
                 guard.app_state.active_pane = ActivePane::Left;
             }
+            guard.sync_terminal_cwd();
             guard.refresh_headers_and_inspector();
             if let Some(w) = win_weak.upgrade() {
+                w.set_show_tab_preview(true);
                 sync_window_from_runtime(&w, &mut guard);
             }
         });
     }
 
-    // Draggable 4px Dual-Pane Splitter Handle (Section 2.2)
+    // Draggable Dual-Pane Splitter Handle (Section 2.2)
     {
         let rt = Rc::clone(&rt);
         let win_weak = window.as_weak();
         window.on_adjust_split_ratio(move |delta_px| {
             let mut guard = rt.borrow_mut();
             let delta = delta_px / 960.0;
-            let next_ratio = (guard.app_state.split_ratio + delta).clamp(0.25, 0.75);
+            let next_ratio = (guard.app_state.split_ratio + delta).clamp(0.20, 0.80);
+            guard.app_state.split_ratio = next_ratio;
+            if let Some(w) = win_weak.upgrade() {
+                w.set_split_ratio(next_ratio);
+            }
+        });
+    }
+    {
+        let rt = Rc::clone(&rt);
+        let win_weak = window.as_weak();
+        window.on_set_split_ratio(move |ratio| {
+            let mut guard = rt.borrow_mut();
+            let next_ratio = ratio.clamp(0.20, 0.80);
             guard.app_state.split_ratio = next_ratio;
             if let Some(w) = win_weak.upgrade() {
                 w.set_split_ratio(next_ratio);
@@ -2278,6 +3805,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 guard.navigate_to_path(use_right, dest);
             }
             if let Some(w) = win_weak.upgrade() {
+                w.set_show_tab_preview(true);
                 sync_window_from_runtime(&w, &mut guard);
             }
         });
@@ -2344,6 +3872,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 guard.navigate_to_path(use_right, valid_dir);
             }
             if let Some(w) = win_weak.upgrade() {
+                w.set_show_tab_preview(true);
                 sync_window_from_runtime(&w, &mut guard);
             }
         });
@@ -2373,6 +3902,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
             let mut guard = rt.borrow_mut();
             guard.go_back();
             if let Some(w) = win_weak.upgrade() {
+                w.set_show_tab_preview(true);
                 sync_window_from_runtime(&w, &mut guard);
             }
         });
@@ -2384,6 +3914,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
             let mut guard = rt.borrow_mut();
             guard.go_forward();
             if let Some(w) = win_weak.upgrade() {
+                w.set_show_tab_preview(true);
                 sync_window_from_runtime(&w, &mut guard);
             }
         });
@@ -2432,9 +3963,12 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 if guard.saved_connections.remove_profile(&item_id) {
                     let _ = guard.saved_connections.save_default();
                 }
+                if guard.prefs.remove_favorite(&item_id) {
+                    let _ = guard.prefs.save_default();
+                }
                 let msg = format!("[DISCONNECT] Disconnected {item_id}");
                 guard.logs.push(msg);
-                let toast = format!("Disconnected {item_id}");
+                let toast = format!("Removed {item_id}");
                 guard.show_toast("info", toast);
                 if let Some(w) = win_weak.upgrade() {
                     sync_window_from_runtime(&w, &mut guard);
@@ -2516,7 +4050,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 }
                 "open_new_tab" => {
                     let is_right = guard.is_right_effective();
-                    let title = vfs_display_title(&target_path);
+                    let title = guard.format_tab_title(&target_path);
                     let vfs_url = if target_path.contains("://") {
                         target_path.clone()
                     } else {
@@ -2554,7 +4088,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                         guard.app_state.panes_layout = PanesLayout::SplitHorizontal;
                     }
                     guard.app_state.active_pane = ActivePane::Right;
-                    let title = vfs_display_title(&target_path);
+                    let title = guard.format_tab_title(&target_path);
                     guard.navigate_to_path(true, target_path);
                     let toast = format!("Opened \"{title}\" in Dual Pane");
                     guard.show_toast("info", toast);
@@ -2607,41 +4141,12 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                     guard.show_toast("info", toast);
                 }
                 "terminal" => {
-                    if let Some((prefix, rel)) = split_remote_uri(&target_path) {
-                        let prof_opt = guard
-                            .saved_connections
-                            .connections
-                            .iter()
-                            .find(|p| p.id == item_id || profile_to_vfs_url(p).starts_with(&prefix))
-                            .cloned();
-                        if let Some(prof) = prof_opt {
-                            if let Ok(spec) =
-                                TerminalIntegration::build_remote_ssh_terminal(&prof, &rel)
-                            {
-                                let _ = Command::new(&spec.program).args(&spec.args).spawn();
-                            }
-                        }
-                        let toast = format!("Launched SSH terminal for {item_label}");
-                        guard.logs.push(format!("[SSH] {toast}"));
-                        guard.show_toast("info", toast);
-                    } else {
-                        if cfg!(target_os = "macos") {
-                            let target = if Path::new(&target_path).exists() {
-                                &target_path
-                            } else {
-                                "/"
-                            };
-                            let args = ["-a", "Terminal", target];
-                            let _ = Command::new("open").args(args).spawn();
-                        } else if let Ok(spec) =
-                            TerminalIntegration::build_local_terminal(&target_path)
-                        {
-                            let _ = Command::new(&spec.program).args(&spec.args).spawn();
-                        }
-                        let toast = format!("Opened terminal at {target_path}");
-                        guard.logs.push(format!("[TERM] {toast}"));
-                        guard.show_toast("info", toast);
-                    }
+                    let is_right = guard.is_right_effective();
+                    guard.navigate_to_path(is_right, target_path.clone());
+                    w.set_show_terminal_drawer(true);
+                    let toast = format!("Opened Bottom Terminal at {item_label}");
+                    guard.logs.push(format!("[TERM] {toast}"));
+                    guard.show_toast("info", toast);
                 }
                 "refresh" => {
                     if let Some((prefix, _)) = split_remote_uri(&target_path) {
@@ -2660,34 +4165,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                     guard.show_toast("copy", toast);
                 }
                 "add_favorite" => {
-                    let vfs_url = if target_path.contains("://") {
-                        target_path.clone()
-                    } else {
-                        format!("file://{target_path}")
-                    };
-                    let fav_sec = guard
-                        .app_state
-                        .sidebar_sections
-                        .iter_mut()
-                        .find(|s| s.title == "Favorites");
-                    if let Some(sec) = fav_sec {
-                        let exists = sec.items.iter().any(|i| i.vfs_url == vfs_url);
-                        if !exists {
-                            let new_id = format!("fav-pin-{}", sec.items.len() + 1);
-                            sec.items.push(SidebarItem {
-                                id: new_id,
-                                label: item_label.clone(),
-                                vfs_url,
-                                icon_kind: "folder".to_string(),
-                                capacity_badge: None,
-                                can_eject: false,
-                                children: vec![],
-                                expanded: false,
-                            });
-                        }
-                    }
-                    let toast = format!("Added \"{item_label}\" to Favorites");
-                    guard.show_toast("success", toast);
+                    guard.pin_folder_to_favorites(&target_path, &item_label);
                 }
                 "duplicate_connection" => {
                     let prof_opt = guard
@@ -2739,13 +4217,53 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                     if guard.saved_connections.remove_profile(&item_id) {
                         let _ = guard.saved_connections.save_default();
                     }
+                    if guard.prefs.remove_favorite(&item_id) {
+                        let _ = guard.prefs.save_default();
+                    }
                     let toast = format!("Removed \"{item_label}\"");
                     guard.logs.push(format!("[EJECT] {toast}"));
+                    guard.show_toast("info", toast);
+                }
+                "move_fav_up" if guard.move_favorite_step(&item_id, -1) => {
+                    let toast = format!("Moved \"{item_label}\" up in Favorites");
+                    guard.show_toast("info", toast);
+                }
+                "move_fav_down" if guard.move_favorite_step(&item_id, 1) => {
+                    let toast = format!("Moved \"{item_label}\" down in Favorites");
                     guard.show_toast("info", toast);
                 }
                 _ => {}
             }
             sync_window_from_runtime(&w, &mut guard);
+        });
+    }
+    {
+        let rt = Rc::clone(&rt);
+        let win_weak = window.as_weak();
+        window.on_reorder_sidebar_favorite(move |from_idx, to_idx| {
+            if from_idx < 0 || to_idx < 0 || from_idx == to_idx {
+                return;
+            }
+            let mut guard = rt.borrow_mut();
+            let f_u = from_idx as usize;
+            let t_u = to_idx as usize;
+            let from_id = guard
+                .sidebar_targets
+                .get(f_u)
+                .map(|(id, _)| id.clone())
+                .unwrap_or_default();
+            let to_id = guard
+                .sidebar_targets
+                .get(t_u)
+                .map(|(id, _)| id.clone())
+                .unwrap_or_default();
+            if guard.reorder_favorites_by_item_ids(&from_id, &to_id) {
+                let toast = "Reordered Favorites".to_string();
+                guard.show_toast("info", toast);
+                if let Some(w) = win_weak.upgrade() {
+                    sync_window_from_runtime(&w, &mut guard);
+                }
+            }
         });
     }
     {
@@ -2775,6 +4293,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
             let toast = format!("Updated color tag for {item_id}");
             guard.show_toast("info", toast);
             if let Some(w) = win_weak.upgrade() {
+                w.set_show_tab_preview(true);
                 sync_window_from_runtime(&w, &mut guard);
             }
         });
@@ -2816,66 +4335,52 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
             if color != ColorLabel::None {
                 guard.sidebar_colors.insert(fav_id.clone(), color);
             }
-            let fav_sec = guard
-                .app_state
-                .sidebar_sections
-                .iter_mut()
-                .find(|s| s.title == "Favorites");
-            if let Some(sec) = fav_sec {
-                if !sec.items.iter().any(|i| i.vfs_url == vfs_url) {
-                    sec.items.push(SidebarItem {
-                        id: fav_id,
-                        label: label.clone(),
-                        vfs_url,
-                        icon_kind: "globe".to_string(),
-                        capacity_badge: None,
-                        can_eject: true,
-                        children: vec![],
-                        expanded: false,
-                    });
-                }
-            }
-            let toast = format!("Added \"{label}\" to Favorites");
-            guard.show_toast("success", toast);
+            guard.pin_folder_to_favorites(&vfs_url, &label);
             sync_window_from_runtime(&w, &mut guard);
         });
     }
 
-    // Pin current directory to Sidebar Favorites
+    // Pin current or selected directory to Sidebar Favorites (with persistence)
     {
         let rt = Rc::clone(&rt);
         let win_weak = window.as_weak();
         window.on_add_current_to_favorites(move || {
             let mut guard = rt.borrow_mut();
             let is_right = guard.is_right_effective();
-            let cur_path = guard.current_pane_path(is_right);
-            let label = vfs_display_title(&cur_path);
-            let vfs_url = if cur_path.contains("://") {
-                cur_path
-            } else {
-                format!("file://{cur_path}")
-            };
-            let fav_sec = guard
-                .app_state
-                .sidebar_sections
-                .iter_mut()
-                .find(|s| s.title == "Favorites");
-            if let Some(sec) = fav_sec {
-                let exists = sec.items.iter().any(|i| i.vfs_url == vfs_url);
-                if !exists {
-                    sec.items.push(SidebarItem {
-                        id: format!("fav-pin-{}", sec.items.len() + 1),
-                        label,
-                        vfs_url,
-                        icon_kind: "folder".to_string(),
-                        capacity_badge: None,
-                        can_eject: false,
-                        children: vec![],
-                        expanded: false,
-                    });
-                }
-            }
+            let sel_dir = guard
+                .selected_metadata()
+                .filter(|m| m.is_dir)
+                .map(|m| (m.path.clone(), m.name.clone()));
+            let (target_path, label) = sel_dir.unwrap_or_else(|| {
+                let p = guard.current_pane_path(is_right);
+                let l = guard.format_tab_title(&p);
+                (p, l)
+            });
+            guard.pin_folder_to_favorites(&target_path, &label);
             if let Some(w) = win_weak.upgrade() {
+                w.set_show_tab_preview(true);
+                sync_window_from_runtime(&w, &mut guard);
+            }
+        });
+    }
+    {
+        let rt = Rc::clone(&rt);
+        let win_weak = window.as_weak();
+        window.on_add_current_folder_to_favorites(move || {
+            let mut guard = rt.borrow_mut();
+            let is_right = guard.is_right_effective();
+            let sel_dir = guard
+                .selected_metadata()
+                .filter(|m| m.is_dir)
+                .map(|m| (m.path.clone(), m.name.clone()));
+            let (target_path, label) = sel_dir.unwrap_or_else(|| {
+                let p = guard.current_pane_path(is_right);
+                let l = guard.format_tab_title(&p);
+                (p, l)
+            });
+            guard.pin_folder_to_favorites(&target_path, &label);
+            if let Some(w) = win_weak.upgrade() {
+                w.set_show_tab_preview(true);
                 sync_window_from_runtime(&w, &mut guard);
             }
         });
@@ -2890,11 +4395,20 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
             let idx = tab_idx as usize;
             if is_right && idx < guard.app_state.right_tabs.len() {
                 guard.app_state.right_active_tab = idx;
+                guard.right_selected_idx = Some(0);
+                guard.right_anchor_idx = Some(0);
+                guard.right_selected_indices.clear();
+                guard.right_selected_indices.insert(0);
             } else if !is_right && idx < guard.app_state.left_tabs.len() {
                 guard.app_state.left_active_tab = idx;
+                guard.left_selected_idx = Some(0);
+                guard.left_anchor_idx = Some(0);
+                guard.left_selected_indices.clear();
+                guard.left_selected_indices.insert(0);
             }
             guard.reload_pane_entries(is_right);
             if let Some(w) = win_weak.upgrade() {
+                w.set_show_tab_preview(true);
                 sync_window_from_runtime(&w, &mut guard);
             }
         });
@@ -2907,7 +4421,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
         window.on_add_tab(move |is_right| {
             let mut guard = rt.borrow_mut();
             let path = guard.current_pane_path(is_right);
-            let title = vfs_display_title(&path);
+            let title = guard.format_tab_title(&path);
             let vfs_url = if path.contains("://") {
                 path.clone()
             } else {
@@ -2941,6 +4455,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
             }
             guard.reload_pane_entries(is_right);
             if let Some(w) = win_weak.upgrade() {
+                w.set_show_tab_preview(true);
                 sync_window_from_runtime(&w, &mut guard);
             }
         });
@@ -2969,6 +4484,81 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
             }
             guard.reload_pane_entries(is_right);
             if let Some(w) = win_weak.upgrade() {
+                w.set_show_tab_preview(true);
+                sync_window_from_runtime(&w, &mut guard);
+            }
+        });
+    }
+
+    // Rearrange Folder Tabs via Drag & Drop (within a pane or across Dual Panes)
+    {
+        let rt = Rc::clone(&rt);
+        let win_weak = window.as_weak();
+        window.on_move_tab(move |from_right, from_idx, to_right, to_idx| {
+            let mut guard = rt.borrow_mut();
+            let f_idx = from_idx.max(0) as usize;
+            let t_idx = to_idx.max(0) as usize;
+            if from_right == to_right {
+                let tabs = if from_right {
+                    &mut guard.app_state.right_tabs
+                } else {
+                    &mut guard.app_state.left_tabs
+                };
+                if f_idx >= tabs.len() {
+                    return;
+                }
+                let clamped_to = t_idx.min(tabs.len() - 1);
+                if f_idx == clamped_to {
+                    return;
+                }
+                let item = tabs.remove(f_idx);
+                tabs.insert(clamped_to, item);
+                if from_right {
+                    guard.app_state.right_active_tab = clamped_to;
+                } else {
+                    guard.app_state.left_active_tab = clamped_to;
+                }
+                guard.reload_pane_entries(from_right);
+            } else {
+                let can_remove = if from_right {
+                    guard.app_state.right_tabs.len() > 1 && f_idx < guard.app_state.right_tabs.len()
+                } else {
+                    guard.app_state.left_tabs.len() > 1 && f_idx < guard.app_state.left_tabs.len()
+                };
+                if !can_remove {
+                    return;
+                }
+                let item = if from_right {
+                    let removed = guard.app_state.right_tabs.remove(f_idx);
+                    let max_r = guard.app_state.right_tabs.len() - 1;
+                    if guard.app_state.right_active_tab > max_r {
+                        guard.app_state.right_active_tab = max_r;
+                    }
+                    removed
+                } else {
+                    let removed = guard.app_state.left_tabs.remove(f_idx);
+                    let max_l = guard.app_state.left_tabs.len() - 1;
+                    if guard.app_state.left_active_tab > max_l {
+                        guard.app_state.left_active_tab = max_l;
+                    }
+                    removed
+                };
+                if to_right {
+                    let ins = t_idx.min(guard.app_state.right_tabs.len());
+                    guard.app_state.right_tabs.insert(ins, item);
+                    guard.app_state.right_active_tab = ins;
+                    guard.app_state.active_pane = ActivePane::Right;
+                } else {
+                    let ins = t_idx.min(guard.app_state.left_tabs.len());
+                    guard.app_state.left_tabs.insert(ins, item);
+                    guard.app_state.left_active_tab = ins;
+                    guard.app_state.active_pane = ActivePane::Left;
+                }
+                guard.reload_pane_entries(false);
+                guard.reload_pane_entries(true);
+            }
+            if let Some(w) = win_weak.upgrade() {
+                w.set_show_tab_preview(true);
                 sync_window_from_runtime(&w, &mut guard);
             }
         });
@@ -2985,7 +4575,8 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
             guard.apply_row_selection(use_right, idx, false, false);
             guard.refresh_headers_and_inspector();
             if let Some(w) = win_weak.upgrade() {
-                sync_window_from_runtime(&w, &mut guard);
+                w.set_show_tab_preview(true);
+                sync_selection_and_inspector(&w, &mut guard);
             }
         });
     }
@@ -2997,42 +4588,10 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
             let idx = row_idx as usize;
             let use_right = is_right && guard.app_state.dual_pane_enabled;
             guard.apply_row_selection(use_right, idx, is_shift, is_cmd);
-
-            if is_shift || is_cmd {
-                guard.last_click = None;
-                guard.refresh_headers_and_inspector();
-                if let Some(w) = win_weak.upgrade() {
-                    sync_window_from_runtime(&w, &mut guard);
-                }
-                return;
-            }
-
-            let clicked_path = if use_right {
-                guard.right_entries.get(idx).map(|r| r.meta.path.clone())
-            } else {
-                guard.left_entries.get(idx).map(|r| r.meta.path.clone())
-            };
-
-            let now = Instant::now();
-            let is_double_click = match (&guard.last_click, &clicked_path) {
-                (Some((prev_pane, prev_path, prev_time)), Some(cur_path)) => {
-                    let elapsed = now.duration_since(*prev_time);
-                    let within_window = elapsed <= Duration::from_millis(500);
-                    *prev_pane == use_right && prev_path == cur_path && within_window
-                }
-                _ => false,
-            };
-
-            if is_double_click {
-                guard.last_click = None;
-                guard.open_entry_at(use_right, Some(idx));
-            } else {
-                guard.last_click = clicked_path.map(|p| (use_right, p, now));
-                guard.refresh_headers_and_inspector();
-            }
-
+            guard.refresh_headers_and_inspector();
             if let Some(w) = win_weak.upgrade() {
-                sync_window_from_runtime(&w, &mut guard);
+                w.set_show_tab_preview(true);
+                sync_selection_and_inspector(&w, &mut guard);
             }
         });
     }
@@ -3054,7 +4613,8 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
             guard.apply_row_selection(use_right, clamped, true, false);
             guard.refresh_headers_and_inspector();
             if let Some(w) = win_weak.upgrade() {
-                sync_window_from_runtime(&w, &mut guard);
+                w.set_show_tab_preview(true);
+                sync_selection_and_inspector(&w, &mut guard);
             }
         });
     }
@@ -3065,12 +4625,115 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
         let win_weak = window.as_weak();
         window.on_open_file_row(move |is_right, row_idx| {
             let mut guard = rt.borrow_mut();
+            let in_cooldown = guard
+                .last_nav_instant
+                .is_some_and(|t| t.elapsed() < Duration::from_millis(280));
+            if in_cooldown {
+                return;
+            }
             let use_right = is_right && guard.app_state.dual_pane_enabled;
             let opt_idx = (row_idx >= 0).then_some(row_idx as usize);
             guard.open_entry_at(use_right, opt_idx);
             if let Some(w) = win_weak.upgrade() {
+                w.set_show_tab_preview(true);
                 sync_window_from_runtime(&w, &mut guard);
             }
+        });
+    }
+
+    // Mouseover File Row / Cell Details & Non-Binary Preview Card
+    {
+        let rt = Rc::clone(&rt);
+        let win_weak = window.as_weak();
+        window.on_hover_file_row(move |is_right, row_idx, abs_x, abs_y| {
+            let Some(w) = win_weak.upgrade() else {
+                return;
+            };
+            let mut guard = rt.borrow_mut();
+            if row_idx < 0 {
+                guard.last_hovered_cell = None;
+                w.set_show_hover_preview(false);
+                return;
+            }
+            let use_right = is_right && guard.app_state.dual_pane_enabled;
+            if guard.last_hovered_cell == Some((use_right, row_idx)) {
+                w.set_hover_preview_x(abs_x);
+                w.set_hover_preview_y(abs_y);
+                w.set_show_hover_preview(true);
+                return;
+            }
+            guard.last_hovered_cell = Some((use_right, row_idx));
+            let idx = row_idx as usize;
+            let meta_opt = if use_right {
+                guard.right_entries.get(idx).map(|r| r.meta.clone())
+            } else {
+                guard.left_entries.get(idx).map(|r| r.meta.clone())
+            };
+            let Some(meta) = meta_opt else {
+                w.set_show_hover_preview(false);
+                return;
+            };
+
+            let is_img = is_image_extension(meta.extension.as_deref());
+            let can_img = is_img
+                && !meta.is_dir
+                && split_remote_uri(&meta.path).is_none()
+                && meta.size.unwrap_or(0) <= 16 * 1024 * 1024;
+            let loaded_img = if can_img {
+                guard
+                    .thumbnail_cache
+                    .entry(meta.path.clone())
+                    .or_insert_with(|| Image::load_from_path(Path::new(&meta.path)).ok())
+                    .clone()
+            } else {
+                None
+            };
+            let img_dims = loaded_img.as_ref().map(|im| {
+                let s = im.size();
+                (s.width, s.height)
+            });
+
+            let (m_cat, m_l1, m_l2, _) = extract_media_metadata(&guard, &meta, img_dims);
+            let media_line = if !m_l1.is_empty() && !m_l2.is_empty() {
+                format!("{m_l1} • {m_l2}")
+            } else if !m_l1.is_empty() {
+                m_l1.clone()
+            } else {
+                m_cat
+            };
+
+            let (prev_text, has_text) = if !meta.is_dir && !is_img {
+                build_inspector_preview(&guard, &meta)
+            } else {
+                (String::new(), false)
+            };
+
+            let sym_perm = meta.permissions_matrix().to_symbolic_string();
+            let oct_perm = meta.permissions_matrix().to_octal_string();
+            let perms_s = format!("{sym_perm} ({oct_perm})");
+
+            w.set_hover_preview_x(abs_x);
+            w.set_hover_preview_y(abs_y);
+            w.set_hover_file_name(meta.display_name().into());
+            w.set_hover_file_kind(meta.kind.clone().into());
+            w.set_hover_file_size(meta.formatted_size().into());
+            w.set_hover_file_modified(meta.formatted_iso_datetime().into());
+            w.set_hover_file_perms(perms_s.into());
+            w.set_hover_media_info(media_line.into());
+            if let Some(im) = loaded_img {
+                w.set_hover_image(im);
+                w.set_hover_has_image(true);
+            } else {
+                w.set_hover_has_image(false);
+            }
+            if has_text {
+                let short_snip: String = prev_text.lines().take(7).collect::<Vec<_>>().join("\n");
+                w.set_hover_text(short_snip.into());
+                w.set_hover_has_text(true);
+            } else {
+                w.set_hover_has_text(false);
+            }
+            w.set_show_hover_preview(true);
         });
     }
 
@@ -3145,6 +4808,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                     guard.left_anchor_idx = Some(idx);
                 }
             }
+            guard.sync_terminal_cwd();
             guard.refresh_headers_and_inspector();
             let sel_list = guard.selected_metadata_list(use_right);
             let target_name = if sel_list.len() > 1 {
@@ -3153,8 +4817,36 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 sel_list.first().map(|m| m.name.clone()).unwrap_or_default()
             };
             if let Some(w) = win_weak.upgrade() {
-                sync_window_from_runtime(&w, &mut guard);
+                w.set_has_clipboard_item(!guard.clipboard_paths.is_empty());
+                sync_selection_and_inspector(&w, &mut guard);
                 w.set_context_target_name(target_name.into());
+                w.set_context_menu_x(x_pos);
+                w.set_context_menu_y(y_pos);
+                w.set_show_context_menu(true);
+            }
+        });
+    }
+
+    // Blank / Empty Directory Context Menu (New Folder, New File, Paste, Add to Favorites)
+    {
+        let rt = Rc::clone(&rt);
+        let win_weak = window.as_weak();
+        window.on_open_blank_context_menu(move |is_right, x_pos, y_pos| {
+            let mut guard = rt.borrow_mut();
+            let use_right = is_right && guard.app_state.dual_pane_enabled;
+            guard.app_state.active_pane = if use_right {
+                ActivePane::Right
+            } else {
+                ActivePane::Left
+            };
+            guard.sync_terminal_cwd();
+            guard.refresh_headers_and_inspector();
+            let cur_path = guard.current_pane_path(use_right);
+            let folder_label = guard.format_tab_title(&cur_path);
+            if let Some(w) = win_weak.upgrade() {
+                w.set_has_clipboard_item(!guard.clipboard_paths.is_empty());
+                sync_selection_and_inspector(&w, &mut guard);
+                w.set_context_target_name(folder_label.into());
                 w.set_context_menu_x(x_pos);
                 w.set_context_menu_y(y_pos);
                 w.set_show_context_menu(true);
@@ -3183,7 +4875,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                         } else {
                             vfs_parent_dir(&meta.path).unwrap_or_else(|| "/".to_string())
                         };
-                        let title = vfs_display_title(&target_dir);
+                        let title = guard.format_tab_title(&target_dir);
                         let vfs_url = if target_dir.contains("://") {
                             target_dir.clone()
                         } else {
@@ -3226,10 +4918,19 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                         return;
                     }
                 }
-                "get_info" | "quick_look" => {
+                "get_info" => {
                     guard.app_state.inspector_open = true;
+                    guard.refresh_headers_and_inspector();
                     if let Some(w) = win_weak.upgrade() {
                         w.set_inspector_tab_index(0);
+                    }
+                }
+                "quick_look" => {
+                    if let Some(w) = win_weak.upgrade() {
+                        w.set_preview_minion_zoom(1.0);
+                        w.set_show_preview_minion(true);
+                        sync_inspector_to_window(&w, &mut guard);
+                        return;
                     }
                 }
                 "rename" => {
@@ -3251,6 +4952,24 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                         return;
                     }
                 }
+                "new_file" => {
+                    if let Some(w) = win_weak.upgrade() {
+                        w.set_input_modal_mode("new_file".into());
+                        w.set_input_modal_title("New File".into());
+                        w.set_input_modal_value("untitled.txt".into());
+                        w.set_show_input_modal(true);
+                        return;
+                    }
+                }
+                "add_favorite" => {
+                    let sel_dir = sel_meta.filter(|m| m.is_dir).map(|m| (m.path, m.name));
+                    let (target_path, label) = sel_dir.unwrap_or_else(|| {
+                        let p = guard.current_pane_path(is_right);
+                        let l = guard.format_tab_title(&p);
+                        (p, l)
+                    });
+                    guard.pin_folder_to_favorites(&target_path, &label);
+                }
                 "compress" => {
                     if let Some(meta) = sel_meta {
                         let parent = Path::new(&meta.path)
@@ -3268,6 +4987,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                             .logs
                             .push(format!("[COMPRESS] Created {archive_path}"));
                         guard.start_tracked_task(&label, &archive_path, sz, label.clone(), "info");
+                        guard.invalidate_dir_cache();
                         guard.reload_pane_entries(is_right);
                     }
                 }
@@ -3294,6 +5014,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                         };
                         let toast = label.clone();
                         guard.start_tracked_task(&label, &cur_dir, total_bytes, toast, "success");
+                        guard.invalidate_dir_cache();
                         guard.reload_pane_entries(is_right);
                     }
                 }
@@ -3304,6 +5025,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                         guard.logs.push(format!("[ALIAS] -> {alias_path}"));
                         let toast = format!("Created symlink for {}", meta.name);
                         guard.show_toast("success", toast);
+                        guard.invalidate_dir_cache();
                         guard.reload_pane_entries(is_right);
                     }
                 }
@@ -3340,10 +5062,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 }
                 "paste" => {
                     let dst_dir = guard.current_pane_path(is_right);
-                    if guard.paste_clipboard_into(&dst_dir) > 0 {
-                        guard.reload_pane_entries(false);
-                        guard.reload_pane_entries(true);
-                    }
+                    guard.paste_clipboard_into(&dst_dir);
                 }
                 "copy_path" if !sel_list.is_empty() => {
                     let joined = sel_list
@@ -3364,12 +5083,13 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
             }
 
             if let Some(w) = win_weak.upgrade() {
+                w.set_show_tab_preview(true);
                 sync_window_from_runtime(&w, &mut guard);
             }
         });
     }
 
-    // Toolbar New Folder & Rename Modal triggers
+    // Toolbar New Folder, New File & Rename Modal triggers
     {
         let win_weak = window.as_weak();
         window.on_open_new_folder_modal(move || {
@@ -3377,6 +5097,17 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 w.set_input_modal_mode("new_folder".into());
                 w.set_input_modal_title("New Folder".into());
                 w.set_input_modal_value("Untitled Folder".into());
+                w.set_show_input_modal(true);
+            }
+        });
+    }
+    {
+        let win_weak = window.as_weak();
+        window.on_open_new_file_modal(move || {
+            if let Some(w) = win_weak.upgrade() {
+                w.set_input_modal_mode("new_file".into());
+                w.set_input_modal_title("New File".into());
+                w.set_input_modal_value("untitled.txt".into());
                 w.set_show_input_modal(true);
             }
         });
@@ -3418,6 +5149,15 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 if guard.vfs_create_dir(&new_dir).is_ok() {
                     guard.logs.push(format!("[MKDIR] Created {new_dir}"));
                     let toast = format!("Created folder \"{trimmed}\"");
+                    guard.show_toast("success", toast);
+                    guard.reload_pane_entries(is_right);
+                }
+            } else if mode == "new_file" {
+                let cur_dir = guard.current_pane_path(is_right);
+                let new_file = join_vfs_path(&cur_dir, trimmed);
+                if guard.vfs_write_bytes(&new_file, b"").is_ok() {
+                    guard.logs.push(format!("[TOUCH] Created {new_file}"));
+                    let toast = format!("Created file \"{trimmed}\"");
                     guard.show_toast("success", toast);
                     guard.reload_pane_entries(is_right);
                 }
@@ -3546,10 +5286,12 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 let dst_label = if permanent { "Removed" } else { "Trash" };
                 guard.start_tracked_task(&label, dst_label, total_bytes, label.clone(), "delete");
                 let _ = cur_dir;
+                guard.invalidate_dir_cache();
                 guard.reload_pane_entries(false);
                 guard.reload_pane_entries(true);
             }
             if let Some(w) = win_weak.upgrade() {
+                w.set_show_tab_preview(true);
                 sync_window_from_runtime(&w, &mut guard);
             }
         });
@@ -3563,6 +5305,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 .transfers
                 .retain(|t| t.status == TransferStatus::InProgress);
             if let Some(w) = win_weak.upgrade() {
+                w.set_show_tab_preview(true);
                 sync_window_from_runtime(&w, &mut guard);
             }
         });
@@ -3655,53 +5398,15 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
             if !guard.app_state.dual_pane_enabled {
                 return;
             }
-            let idx = row_idx as usize;
-            let in_sel = if from_right {
-                guard.right_selected_indices.contains(&idx)
-            } else {
-                guard.left_selected_indices.contains(&idx)
-            };
-            let items = if in_sel {
-                guard.selected_metadata_list(from_right)
-            } else {
-                let single = if from_right {
-                    guard.right_entries.get(idx).map(|r| r.meta.clone())
-                } else {
-                    guard.left_entries.get(idx).map(|r| r.meta.clone())
-                };
-                single.into_iter().collect()
-            };
+            let items = guard.drag_items_for_row(from_right, row_idx.max(0) as usize);
             if items.is_empty() {
                 return;
             }
             let dst_dir = guard.current_pane_path(!from_right);
-            let mut copied = 0usize;
-            let mut total_bytes = 0u64;
-            let first_name = items[0].name.clone();
-            for src_meta in &items {
-                let dst_path = join_vfs_path(&dst_dir, &src_meta.name);
-                if dst_path != src_meta.path
-                    && guard.vfs_copy_entry(&src_meta.path, &dst_path).is_ok()
-                {
-                    total_bytes += src_meta.size.unwrap_or(4096);
-                    let msg = format!("[DRAG-DROP] {} -> {dst_path}", src_meta.name);
-                    guard.logs.push(msg);
-                    copied += 1;
-                }
-            }
-            if copied > 0 {
-                let dst_title = vfs_display_title(&dst_dir);
-                let label = if copied == 1 {
-                    format!("Copied {first_name}")
-                } else {
-                    format!("Copied {copied} items")
-                };
-                let toast = format!("{label} to {dst_title}");
-                guard.start_tracked_task(&label, &dst_dir, total_bytes, toast, "success");
-                guard.reload_pane_entries(!from_right);
-                if let Some(w) = win_weak.upgrade() {
-                    sync_window_from_runtime(&w, &mut guard);
-                }
+            guard.execute_drop_target(&items, &dst_dir, false);
+            if let Some(w) = win_weak.upgrade() {
+                w.set_show_tab_preview(true);
+                sync_window_from_runtime(&w, &mut guard);
             }
         });
     }
@@ -3711,22 +5416,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
         window.on_drop_row_on_tab(
             move |from_right, row_idx, target_is_right, target_tab_idx| {
                 let mut guard = rt.borrow_mut();
-                let idx = row_idx as usize;
-                let in_sel = if from_right {
-                    guard.right_selected_indices.contains(&idx)
-                } else {
-                    guard.left_selected_indices.contains(&idx)
-                };
-                let items = if in_sel {
-                    guard.selected_metadata_list(from_right)
-                } else {
-                    let single = if from_right {
-                        guard.right_entries.get(idx).map(|r| r.meta.clone())
-                    } else {
-                        guard.left_entries.get(idx).map(|r| r.meta.clone())
-                    };
-                    single.into_iter().collect()
-                };
+                let items = guard.drag_items_for_row(from_right, row_idx.max(0) as usize);
                 if items.is_empty() {
                     return;
                 }
@@ -3747,34 +5437,9 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 let Some(dst_dir) = dst_dir_opt else {
                     return;
                 };
-                let mut copied = 0usize;
-                let mut total_bytes = 0u64;
-                let first_name = items[0].name.clone();
-                for src_meta in &items {
-                    let dst_path = join_vfs_path(&dst_dir, &src_meta.name);
-                    if dst_path != src_meta.path
-                        && guard.vfs_copy_entry(&src_meta.path, &dst_path).is_ok()
-                    {
-                        total_bytes += src_meta.size.unwrap_or(4096);
-                        let msg = format!("[TAB-DROP] {} -> {dst_path}", src_meta.name);
-                        guard.logs.push(msg);
-                        copied += 1;
-                    }
-                }
-                if copied > 0 {
-                    let dst_title = vfs_display_title(&dst_dir);
-                    let label = if copied == 1 {
-                        format!("Copied {first_name}")
-                    } else {
-                        format!("Copied {copied} items")
-                    };
-                    let toast = format!("{label} to tab {dst_title}");
-                    guard.start_tracked_task(&label, &dst_dir, total_bytes, toast, "success");
-                    guard.reload_pane_entries(false);
-                    guard.reload_pane_entries(true);
-                    if let Some(w) = win_weak.upgrade() {
-                        sync_window_from_runtime(&w, &mut guard);
-                    }
+                guard.execute_drop_target(&items, &dst_dir, false);
+                if let Some(w) = win_weak.upgrade() {
+                    sync_window_from_runtime(&w, &mut guard);
                 }
             },
         );
@@ -3818,6 +5483,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
             let parent = vfs_parent_dir(&cur).unwrap_or_else(|| "/".to_string());
             guard.navigate_to_path(use_right, parent);
             if let Some(w) = win_weak.upgrade() {
+                w.set_show_tab_preview(true);
                 sync_window_from_runtime(&w, &mut guard);
             }
         });
@@ -3854,6 +5520,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
             }
             guard.reload_pane_entries(is_right);
             if let Some(w) = win_weak.upgrade() {
+                w.set_show_tab_preview(true);
                 sync_window_from_runtime(&w, &mut guard);
             }
         });
@@ -3881,6 +5548,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
             }
             guard.reload_pane_entries(is_right);
             if let Some(w) = win_weak.upgrade() {
+                w.set_show_tab_preview(true);
                 sync_window_from_runtime(&w, &mut guard);
             }
         });
@@ -3904,6 +5572,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
             }
             guard.reload_pane_entries(use_right);
             if let Some(w) = win_weak.upgrade() {
+                w.set_show_tab_preview(true);
                 sync_window_from_runtime(&w, &mut guard);
             }
         });
@@ -3916,7 +5585,8 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
         window.on_set_view_mode(move |mode_int| {
             let mut guard = rt.borrow_mut();
             let mode = int_to_view_mode(mode_int);
-            if guard.is_right_effective() {
+            let is_right = guard.is_right_effective();
+            if is_right {
                 let idx = guard.app_state.right_active_tab;
                 if let Some(tab) = guard.app_state.right_tabs.get_mut(idx) {
                     tab.view_mode = mode;
@@ -3927,7 +5597,9 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                     tab.view_mode = mode;
                 }
             }
+            guard.reload_pane_entries(is_right);
             if let Some(w) = win_weak.upgrade() {
+                w.set_show_tab_preview(true);
                 sync_window_from_runtime(&w, &mut guard);
             }
         });
@@ -3944,6 +5616,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
             guard.reload_pane_entries(false);
             guard.reload_pane_entries(true);
             if let Some(w) = win_weak.upgrade() {
+                w.set_show_tab_preview(true);
                 sync_window_from_runtime(&w, &mut guard);
             }
         });
@@ -3956,7 +5629,11 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
         window.on_toggle_inspector(move || {
             let mut guard = rt.borrow_mut();
             guard.app_state.inspector_open = !guard.app_state.inspector_open;
+            if guard.app_state.inspector_open {
+                guard.refresh_headers_and_inspector();
+            }
             if let Some(w) = win_weak.upgrade() {
+                w.set_show_tab_preview(true);
                 sync_window_from_runtime(&w, &mut guard);
             }
         });
@@ -3999,6 +5676,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                     .logs
                     .push(format!("[PERM] {} -> {sym} ({oct})", meta.name));
                 let is_right = guard.is_right_effective();
+                guard.invalidate_dir_cache();
                 guard.reload_pane_entries(is_right);
                 if let Some(w) = win_weak.upgrade() {
                     sync_window_from_runtime(&w, &mut guard);
@@ -4039,6 +5717,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                     format!("Tagged {} items as {tag_name}", selected_list.len())
                 };
                 guard.show_toast("info", toast_msg);
+                guard.invalidate_dir_cache();
                 guard.reload_pane_entries(is_right);
                 if let Some(w) = win_weak.upgrade() {
                     sync_window_from_runtime(&w, &mut guard);
@@ -4058,6 +5737,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 let _ = guard.mounted_vfs.set_hide_extension(&meta.path, next);
                 let _ = guard.local_vfs.set_hide_extension(&meta.path, next);
                 let is_right = guard.is_right_effective();
+                guard.invalidate_dir_cache();
                 guard.reload_pane_entries(is_right);
                 if let Some(w) = win_weak.upgrade() {
                     sync_window_from_runtime(&w, &mut guard);
@@ -4077,6 +5757,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 let _ = guard.mounted_vfs.set_locked(&meta.path, next);
                 let _ = guard.local_vfs.set_locked(&meta.path, next);
                 let is_right = guard.is_right_effective();
+                guard.invalidate_dir_cache();
                 guard.reload_pane_entries(is_right);
                 if let Some(w) = win_weak.upgrade() {
                     sync_window_from_runtime(&w, &mut guard);
@@ -4136,6 +5817,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                     };
                     let toast = label.clone();
                     guard.start_tracked_task(&label, &cur_dir, total_bytes, toast, "success");
+                    guard.invalidate_dir_cache();
                     guard.reload_pane_entries(false);
                     if let Some(w) = win_weak.upgrade() {
                         sync_window_from_runtime(&w, &mut guard);
@@ -4145,63 +5827,10 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
             }
 
             let dst_dir = guard.current_pane_path(!from_right);
-            let trimmed_dst = dst_dir.trim_end_matches('/');
-            if sel_list.len() == 1 {
-                let dst_path = format!("{trimmed_dst}/{}", src_meta.name);
-                let existing = guard
-                    .mounted_vfs
-                    .metadata(&dst_path)
-                    .ok()
-                    .or_else(|| guard.local_vfs.metadata(&dst_path).ok());
-
-                if let Some(ex_meta) = existing {
-                    let src_dt = src_meta.formatted_modified_datetime();
-                    let ex_dt = ex_meta.formatted_modified_datetime();
-                    let modal = ConflictModalDescriptor::from_collision(
-                        &src_meta, &ex_meta, &src_dt, &ex_dt,
-                    );
-                    guard.pending_conflict = Some((src_meta, ex_meta, !from_right));
-                    if let Some(w) = win_weak.upgrade() {
-                        let new_dt = modal.new_item.formatted_modified;
-                        let new_sz = modal.new_item.formatted_size;
-                        let ex_dt = modal.existing_item.formatted_modified;
-                        let ex_sz = modal.existing_item.formatted_size;
-                        w.set_conflict_headline(modal.headline.into());
-                        w.set_conflict_subheadline(modal.subheadline.into());
-                        w.set_conflict_new_date(new_dt.into());
-                        w.set_conflict_new_size(new_sz.into());
-                        w.set_conflict_existing_date(ex_dt.into());
-                        w.set_conflict_existing_size(ex_sz.into());
-                        w.set_show_conflict_modal(true);
-                    }
-                    return;
-                }
-            }
-
-            let mut copied = 0usize;
-            let mut total_bytes = 0u64;
-            for item in &sel_list {
-                let dst_path = join_vfs_path(&dst_dir, &item.name);
-                if guard.vfs_copy_entry(&item.path, &dst_path).is_ok() {
-                    total_bytes += item.size.unwrap_or(4096);
-                    let msg = format!("[TRANSFER] {} -> {dst_path}", item.name);
-                    guard.logs.push(msg);
-                    copied += 1;
-                }
-            }
-            if copied > 0 {
-                let dst_title = vfs_display_title(&dst_dir);
-                let label = if copied == 1 {
-                    format!("Copied {}", src_meta.name)
-                } else {
-                    format!("Copied {copied} items")
-                };
-                let toast = format!("{label} to {dst_title}");
-                guard.start_tracked_task(&label, &dst_dir, total_bytes, toast, "success");
-                guard.reload_pane_entries(!from_right);
-                if let Some(w) = win_weak.upgrade() {
-                    sync_window_from_runtime(&w, &mut guard);
-                }
+            guard.execute_drop_target(&sel_list, &dst_dir, false);
+            if let Some(w) = win_weak.upgrade() {
+                w.set_show_tab_preview(true);
+                sync_window_from_runtime(&w, &mut guard);
             }
         });
     }
@@ -4221,32 +5850,10 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 return;
             }
             let dst_dir = guard.current_pane_path(!from_right);
-            let mut moved = 0usize;
-            let mut total_bytes = 0u64;
-            let first_name = sel_list[0].name.clone();
-            for item in &sel_list {
-                let dst_path = join_vfs_path(&dst_dir, &item.name);
-                if guard.vfs_rename(&item.path, &dst_path).is_ok() {
-                    total_bytes += item.size.unwrap_or(4096);
-                    let msg = format!("[MOVE] {} -> {dst_path}", item.name);
-                    guard.logs.push(msg);
-                    moved += 1;
-                }
-            }
-            if moved > 0 {
-                let dst_title = vfs_display_title(&dst_dir);
-                let label = if moved == 1 {
-                    format!("Moved {first_name}")
-                } else {
-                    format!("Moved {moved} items")
-                };
-                let toast = format!("{label} to {dst_title}");
-                guard.start_tracked_task(&label, &dst_dir, total_bytes, toast, "success");
-                guard.reload_pane_entries(false);
-                guard.reload_pane_entries(true);
-                if let Some(w) = win_weak.upgrade() {
-                    sync_window_from_runtime(&w, &mut guard);
-                }
+            guard.execute_drop_target(&sel_list, &dst_dir, true);
+            if let Some(w) = win_weak.upgrade() {
+                w.set_show_tab_preview(true);
+                sync_window_from_runtime(&w, &mut guard);
             }
         });
     }
@@ -4283,37 +5890,14 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 "skip" => ConflictResolution::Skip,
                 _ => ConflictResolution::Stop,
             };
-            let pending = guard.pending_conflict.take();
-            if let Some((src_meta, ex_meta, dst_is_right)) = pending {
-                let task = TransferTask {
-                    id: format!("tx-{}", guard.transfers.len() + 1),
-                    priority: TransferPriority::Foreground,
-                    source_path: src_meta.path.clone(),
-                    destination_path: ex_meta.path.clone(),
-                    total_bytes: src_meta.size.unwrap_or(0),
-                    transferred_bytes: 0,
-                    chunk_size: DEFAULT_TRANSFER_CHUNK_SIZE,
-                    max_retries: 3,
-                    status: TransferStatus::Queued,
-                    error_message: None,
-                };
-                let res = guard.transfer_engine.execute_task(
-                    task,
-                    &guard.local_vfs,
-                    &guard.local_vfs,
-                    policy,
-                    false,
-                );
-                if let Ok(done) = res {
-                    let dst = &done.destination_path;
-                    let msg = format!("[CONFLICT] {:?} -> {dst}", policy);
-                    guard.logs.push(msg);
-                    guard.transfers.push(done);
-                }
-                guard.reload_pane_entries(dst_is_right);
-            }
+            let apply_all = win_weak
+                .upgrade()
+                .is_some_and(|w| w.get_conflict_apply_all());
+            guard.resolve_batch_conflict(policy, apply_all);
             if let Some(w) = win_weak.upgrade() {
-                w.set_show_conflict_modal(false);
+                if guard.active_conflict().is_none() {
+                    w.set_conflict_apply_all(false);
+                }
                 sync_window_from_runtime(&w, &mut guard);
             }
         });
@@ -4346,36 +5930,313 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 }
             } else {
                 let cur_dir = guard.current_pane_path(false);
-                let title = vfs_display_title(&cur_dir);
+                let title = guard.format_tab_title(&cur_dir);
                 let label = format!("Refreshed {title}");
                 guard.start_tracked_task(&label, &cur_dir, 4096, label.clone(), "info");
             }
+            guard.invalidate_dir_cache();
             guard.reload_pane_entries(false);
             guard.reload_pane_entries(true);
+            if let Some(w) = win_weak.upgrade() {
+                w.set_show_tab_preview(true);
+                sync_window_from_runtime(&w, &mut guard);
+            }
+        });
+    }
+
+    // Preview Minion (Quick Look HUD) Toggle
+    {
+        let rt = Rc::clone(&rt);
+        let win_weak = window.as_weak();
+        window.on_toggle_preview_minion(move || {
+            if let Some(w) = win_weak.upgrade() {
+                let next = !w.get_show_preview_minion();
+                w.set_preview_minion_zoom(1.0);
+                w.set_show_preview_minion(next);
+                if next {
+                    let mut guard = rt.borrow_mut();
+                    sync_inspector_to_window(&w, &mut guard);
+                }
+            }
+        });
+    }
+
+    // Preferences & Themes Callbacks (persisted to ~/.config/manifold/preferences.toml)
+    {
+        let rt = Rc::clone(&rt);
+        let win_weak = window.as_weak();
+        window.on_select_theme_preset(move |preset| {
+            let mut guard = rt.borrow_mut();
+            guard.prefs.theme_preset = preset.to_string();
+            let _ = guard.prefs.save_default();
+            let toast = format!("Theme set to \"{}\"", guard.prefs.theme_preset);
+            guard.show_toast("info", toast);
+            if let Some(w) = win_weak.upgrade() {
+                w.set_show_tab_preview(true);
+                sync_window_from_runtime(&w, &mut guard);
+            }
+        });
+    }
+    {
+        let rt = Rc::clone(&rt);
+        let win_weak = window.as_weak();
+        window.on_select_font_size_delta(move |delta| {
+            let mut guard = rt.borrow_mut();
+            let clamped = delta.clamp(-1, 5);
+            guard.prefs.font_size_delta = clamped;
+            let _ = guard.prefs.save_default();
+            let toast = format!("Font size delta set to {clamped:+}");
+            guard.show_toast("info", toast);
+            if let Some(w) = win_weak.upgrade() {
+                sync_window_from_runtime(&w, &mut guard);
+            }
+        });
+    }
+    {
+        let rt = Rc::clone(&rt);
+        let win_weak = window.as_weak();
+        window.on_select_font_family(move |family| {
+            let mut guard = rt.borrow_mut();
+            guard.prefs.font_family = family.to_string();
+            let _ = guard.prefs.save_default();
+            let toast = format!("Font family set to \"{}\"", guard.prefs.font_family);
+            guard.show_toast("info", toast);
+            if let Some(w) = win_weak.upgrade() {
+                sync_window_from_runtime(&w, &mut guard);
+            }
+        });
+    }
+    {
+        let rt = Rc::clone(&rt);
+        let win_weak = window.as_weak();
+        window.on_toggle_font_bold(move || {
+            let mut guard = rt.borrow_mut();
+            guard.prefs.font_bold = !guard.prefs.font_bold;
+            let _ = guard.prefs.save_default();
+            let weight_lbl = if guard.prefs.font_bold {
+                "Bold / High-Legibility"
+            } else {
+                "Regular Weight"
+            };
+            let toast = format!("Font style set to \"{weight_lbl}\"");
+            guard.show_toast("info", toast);
             if let Some(w) = win_weak.upgrade() {
                 sync_window_from_runtime(&w, &mut guard);
             }
         });
     }
 
-    // Open Terminal Here
+    // Embedded Bottom Terminal Drawer & External OS Terminal Callbacks
+    {
+        let rt = Rc::clone(&rt);
+        let win_weak = window.as_weak();
+        window.on_open_terminal(move || {
+            let mut guard = rt.borrow_mut();
+            guard.sync_terminal_cwd();
+            if let Some(w) = win_weak.upgrade() {
+                let next = !w.get_show_terminal_drawer();
+                w.set_show_terminal_drawer(next);
+                sync_window_from_runtime(&w, &mut guard);
+            }
+        });
+    }
+    {
+        let rt = Rc::clone(&rt);
+        let win_weak = window.as_weak();
+        window.on_clear_terminal(move || {
+            let mut guard = rt.borrow_mut();
+            let cwd = guard.terminal_cwd.clone();
+            guard.terminal_output = format!("Interactive shell ready in {cwd}");
+            if let Some(w) = win_weak.upgrade() {
+                sync_window_from_runtime(&w, &mut guard);
+            }
+        });
+    }
+    {
+        let rt = Rc::clone(&rt);
+        let win_weak = window.as_weak();
+        window.on_run_terminal_command(move |raw_cmd| {
+            let cmd = raw_cmd.trim().to_string();
+            if cmd.is_empty() {
+                return;
+            }
+            let mut guard = rt.borrow_mut();
+            if guard.terminal_history.last() != Some(&cmd) {
+                guard.terminal_history.push(cmd.clone());
+            }
+            guard.terminal_history_pos = guard.terminal_history.len();
+
+            let is_right = guard.is_right_effective();
+            if cmd == "clear" {
+                let cwd = guard.terminal_cwd.clone();
+                guard.terminal_output = format!("Interactive shell ready in {cwd}");
+                if let Some(w) = win_weak.upgrade() {
+                    sync_window_from_runtime(&w, &mut guard);
+                }
+                return;
+            }
+            if cmd == "cd" || cmd.starts_with("cd ") {
+                let arg = cmd.strip_prefix("cd").unwrap_or("").trim();
+                let cur_dir = guard.current_pane_path(is_right);
+                let next_dir = if arg.is_empty() || arg == "~" {
+                    expand_tilde_path("~")
+                } else if arg == ".." {
+                    vfs_parent_dir(&cur_dir).unwrap_or_else(|| "/".to_string())
+                } else if arg.starts_with('/') || arg.contains("://") {
+                    arg.to_string()
+                } else if arg.starts_with("~/") {
+                    expand_tilde_path(arg)
+                } else {
+                    join_vfs_path(&cur_dir, arg)
+                };
+                guard.navigate_to_path(is_right, next_dir);
+                if let Some(w) = win_weak.upgrade() {
+                    sync_window_from_runtime(&w, &mut guard);
+                }
+                return;
+            }
+
+            let cwd = guard.terminal_cwd.clone();
+            let header = format!("\n$ {cmd}");
+            guard.terminal_output.push_str(&header);
+            let effective_cmd = normalize_terminal_command(&cmd);
+
+            if let Some((prefix, rel)) = split_remote_uri(&cwd) {
+                guard.ensure_remote_connected(&prefix);
+                let output_text = if let Some(remote) = guard.remote_backends.get(&prefix) {
+                    let sub = if rel.is_empty() { "/" } else { rel.as_str() };
+                    match remote.execute_shell_in_dir(sub, &effective_cmd) {
+                        Ok(out) => out,
+                        Err(e) => format!("Error: {e}"),
+                    }
+                } else {
+                    format!("Error: Remote host {prefix} is not connected.")
+                };
+                if !output_text.trim().is_empty() {
+                    guard.terminal_output.push('\n');
+                    guard.terminal_output.push_str(output_text.trim_end());
+                }
+            } else {
+                let sent_to_pty = if let Some(pty) = &mut guard.pty_shell {
+                    pty.sync_cwd(&cwd);
+                    pty.send_line(&effective_cmd)
+                } else {
+                    false
+                };
+                if sent_to_pty {
+                    std::thread::sleep(Duration::from_millis(65));
+                    let _ = guard.poll_pty_output();
+                } else {
+                    let run_dir = if Path::new(&cwd).is_dir() {
+                        cwd.as_str()
+                    } else {
+                        "/"
+                    };
+                    let timeout = Duration::from_millis(2500);
+                    let out = run_local_command_bounded(run_dir, &effective_cmd, timeout);
+                    if !out.trim().is_empty() {
+                        guard.terminal_output.push('\n');
+                        guard.terminal_output.push_str(out.trim_end());
+                    }
+                }
+            }
+
+            if guard.terminal_output.len() > 8192 {
+                let start = guard.terminal_output.len() - 8192;
+                guard.terminal_output = guard.terminal_output[start..].to_string();
+            }
+            guard.invalidate_dir_cache();
+            guard.reload_pane_entries(is_right);
+            if let Some(w) = win_weak.upgrade() {
+                sync_window_from_runtime(&w, &mut guard);
+            }
+        });
+    }
+    {
+        let rt = Rc::clone(&rt);
+        let win_weak = window.as_weak();
+        window.on_terminal_key_event(move |action, _ctrl| {
+            let Some(w) = win_weak.upgrade() else {
+                return false;
+            };
+            let mut guard = rt.borrow_mut();
+            match action.as_str() {
+                "up" => {
+                    if !guard.terminal_history.is_empty() && guard.terminal_history_pos > 0 {
+                        guard.terminal_history_pos -= 1;
+                        let entry = guard.terminal_history[guard.terminal_history_pos].clone();
+                        w.set_terminal_command_input(entry.into());
+                    }
+                    true
+                }
+                "down" => {
+                    if guard.terminal_history_pos < guard.terminal_history.len() {
+                        guard.terminal_history_pos += 1;
+                        let entry = if guard.terminal_history_pos < guard.terminal_history.len() {
+                            guard.terminal_history[guard.terminal_history_pos].clone()
+                        } else {
+                            String::new()
+                        };
+                        w.set_terminal_command_input(entry.into());
+                    }
+                    true
+                }
+                "ctrl_c" => {
+                    if let Some(pty) = &mut guard.pty_shell {
+                        pty.send_interrupt();
+                    }
+                    guard.terminal_output.push_str("\n^C");
+                    w.set_terminal_command_input(SharedString::default());
+                    w.set_terminal_output(guard.terminal_output.clone().into());
+                    true
+                }
+                "escape" => {
+                    if let Some(pty) = &mut guard.pty_shell {
+                        pty.send_interrupt();
+                    }
+                    if !w.get_terminal_command_input().is_empty() {
+                        w.set_terminal_command_input(SharedString::default());
+                    } else {
+                        w.set_show_terminal_drawer(false);
+                        w.invoke_focus_main_key_router();
+                    }
+                    true
+                }
+                _ => false,
+            }
+        });
+    }
+    {
+        let win_weak = window.as_weak();
+        window.on_open_external_terminal(move || {
+            if let Some(w) = win_weak.upgrade() {
+                w.invoke_open_terminal_here();
+            }
+        });
+    }
+
+    // Open Integrated Bottom Terminal Here
     {
         let rt = Rc::clone(&rt);
         let win_weak = window.as_weak();
         window.on_open_terminal_here(move || {
             let mut guard = rt.borrow_mut();
             let is_right = guard.is_right_effective();
-            let dir = guard.current_pane_path(is_right);
-            if cfg!(target_os = "macos") {
-                let target = if Path::new(&dir).exists() { &dir } else { "/" };
-                let args = ["-a", "Terminal", target];
-                let _ = Command::new("open").args(args).spawn();
-            } else if let Ok(spec) = TerminalIntegration::build_local_terminal(".") {
-                let _ = Command::new(&spec.program).args(&spec.args).spawn();
+            let sel_dir = guard
+                .selected_metadata()
+                .filter(|m| m.is_dir)
+                .map(|m| m.path.clone())
+                .unwrap_or_else(|| guard.current_pane_path(is_right));
+            if guard.terminal_cwd != sel_dir {
+                guard.terminal_cwd = sel_dir.clone();
+                if let Some(pty) = &mut guard.pty_shell {
+                    pty.sync_cwd(&sel_dir);
+                }
             }
-            let msg = format!("[TERM] Opened terminal at {dir}");
+            let msg = format!("[TERM] Opened integrated bottom terminal at {sel_dir}");
             guard.logs.push(msg);
             if let Some(w) = win_weak.upgrade() {
+                w.set_show_terminal_drawer(true);
                 sync_window_from_runtime(&w, &mut guard);
             }
         });
@@ -4645,8 +6506,6 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                     guard.logs.push(msg);
                     let toast = format!("Saved \"{display_label}\" (offline: {host_name})");
                     guard.show_toast("info", toast);
-                    guard.app_state.inspector_open = true;
-                    w.set_inspector_tab_index(2);
                 }
             }
             w.set_connect_editing_id(SharedString::default());
@@ -4678,9 +6537,78 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 return;
             };
             let mut guard = rt.borrow_mut();
+            if guard.poll_pty_output() {
+                w.set_terminal_output(guard.terminal_output.clone().into());
+            }
             let mut need_transfer_sync = false;
+            let mut need_full_sync = false;
 
-            if guard.active_task_ticks > 0 {
+            while let Ok(ev) = guard.worker_rx.try_recv() {
+                match ev {
+                    BgWorkerEvent::Progress {
+                        task_id,
+                        transferred,
+                        total,
+                        label,
+                    } => {
+                        let tot = total.max(1);
+                        let pct = ((transferred.saturating_mul(100)) / tot).clamp(5, 99);
+                        guard.active_task_label = label.clone();
+                        guard.active_task_progress = pct as i32;
+                        for task in &mut guard.transfers {
+                            if task.id == task_id {
+                                task.transferred_bytes = transferred;
+                                task.total_bytes = tot;
+                            }
+                        }
+                        w.set_active_task_label(label.into());
+                        w.set_active_task_progress(guard.active_task_progress);
+                        need_transfer_sync = true;
+                    }
+                    BgWorkerEvent::Finished {
+                        task_id,
+                        ok_count,
+                        err_msg,
+                        toast_msg,
+                    } => {
+                        guard.bg_tasks_in_flight = guard.bg_tasks_in_flight.saturating_sub(1);
+                        let is_ok = err_msg.is_none() && ok_count > 0;
+                        for task in &mut guard.transfers {
+                            if task.id == task_id {
+                                if is_ok {
+                                    task.transferred_bytes = task.total_bytes;
+                                    task.status = TransferStatus::Completed;
+                                } else {
+                                    task.status = TransferStatus::Failed;
+                                    task.error_message = err_msg.clone();
+                                }
+                            }
+                        }
+                        let log_line = match &err_msg {
+                            Some(e) => format!("[BG-ERROR] {toast_msg} ({e})"),
+                            None => format!("[BG-DONE] {toast_msg}"),
+                        };
+                        guard.logs.push(log_line);
+                        let toast_kind = if is_ok { "success" } else { "info" };
+                        guard.show_toast(toast_kind, toast_msg);
+                        if guard.bg_tasks_in_flight == 0 && guard.active_task_ticks == 0 {
+                            guard.active_task_progress = 100;
+                        }
+                        guard.invalidate_dir_cache();
+                        guard.reload_pane_entries(false);
+                        guard.reload_pane_entries(true);
+                        need_transfer_sync = true;
+                        need_full_sync = true;
+                    }
+                }
+            }
+
+            if guard.bg_tasks_in_flight > 0 {
+                guard.spinner_frame = (guard.spinner_frame + 1) % 8;
+                w.set_task_running(true);
+                w.set_spinner_frame(guard.spinner_frame);
+                w.set_active_task_progress(guard.active_task_progress);
+            } else if guard.active_task_ticks > 0 {
                 guard.active_task_ticks -= 1;
                 guard.spinner_frame = (guard.spinner_frame + 1) % 8;
                 let rem = guard.active_task_ticks as i32;
@@ -4703,6 +6631,8 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 w.set_task_running(!finished);
                 w.set_spinner_frame(guard.spinner_frame);
                 w.set_active_task_progress(guard.active_task_progress);
+            } else {
+                w.set_task_running(false);
             }
 
             if guard.toast_ticks > 0 {
@@ -4712,7 +6642,9 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 }
             }
 
-            if need_transfer_sync {
+            if need_full_sync {
+                sync_window_from_runtime(&w, &mut guard);
+            } else if need_transfer_sync {
                 let tr_rows: Vec<TransferRowSlint> = guard
                     .transfers
                     .iter()
@@ -4922,17 +6854,60 @@ fn handle_keyboard_shortcut(
     let (cmd, alt, shift) = mods;
     let k_low = key.to_lowercase();
 
-    // Escape closes active popovers, modals, or path edit mode
+    // Escape closes active popovers, modals, hover preview, path edit mode, or terminal drawer
     if key == "\u{001b}" {
+        let had_overlay = w.get_show_app_menu()
+            || w.get_show_context_menu()
+            || w.get_show_sidebar_context_menu()
+            || w.get_show_sibling_dropdown()
+            || w.get_show_tasks_popover()
+            || w.get_show_preview_minion()
+            || w.get_show_hover_preview()
+            || w.get_show_preferences_modal()
+            || w.get_show_input_modal()
+            || w.get_show_delete_modal()
+            || w.get_show_connect_modal()
+            || w.get_show_conflict_modal()
+            || w.get_left_path_edit_mode()
+            || w.get_right_path_edit_mode();
+        w.set_show_app_menu(false);
         w.set_show_context_menu(false);
         w.set_show_sidebar_context_menu(false);
         w.set_show_sibling_dropdown(false);
         w.set_show_tasks_popover(false);
+        w.set_show_preview_minion(false);
+        w.set_show_hover_preview(false);
+        w.set_show_preferences_modal(false);
         w.set_show_input_modal(false);
         w.set_show_delete_modal(false);
         w.set_show_connect_modal(false);
+        if w.get_show_conflict_modal() {
+            rt.borrow_mut().pending_batch = None;
+            w.set_conflict_apply_all(false);
+        }
+        w.set_show_conflict_modal(false);
         w.set_left_path_edit_mode(false);
         w.set_right_path_edit_mode(false);
+        if !had_overlay {
+            if w.get_show_terminal_drawer() {
+                if let Some(pty) = &mut rt.borrow_mut().pty_shell {
+                    pty.send_interrupt();
+                }
+                w.set_show_terminal_drawer(false);
+            } else if !w.get_search_query().is_empty() {
+                let is_right = rt.borrow().is_right_effective();
+                w.set_search_query(SharedString::default());
+                w.invoke_clear_pane_filter(is_right);
+            }
+        }
+        w.invoke_focus_main_key_router();
+        return true;
+    }
+
+    // Ctrl+, / Cmd+,: Open Preferences & Themes Modal
+    if cmd && !alt && key == "," {
+        w.set_show_app_menu(false);
+        w.set_show_preferences_modal(true);
         return true;
     }
 
@@ -5111,14 +7086,15 @@ fn handle_keyboard_shortcut(
         return true;
     }
 
-    // Ctrl+F / Cmd+F: Clear/focus inline filter
+    // Ctrl+F / Cmd+F: Focus inline filter box in top toolbar
     if cmd && k_low == "f" {
+        w.invoke_focus_filter_box();
         return true;
     }
 
-    // Space: Toggle Quick Look / Inspector Panel
+    // Space: Toggle Preview Minion (Quick Look HUD)
     if key == " " && !cmd && !alt {
-        w.invoke_toggle_inspector();
+        w.invoke_toggle_preview_minion();
         return true;
     }
 
@@ -5154,10 +7130,71 @@ fn handle_keyboard_shortcut(
         return true;
     }
 
-    // UpArrow (`\u{f700}`) / DownArrow (`\u{f701}`): Move or Shift-extend selection up/down
-    if key == "\u{f700}" || key == "\u{f701}" {
+    // LeftArrow (`\u{f702}`) / RightArrow (`\u{f703}`): Enter folder / Parent dir or Icon Grid step
+    if !cmd && !alt && (key == "\u{f702}" || key == "\u{f703}") {
         let mut guard = rt.borrow_mut();
         let is_right = guard.is_right_effective();
+        let view_mode = guard.app_state.toolbar.active_view_mode;
+        if view_mode == PaneViewMode::Icons {
+            let len = if is_right {
+                guard.right_entries.len()
+            } else {
+                guard.left_entries.len()
+            };
+            if len > 0 {
+                let cur = if is_right {
+                    guard.right_selected_idx.unwrap_or(0)
+                } else {
+                    guard.left_selected_idx.unwrap_or(0)
+                };
+                let next = if key == "\u{f702}" {
+                    cur.saturating_sub(1)
+                } else {
+                    (cur + 1).min(len - 1)
+                };
+                guard.apply_row_selection(is_right, next, shift, false);
+                guard.refresh_headers_and_inspector();
+                sync_selection_and_inspector(w, &mut guard);
+                drop(guard);
+                w.invoke_ensure_row_visible(is_right, next as i32);
+            }
+            return true;
+        }
+        if key == "\u{f702}" {
+            drop(guard);
+            w.invoke_navigate_up(is_right);
+            return true;
+        }
+        let cur_opt = if is_right {
+            guard.right_selected_idx
+        } else {
+            guard.left_selected_idx
+        };
+        if let Some(cur) = cur_opt {
+            let is_dir = if is_right {
+                guard.right_entries.get(cur).is_some_and(|r| r.meta.is_dir)
+            } else {
+                guard.left_entries.get(cur).is_some_and(|r| r.meta.is_dir)
+            };
+            if is_dir {
+                guard.open_entry_at(is_right, Some(cur));
+                sync_window_from_runtime(w, &mut guard);
+            }
+        }
+        return true;
+    }
+
+    // UpArrow / DownArrow / Home / End / PageUp / PageDown: Move or Shift-extend selection
+    if key == "\u{f700}"
+        || key == "\u{f701}"
+        || key == "\u{f729}"
+        || key == "\u{f72b}"
+        || key == "\u{f72c}"
+        || key == "\u{f72d}"
+    {
+        let mut guard = rt.borrow_mut();
+        let is_right = guard.is_right_effective();
+        let view_mode = guard.app_state.toolbar.active_view_mode;
         let len = if is_right {
             guard.right_entries.len()
         } else {
@@ -5169,14 +7206,25 @@ fn handle_keyboard_shortcut(
             } else {
                 guard.left_selected_idx.unwrap_or(0)
             };
-            let next = if key == "\u{f700}" {
-                cur.saturating_sub(1)
+            let step = if view_mode == PaneViewMode::Icons {
+                3
             } else {
-                (cur + 1).min(len - 1)
+                1
+            };
+            let next = match key {
+                "\u{f700}" => cur.saturating_sub(step),
+                "\u{f701}" => (cur + step).min(len - 1),
+                "\u{f729}" => 0,
+                "\u{f72b}" => len - 1,
+                "\u{f72c}" => cur.saturating_sub(12),
+                "\u{f72d}" => (cur + 12).min(len - 1),
+                _ => cur,
             };
             guard.apply_row_selection(is_right, next, shift, false);
             guard.refresh_headers_and_inspector();
-            sync_window_from_runtime(w, &mut guard);
+            sync_selection_and_inspector(w, &mut guard);
+            drop(guard);
+            w.invoke_ensure_row_visible(is_right, next as i32);
         }
         return true;
     }
@@ -5200,6 +7248,88 @@ fn handle_keyboard_shortcut(
     }
 
     false
+}
+
+fn normalize_terminal_command(raw_cmd: &str) -> String {
+    let trimmed = raw_cmd.trim();
+    let is_interactive_top = trimmed == "top"
+        || (trimmed.starts_with("top ") && !trimmed.contains("-l") && !trimmed.contains("-b"));
+    if is_interactive_top {
+        if cfg!(target_os = "macos") {
+            return "top -l 1 -n 25".to_string();
+        }
+        return "top -b -n 1 | head -n 35".to_string();
+    }
+    if trimmed == "htop" || trimmed == "btop" {
+        return "ps aux | head -n 30".to_string();
+    }
+    if trimmed.starts_with("ping ") && !trimmed.contains(" -c ") {
+        let rest = trimmed.strip_prefix("ping ").unwrap_or("").trim();
+        return format!("ping -c 4 {rest}");
+    }
+    if trimmed.starts_with("tail -f ") {
+        let rest = trimmed.strip_prefix("tail -f ").unwrap_or("").trim();
+        return format!("tail -n 50 {rest}");
+    }
+    if trimmed == "yes" || trimmed.starts_with("yes ") {
+        return "echo '[Interactive infinite stream bounded]'".to_string();
+    }
+    trimmed.to_string()
+}
+
+fn run_local_command_bounded(run_dir: &str, cmd: &str, timeout: Duration) -> String {
+    let mut child = match Command::new("sh")
+        .args(["-c", cmd])
+        .current_dir(run_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return format!("Error executing command: {e}"),
+    };
+
+    let start = Instant::now();
+    let mut timed_out = false;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    timed_out = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(_) => break,
+        }
+    }
+
+    let mut out_bytes = Vec::new();
+    let mut err_bytes = Vec::new();
+    if let Some(out_pipe) = child.stdout.take() {
+        let _ = out_pipe.take(16384).read_to_end(&mut out_bytes);
+    }
+    if let Some(err_pipe) = child.stderr.take() {
+        let _ = err_pipe.take(16384).read_to_end(&mut err_bytes);
+    }
+    let stdout = String::from_utf8_lossy(&out_bytes);
+    let stderr = String::from_utf8_lossy(&err_bytes);
+    let mut combined = if stderr.trim().is_empty() {
+        stdout.trim_end().to_string()
+    } else if stdout.trim().is_empty() {
+        stderr.trim_end().to_string()
+    } else {
+        format!("{}\n{}", stdout.trim_end(), stderr.trim_end())
+    };
+    if timed_out {
+        let note = "\n[Command timed out after 2.5s — interactive process stopped]";
+        combined.push_str(note);
+    }
+    combined
 }
 
 #[cfg(test)]
@@ -5288,5 +7418,63 @@ mod tests {
         assert_eq!(items[1].name, "alpha_dir");
         assert_eq!(items[2].name, "b_small.txt");
         assert_eq!(items[3].name, "a_large.bin");
+    }
+
+    #[test]
+    fn test_remote_tab_title_includes_connection_name_and_path() {
+        let mut rt = GuiRuntime::new(ManifoldAppState::new_reference_workspace());
+        rt.saved_connections.connections.push(ConnectionProfile {
+            id: "conn-prod".to_string(),
+            name: "Prod SFTP".to_string(),
+            group: None,
+            protocol: ProtocolType::Sftp,
+            host: Some("deploy.example.com".to_string()),
+            port: Some(22),
+            endpoint: None,
+            bucket: None,
+            region: None,
+            username: "ubuntu".to_string(),
+            auth_type: AuthType::Password,
+            key_path: None,
+            base_path: "/var/www".to_string(),
+            local_path: None,
+            base_url: None,
+            text_encoding: "Unicode (UTF-8)".to_string(),
+            note: String::new(),
+            color_label: ColorLabel::Green,
+            show_advanced: true,
+        });
+        let title = rt.format_tab_title("sftp://ubuntu@deploy.example.com:22/var/www/html");
+        assert_eq!(title, "Prod SFTP: /var/www/html");
+    }
+
+    #[test]
+    fn test_batch_transfer_conflict_detection_and_keep_both() {
+        let mut rt = GuiRuntime::new(ManifoldAppState::new_reference_workspace());
+        let src_dir = "/tmp/manifold_conflict_src";
+        let dst_dir = "/tmp/manifold_conflict_dst";
+        let _ = rt.local_vfs.remove(src_dir, true);
+        let _ = rt.local_vfs.remove(dst_dir, true);
+        rt.local_vfs.create_dir(src_dir).unwrap();
+        rt.local_vfs.create_dir(dst_dir).unwrap();
+
+        let src_file = format!("{src_dir}/cert.pdf");
+        let dst_file = format!("{dst_dir}/cert.pdf");
+        rt.local_vfs.write_bytes(&src_file, b"new-pdf").unwrap();
+        rt.local_vfs.write_bytes(&dst_file, b"old-pdf").unwrap();
+
+        let src_meta = rt.local_vfs.metadata(&src_file).unwrap();
+        rt.execute_drop_target(std::slice::from_ref(&src_meta), dst_dir, false);
+        assert!(rt.active_conflict().is_some());
+
+        rt.resolve_batch_conflict(ConflictResolution::KeepBoth, false);
+        assert!(rt.active_conflict().is_none());
+
+        let kept_copy = format!("{dst_dir}/cert 2.pdf");
+        assert!(rt.local_vfs.metadata(&dst_file).is_ok());
+        assert!(rt.local_vfs.metadata(&kept_copy).is_ok());
+
+        let _ = rt.local_vfs.remove(src_dir, true);
+        let _ = rt.local_vfs.remove(dst_dir, true);
     }
 }

@@ -504,6 +504,128 @@ impl SessionState {
     }
 }
 
+fn default_fav_icon_kind() -> String {
+    "folder".to_string()
+}
+
+/// Pinned folder shortcut in the Left Sidebar `Favorites` section.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FavoriteFolderEntry {
+    pub id: String,
+    pub label: String,
+    pub vfs_url: String,
+    #[serde(default = "default_fav_icon_kind")]
+    pub icon_kind: String,
+    #[serde(default)]
+    pub color_label: ColorLabel,
+}
+
+fn default_theme_preset() -> String {
+    "dark_zinc".to_string()
+}
+
+const fn default_font_size_delta() -> i32 {
+    1
+}
+
+fn default_font_family() -> String {
+    "sans-serif".to_string()
+}
+
+/// Persistent UI Preferences (`preferences.toml`) for Typography, Themes, and Favorites.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppPreferences {
+    #[serde(default = "default_theme_preset")]
+    pub theme_preset: String,
+    #[serde(default = "default_font_size_delta")]
+    pub font_size_delta: i32,
+    #[serde(default = "default_font_family")]
+    pub font_family: String,
+    #[serde(default)]
+    pub font_bold: bool,
+    #[serde(default)]
+    pub custom_favorites: Vec<FavoriteFolderEntry>,
+    #[serde(default)]
+    pub favorite_order: Vec<String>,
+}
+
+impl Default for AppPreferences {
+    fn default() -> Self {
+        Self {
+            theme_preset: default_theme_preset(),
+            font_size_delta: default_font_size_delta(),
+            font_family: default_font_family(),
+            font_bold: false,
+            custom_favorites: Vec::new(),
+            favorite_order: Vec::new(),
+        }
+    }
+}
+
+impl AppPreferences {
+    pub fn from_toml_str(input: &str) -> Result<Self, ConfigError> {
+        Ok(toml::from_str(input)?)
+    }
+
+    pub fn to_toml_string(&self) -> Result<String, ConfigError> {
+        Ok(toml::to_string_pretty(self)?)
+    }
+
+    pub fn default_config_path() -> PathBuf {
+        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+            if !xdg.trim().is_empty() {
+                return PathBuf::from(xdg).join("manifold").join("preferences.toml");
+            }
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            if !home.trim().is_empty() {
+                return PathBuf::from(home)
+                    .join(".config")
+                    .join("manifold")
+                    .join("preferences.toml");
+            }
+        }
+        PathBuf::from("/tmp/manifold/preferences.toml")
+    }
+
+    pub fn load_default() -> Self {
+        let path = Self::default_config_path();
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|s| Self::from_toml_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save_default(&self) -> Result<(), ConfigError> {
+        let path = Self::default_config_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let serialized = self.to_toml_string()?;
+        fs::write(path, serialized)?;
+        Ok(())
+    }
+
+    pub fn upsert_favorite(&mut self, entry: FavoriteFolderEntry) {
+        let existing = self
+            .custom_favorites
+            .iter_mut()
+            .find(|f| f.id == entry.id || f.vfs_url == entry.vfs_url);
+        if let Some(found) = existing {
+            *found = entry;
+        } else {
+            self.custom_favorites.push(entry);
+        }
+    }
+
+    pub fn remove_favorite(&mut self, id_or_url: &str) -> bool {
+        let prev = self.custom_favorites.len();
+        self.custom_favorites
+            .retain(|f| f.id != id_or_url && f.vfs_url != id_or_url);
+        self.custom_favorites.len() != prev
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -594,5 +716,34 @@ sort_direction = "ascending"
         assert_eq!(state.left_pane.active_tab_index, 2);
         assert_eq!(state.left_pane.tabs.len(), 3);
         assert_eq!(state.right_pane.tabs[2].view_mode, PaneViewMode::Icons);
+    }
+
+    #[test]
+    fn preferences_roundtrips_and_manages_favorites() {
+        let mut prefs = AppPreferences::default();
+        assert_eq!(prefs.font_size_delta, 1);
+        assert_eq!(prefs.theme_preset, "dark_zinc");
+        assert_eq!(prefs.font_family, "sans-serif");
+
+        prefs.theme_preset = "midnight_ocean".to_string();
+        prefs.font_size_delta = 2;
+        prefs.font_family = "monospace".to_string();
+        prefs.font_bold = true;
+        prefs.upsert_favorite(FavoriteFolderEntry {
+            id: "fav-work".to_string(),
+            label: "Workspace".to_string(),
+            vfs_url: "/tmp/workspace".to_string(),
+            icon_kind: "folder".to_string(),
+            color_label: ColorLabel::Blue,
+        });
+        assert_eq!(prefs.custom_favorites.len(), 1);
+
+        let serialized = prefs.to_toml_string().unwrap();
+        let parsed = AppPreferences::from_toml_str(&serialized).unwrap();
+        assert_eq!(parsed, prefs);
+
+        let mut updated = parsed;
+        assert!(updated.remove_favorite("/tmp/workspace"));
+        assert!(updated.custom_favorites.is_empty());
     }
 }

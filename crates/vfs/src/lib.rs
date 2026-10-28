@@ -314,6 +314,17 @@ impl FileMetadata {
             None => "--".to_string(),
         }
     }
+
+    /// Formats `modified` as `"DD/MM/YYYY, HH:mm"` for the Conflict Resolution Modal.
+    pub fn formatted_conflict_datetime(&self) -> String {
+        match self.modified {
+            Some(t) => {
+                let (y, m, d, hh, mm) = system_time_to_civil(t);
+                format!("{d:02}/{m:02}/{y:04}, {hh:02}:{mm:02}")
+            }
+            None => "--".to_string(),
+        }
+    }
 }
 
 /// Converts a [`SystemTime`] into `(year, month, day, hour, minute)` in UTC.
@@ -534,7 +545,11 @@ impl LocalFsBackend {
         })?;
 
         let is_symlink = sym_meta.file_type().is_symlink();
-        let target_meta = fs::metadata(path).unwrap_or_else(|_| sym_meta.clone());
+        let target_meta = if is_symlink {
+            fs::metadata(path).unwrap_or(sym_meta)
+        } else {
+            sym_meta
+        };
         let is_dir = target_meta.is_dir();
 
         let raw_name = path.file_name().and_then(|n| n.to_str());

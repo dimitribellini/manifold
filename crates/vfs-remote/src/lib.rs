@@ -29,8 +29,9 @@ if pid == 0:
 
 out = bytearray()
 sent_pw = False
+timeout_sec = float(os.environ.get("MANIFOLD_SSH_TIMEOUT", "30.0"))
 while True:
-    r, _, _ = select.select([fd], [], [], 8.0)
+    r, _, _ = select.select([fd], [], [], timeout_sec)
     if not r:
         break
     try:
@@ -61,6 +62,7 @@ struct RemoteNode {
 }
 
 /// Unified Remote VFS Backend supporting SFTP, S3, Google Drive, GCS, Azure, FTP/FTPS, WebDAV, and SMB.
+#[derive(Clone)]
 pub struct RemoteVfsBackend {
     profile: ConnectionProfile,
     secret: Option<String>,
@@ -198,13 +200,18 @@ impl RemoteVfsBackend {
         Ok((args, target))
     }
 
-    fn exec_pty_cmd(&self, cmd_vec: &[String]) -> Result<Vec<u8>, VfsError> {
+    fn exec_pty_cmd_with_timeout(
+        &self,
+        cmd_vec: &[String],
+        timeout_sec: &str,
+    ) -> Result<Vec<u8>, VfsError> {
         let pass = self.secret.as_deref().unwrap_or("");
         let out = Command::new("python3")
             .arg("-c")
             .arg(PTY_SSH_SCRIPT)
             .args(cmd_vec)
             .env("MANIFOLD_SSH_PASS", pass)
+            .env("MANIFOLD_SSH_TIMEOUT", timeout_sec)
             .output()
             .map_err(|e| VfsError::NetworkError(format!("Failed to invoke python3/ssh: {e}")))?;
         if !out.status.success() {
@@ -217,6 +224,10 @@ impl RemoteVfsBackend {
             return Err(VfsError::NetworkError(msg));
         }
         Ok(out.stdout)
+    }
+
+    fn exec_pty_cmd(&self, cmd_vec: &[String]) -> Result<Vec<u8>, VfsError> {
+        self.exec_pty_cmd_with_timeout(cmd_vec, "30.0")
     }
 
     fn run_remote_shell(&self, remote_sh: &str) -> Result<String, VfsError> {
@@ -233,6 +244,107 @@ impl RemoteVfsBackend {
         } else {
             Ok(text)
         }
+    }
+
+    /// Executes a command inside `remote_dir` for the embedded bottom terminal.
+    pub fn execute_shell_in_dir(&self, remote_dir: &str, cmd: &str) -> Result<String, VfsError> {
+        self.ensure_connected()?;
+        let norm = Self::normalize_remote_path(remote_dir)?;
+        if self.live_ssh {
+            let esc = norm.replace('\'', "'\\''");
+            let sh = format!("cd '{esc}' 2>/dev/null && ({cmd}) 2>&1");
+            return self.run_remote_shell(&sh);
+        }
+        Ok(format!("[{}] ({norm}) $ {cmd}\nOK\n", self.profile.name))
+    }
+
+    /// Streams a local file directly to a remote path without buffering the entire file in RAM.
+    pub fn upload_local_file(&self, local_path: &Path, remote_path: &str) -> Result<(), VfsError> {
+        self.ensure_connected()?;
+        let norm = Self::normalize_remote_path(remote_path)?;
+        if self.live_ssh {
+            let (base_args, target) = self.ssh_base_args(true)?;
+            let local_str = local_path.to_string_lossy().to_string();
+            let mut cmd_vec = vec!["scp".to_string()];
+            cmd_vec.extend(base_args);
+            cmd_vec.push(local_str);
+            cmd_vec.push(format!("{target}:{norm}"));
+            self.exec_pty_cmd_with_timeout(&cmd_vec, "3600.0")?;
+            return Ok(());
+        }
+        let file_meta = fs::metadata(local_path)?;
+        let file_len = file_meta.len();
+        let sample = if file_len <= 65_536 {
+            fs::read(local_path).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if let Some((parent, _)) = norm.rsplit_once('/') {
+            let parent_norm = if parent.is_empty() { "/" } else { parent };
+            if !self.nodes.read().unwrap().contains_key(parent_norm) {
+                self.create_dir(parent_norm)?;
+            }
+        }
+        let name = norm.rsplit('/').next().unwrap_or(&norm).to_string();
+        let (extension, kind) = manifold_vfs::infer_file_kind(&name, false);
+        let mut nodes = self.nodes.write().unwrap();
+        nodes.insert(
+            norm.clone(),
+            RemoteNode {
+                metadata: FileMetadata {
+                    name,
+                    path: norm,
+                    extension,
+                    kind,
+                    size: Some(file_len),
+                    is_dir: false,
+                    is_symlink: false,
+                    is_hidden: false,
+                    is_locked: false,
+                    hide_extension: false,
+                    color_label: ColorLabel::None,
+                    modified: Some(SystemTime::now()),
+                    created: Some(SystemTime::now()),
+                    added: Some(SystemTime::now()),
+                    permissions: 0o644,
+                    owner: Some(self.profile.username.clone()),
+                    group: Some("staff".to_string()),
+                },
+                data: sample,
+            },
+        );
+        Ok(())
+    }
+
+    /// Streams a remote file directly to a local path without buffering the entire file in RAM.
+    pub fn download_to_local_file(
+        &self,
+        remote_path: &str,
+        local_path: &Path,
+    ) -> Result<(), VfsError> {
+        self.ensure_connected()?;
+        let norm = Self::normalize_remote_path(remote_path)?;
+        if self.live_ssh {
+            let (base_args, target) = self.ssh_base_args(true)?;
+            let local_str = local_path.to_string_lossy().to_string();
+            let mut cmd_vec = vec!["scp".to_string()];
+            cmd_vec.extend(base_args);
+            cmd_vec.push(format!("{target}:{norm}"));
+            cmd_vec.push(local_str);
+            self.exec_pty_cmd_with_timeout(&cmd_vec, "3600.0")?;
+            return Ok(());
+        }
+        let nodes = self.nodes.read().unwrap();
+        let found = nodes
+            .get(&norm)
+            .map(|n| n.data.clone())
+            .ok_or(VfsError::NotFound(norm))?;
+        drop(nodes);
+        if let Some(parent) = local_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(local_path, &found)?;
+        Ok(())
     }
 
     pub fn profile(&self) -> &ConnectionProfile {
