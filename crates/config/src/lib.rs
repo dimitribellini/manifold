@@ -221,7 +221,15 @@ impl ConnectionsConfig {
                 return PathBuf::from(xdg).join("manifold").join("connections.toml");
             }
         }
-        if let Ok(home) = std::env::var("HOME") {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            if !appdata.trim().is_empty() {
+                return PathBuf::from(appdata)
+                    .join("Manifold")
+                    .join("connections.toml");
+            }
+        }
+        let home_var = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"));
+        if let Ok(home) = home_var {
             if !home.trim().is_empty() {
                 return PathBuf::from(home)
                     .join(".config")
@@ -229,7 +237,9 @@ impl ConnectionsConfig {
                     .join("connections.toml");
             }
         }
-        PathBuf::from("/tmp/manifold/connections.toml")
+        std::env::temp_dir()
+            .join("manifold")
+            .join("connections.toml")
     }
 
     pub fn load_default() -> Self {
@@ -304,6 +314,13 @@ impl CredentialStore {
                         secret,
                     ])
                     .output();
+            } else if cfg!(target_os = "windows") {
+                let target_arg = format!("/generic:{KEYRING_SERVICE_NAME}:{connection_id}");
+                let user_arg = format!("/user:{KEYRING_SERVICE_NAME}");
+                let pass_arg = format!("/pass:{secret}");
+                let _ = Command::new("cmdkey")
+                    .args([&target_arg, &user_arg, &pass_arg])
+                    .output();
             } else {
                 let _ = Command::new("secret-tool")
                     .args([
@@ -329,7 +346,7 @@ impl CredentialStore {
                 return Ok(Some(val.clone()));
             }
         }
-        if self.use_os_backend {
+        if self.use_os_backend && !cfg!(target_os = "windows") {
             let output = if cfg!(target_os = "macos") {
                 Command::new("security")
                     .args([
@@ -380,6 +397,9 @@ impl CredentialStore {
                         connection_id,
                     ])
                     .output();
+            } else if cfg!(target_os = "windows") {
+                let target_arg = format!("/delete:{KEYRING_SERVICE_NAME}:{connection_id}");
+                let _ = Command::new("cmdkey").arg(&target_arg).output();
             } else {
                 let _ = Command::new("secret-tool")
                     .args([
@@ -577,7 +597,15 @@ impl AppPreferences {
                 return PathBuf::from(xdg).join("manifold").join("preferences.toml");
             }
         }
-        if let Ok(home) = std::env::var("HOME") {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            if !appdata.trim().is_empty() {
+                return PathBuf::from(appdata)
+                    .join("Manifold")
+                    .join("preferences.toml");
+            }
+        }
+        let home_var = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"));
+        if let Ok(home) = home_var {
             if !home.trim().is_empty() {
                 return PathBuf::from(home)
                     .join(".config")
@@ -585,7 +613,9 @@ impl AppPreferences {
                     .join("preferences.toml");
             }
         }
-        PathBuf::from("/tmp/manifold/preferences.toml")
+        std::env::temp_dir()
+            .join("manifold")
+            .join("preferences.toml")
     }
 
     pub fn load_default() -> Self {

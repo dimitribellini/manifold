@@ -1,3 +1,7 @@
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
 //! Manifold (`manifold`) — Cross-Platform Dual-Pane File Manager & Remote Transfer Engine.
 
 use std::path::PathBuf;
@@ -41,9 +45,10 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
-    if let Ok(home) = std::env::var("HOME") {
+    let home_var = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"));
+    if let Ok(home) = home_var {
         let at_root = std::env::current_dir()
-            .map(|p| p == std::path::Path::new("/"))
+            .map(|p| p == std::path::Path::new("/") || p == std::path::Path::new("C:\\"))
             .unwrap_or(true);
         if at_root && std::path::Path::new(&home).is_dir() {
             let _ = std::env::set_current_dir(&home);

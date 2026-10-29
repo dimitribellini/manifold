@@ -4,9 +4,11 @@
 //! [`ColorLabel`], [`VolumeStats`], [`LocalFsBackend`], and [`ArchiveBackend`].
 
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::ffi::CString;
 use std::fs;
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -569,19 +571,34 @@ impl LocalFsBackend {
         let modified = target_meta.modified().ok();
         let created = target_meta.created().ok().or(modified);
         let added = attrs.added.or(created).or(modified);
-        let permissions = target_meta.permissions().mode() & 0o7777;
-
-        let uid = target_meta.uid();
-        let gid = target_meta.gid();
-        let owner_str = if uid == 0 {
-            "root".to_string()
-        } else {
-            std::env::var("USER").unwrap_or_else(|_| uid.to_string())
+        #[cfg(unix)]
+        let (permissions, owner_str, group_str) = {
+            let perm_bits = target_meta.permissions().mode() & 0o7777;
+            let uid = target_meta.uid();
+            let gid = target_meta.gid();
+            let owner = if uid == 0 {
+                "root".to_string()
+            } else {
+                std::env::var("USER").unwrap_or_else(|_| uid.to_string())
+            };
+            let group = match gid {
+                0 => "wheel".to_string(),
+                20 => "staff".to_string(),
+                _ => gid.to_string(),
+            };
+            (perm_bits, owner, group)
         };
-        let group_str = match gid {
-            0 => "wheel".to_string(),
-            20 => "staff".to_string(),
-            _ => gid.to_string(),
+        #[cfg(windows)]
+        let (permissions, owner_str, group_str) = {
+            let readonly = target_meta.permissions().readonly();
+            let perm_bits = match (is_dir, readonly) {
+                (true, true) => 0o555,
+                (true, false) => 0o755,
+                (false, true) => 0o444,
+                (false, false) => 0o644,
+            };
+            let owner = std::env::var("USERNAME").unwrap_or_else(|_| "User".to_string());
+            (perm_bits, owner, "Users".to_string())
         };
 
         Ok(FileMetadata {
@@ -656,25 +673,54 @@ impl FileSystemBackend for LocalFsBackend {
     #[allow(clippy::unnecessary_cast)]
     fn volume_stats(&self, path: &str) -> Result<VolumeStats, VfsError> {
         let resolved = self.resolve_safe_path(path)?;
-        let lossy = resolved.to_string_lossy();
-        let Ok(c_path) = CString::new(lossy.as_bytes()) else {
-            return Err(VfsError::InvalidPath(path.to_string()));
-        };
+        #[cfg(unix)]
+        {
+            let lossy = resolved.to_string_lossy();
+            let Ok(c_path) = CString::new(lossy.as_bytes()) else {
+                return Err(VfsError::InvalidPath(path.to_string()));
+            };
 
-        // Query POSIX statvfs for accurate volume free space ("354,54 GB available")
-        unsafe {
-            let mut stat: libc::statvfs = std::mem::zeroed();
-            if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 {
-                let block_size = if stat.f_frsize > 0 {
-                    stat.f_frsize as u64
-                } else {
-                    stat.f_bsize as u64
-                };
-                let total_bytes = (stat.f_blocks as u64).saturating_mul(block_size);
-                let available_bytes = (stat.f_bavail as u64).saturating_mul(block_size);
+            // Query POSIX statvfs for accurate volume free space ("354,54 GB available")
+            unsafe {
+                let mut stat: libc::statvfs = std::mem::zeroed();
+                if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 {
+                    let block_size = if stat.f_frsize > 0 {
+                        stat.f_frsize as u64
+                    } else {
+                        stat.f_bsize as u64
+                    };
+                    let total_bytes = (stat.f_blocks as u64).saturating_mul(block_size);
+                    let available_bytes = (stat.f_bavail as u64).saturating_mul(block_size);
+                    return Ok(VolumeStats {
+                        total_bytes,
+                        available_bytes,
+                    });
+                }
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            #[link(name = "kernel32")]
+            extern "system" {
+                fn GetDiskFreeSpaceExW(
+                    lp_directory_name: *const u16,
+                    lp_free_bytes_available: *mut u64,
+                    lp_total_number_of_bytes: *mut u64,
+                    lp_total_number_of_free_bytes: *mut u64,
+                ) -> i32;
+            }
+            let mut wide: Vec<u16> = resolved.as_os_str().encode_wide().collect();
+            wide.push(0);
+            let mut avail: u64 = 0;
+            let mut total: u64 = 0;
+            let mut free: u64 = 0;
+            let ptr = wide.as_ptr();
+            let ok = unsafe { GetDiskFreeSpaceExW(ptr, &mut avail, &mut total, &mut free) };
+            if ok != 0 {
                 return Ok(VolumeStats {
-                    total_bytes,
-                    available_bytes,
+                    total_bytes: total,
+                    available_bytes: avail,
                 });
             }
         }
@@ -774,8 +820,17 @@ impl FileSystemBackend for LocalFsBackend {
 
     fn set_permissions(&self, path: &str, mode: u32) -> Result<(), VfsError> {
         let resolved = self.resolve_safe_path(path)?;
-        let perms = fs::Permissions::from_mode(mode & 0o7777);
-        fs::set_permissions(&resolved, perms)?;
+        #[cfg(unix)]
+        {
+            let perms = fs::Permissions::from_mode(mode & 0o7777);
+            fs::set_permissions(&resolved, perms)?;
+        }
+        #[cfg(windows)]
+        {
+            let mut perms = fs::metadata(&resolved)?.permissions();
+            perms.set_readonly((mode & 0o200) == 0);
+            fs::set_permissions(&resolved, perms)?;
+        }
         Ok(())
     }
 

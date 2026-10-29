@@ -728,9 +728,16 @@ impl ManifoldAppState {
     pub fn new_live_workspace(left_dir: Option<&Path>, right_dir: Option<&Path>) -> Self {
         let vfs = LocalFsBackend::new();
         let home_dir = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
             .ok()
             .filter(|s| !s.is_empty() && Path::new(s).exists())
-            .unwrap_or_else(|| "/".to_string());
+            .unwrap_or_else(|| {
+                if cfg!(windows) {
+                    "C:\\".to_string()
+                } else {
+                    "/".to_string()
+                }
+            });
 
         let user_label = std::env::var("USER")
             .or_else(|_| std::env::var("USERNAME"))
@@ -746,19 +753,53 @@ impl ManifoldAppState {
             });
 
         let root_vol_name = resolve_dynamic_root_label();
-        let root_stats = vfs.volume_stats("/").ok();
+        let root_path = if cfg!(windows) { "C:\\" } else { "/" };
+        let root_stats = vfs.volume_stats(root_path).ok();
         let root_badge = root_stats.map(|s| s.format_available_gb());
 
-        let mut device_items = vec![SidebarItem {
-            id: "dev-root".to_string(),
-            label: root_vol_name.to_string(),
-            vfs_url: "file:///".to_string(),
-            icon_kind: "drive".to_string(),
-            capacity_badge: root_badge,
-            can_eject: false,
-            children: vec![],
-            expanded: false,
-        }];
+        let mut device_items = if cfg!(windows) {
+            let mut drives = Vec::new();
+            for letter in b'C'..=b'Z' {
+                let drv = format!("{}:\\", letter as char);
+                if Path::new(&drv).is_dir() {
+                    let badge = vfs.volume_stats(&drv).ok().map(|s| s.format_available_gb());
+                    drives.push(SidebarItem {
+                        id: format!("dev-drv-{}", letter as char),
+                        label: format!("Local Disk ({}:)", letter as char),
+                        vfs_url: format!("file://{drv}"),
+                        icon_kind: "drive".to_string(),
+                        capacity_badge: badge,
+                        can_eject: letter != b'C',
+                        children: vec![],
+                        expanded: false,
+                    });
+                }
+            }
+            if drives.is_empty() {
+                drives.push(SidebarItem {
+                    id: "dev-root".to_string(),
+                    label: "Local Disk (C:)".to_string(),
+                    vfs_url: "file://C:\\".to_string(),
+                    icon_kind: "drive".to_string(),
+                    capacity_badge: root_badge,
+                    can_eject: false,
+                    children: vec![],
+                    expanded: false,
+                });
+            }
+            drives
+        } else {
+            vec![SidebarItem {
+                id: "dev-root".to_string(),
+                label: root_vol_name.to_string(),
+                vfs_url: "file:///".to_string(),
+                icon_kind: "drive".to_string(),
+                capacity_badge: root_badge,
+                can_eject: false,
+                children: vec![],
+                expanded: false,
+            }]
+        };
 
         if let Ok(entries) = std::fs::read_dir("/Volumes") {
             for entry in entries.flatten() {
@@ -806,10 +847,12 @@ impl ManifoldAppState {
             ("fav-pictures", "Pictures", "pictures"),
             ("fav-music", "Music", "music"),
             ("fav-movies", "Movies", "movies"),
+            ("fav-videos", "Videos", "movies"),
         ];
         for (id, folder, icon) in candidate_dirs {
-            let full = format!("{}/{}", home_dir.trim_end_matches('/'), folder);
-            if Path::new(&full).is_dir() {
+            let full_buf = Path::new(&home_dir).join(folder);
+            let full = full_buf.to_string_lossy().to_string();
+            if full_buf.is_dir() {
                 favorite_items.push(SidebarItem {
                     id: id.to_string(),
                     label: folder.to_string(),

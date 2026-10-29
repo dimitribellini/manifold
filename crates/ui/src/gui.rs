@@ -87,6 +87,9 @@ struct InteractivePtyShell {
 
 impl InteractivePtyShell {
     fn spawn(initial_cwd: &str) -> Option<Self> {
+        if cfg!(target_os = "windows") {
+            return None;
+        }
         let start_dir = if Path::new(initial_cwd).is_dir() {
             initial_cwd
         } else {
@@ -1952,6 +1955,8 @@ const fn play_system_sound(_kind: &str) {}
 fn open_with_system_handler(path: &str) {
     if cfg!(target_os = "macos") {
         let _ = Command::new("open").arg(path).spawn();
+    } else if cfg!(target_os = "windows") {
+        let _ = Command::new("explorer").arg(path).spawn();
     } else {
         let _ = Command::new("xdg-open").arg(path).spawn();
     }
@@ -1960,6 +1965,9 @@ fn open_with_system_handler(path: &str) {
 fn reveal_in_system_file_manager(path: &str) {
     if cfg!(target_os = "macos") {
         let _ = Command::new("open").args(["-R", path]).spawn();
+    } else if cfg!(target_os = "windows") {
+        let select_arg = format!("/select,{path}");
+        let _ = Command::new("explorer").arg(select_arg).spawn();
     } else if let Some(parent) = Path::new(path).parent().and_then(|p| p.to_str()) {
         let _ = Command::new("xdg-open").arg(parent).spawn();
     }
@@ -1968,6 +1976,8 @@ fn reveal_in_system_file_manager(path: &str) {
 fn copy_string_to_system_clipboard(text: &str) {
     let cmd_name = if cfg!(target_os = "macos") {
         "pbcopy"
+    } else if cfg!(target_os = "windows") {
+        "clip"
     } else {
         "xclip"
     };
@@ -2483,6 +2493,8 @@ fn apply_preferences_to_window(w: &ManifoldWindow, prefs: &AppPreferences) {
         "Inter" => {
             if cfg!(target_os = "macos") {
                 "Avenir Next"
+            } else if cfg!(target_os = "windows") {
+                "Segoe UI"
             } else {
                 "DejaVu Sans"
             }
@@ -2490,12 +2502,14 @@ fn apply_preferences_to_window(w: &ManifoldWindow, prefs: &AppPreferences) {
         "monospace" => {
             if cfg!(target_os = "macos") {
                 "Menlo"
+            } else if cfg!(target_os = "windows") {
+                "Consolas"
             } else {
                 "DejaVu Sans Mono"
             }
         }
         "serif" => {
-            if cfg!(target_os = "macos") {
+            if cfg!(target_os = "macos") || cfg!(target_os = "windows") {
                 "Georgia"
             } else {
                 "DejaVu Serif"
@@ -5021,7 +5035,21 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 "make_alias" => {
                     if let Some(meta) = sel_meta {
                         let alias_path = format!("{} alias", meta.path);
-                        let _ = std::os::unix::fs::symlink(&meta.path, &alias_path);
+                        #[cfg(unix)]
+                        {
+                            let _ = std::os::unix::fs::symlink(&meta.path, &alias_path);
+                        }
+                        #[cfg(windows)]
+                        {
+                            let sym_res = if meta.is_dir {
+                                std::os::windows::fs::symlink_dir(&meta.path, &alias_path)
+                            } else {
+                                std::os::windows::fs::symlink_file(&meta.path, &alias_path)
+                            };
+                            if sym_res.is_err() && !meta.is_dir {
+                                let _ = std::fs::copy(&meta.path, &alias_path);
+                            }
+                        }
                         guard.logs.push(format!("[ALIAS] -> {alias_path}"));
                         let toast = format!("Created symlink for {}", meta.name);
                         guard.show_toast("success", toast);
@@ -7278,8 +7306,13 @@ fn normalize_terminal_command(raw_cmd: &str) -> String {
 }
 
 fn run_local_command_bounded(run_dir: &str, cmd: &str, timeout: Duration) -> String {
-    let mut child = match Command::new("sh")
-        .args(["-c", cmd])
+    let (shell_bin, shell_flag) = if cfg!(target_os = "windows") {
+        ("cmd", "/C")
+    } else {
+        ("sh", "-c")
+    };
+    let mut child = match Command::new(shell_bin)
+        .args([shell_flag, cmd])
         .current_dir(run_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
