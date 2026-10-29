@@ -51,6 +51,35 @@ pub fn resolve_dynamic_root_label() -> &'static str {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn linux_network_mounts(mountinfo: &str) -> Vec<(String, String)> {
+    mountinfo
+        .lines()
+        .filter_map(|line| {
+            let (before, after) = line.split_once(" - ")?;
+            let fields: Vec<_> = before.split_whitespace().collect();
+            let fs = after.split_whitespace().next()?;
+            if !matches!(
+                fs,
+                "nfs" | "nfs4" | "cifs" | "smb3" | "sshfs" | "fuse.sshfs"
+            ) {
+                return None;
+            }
+            let path = fields
+                .get(4)?
+                .replace("\\040", " ")
+                .replace("\\011", "\\t")
+                .replace("\\134", "\\");
+            let label = Path::new(&path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&path)
+                .to_string();
+            Some((label, path))
+        })
+        .collect()
+}
+
 /// Top Unified Toolbar model (`doc/image1.png` & `doc/image2.png`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolbarModel {
@@ -901,7 +930,7 @@ impl ManifoldAppState {
         }
 
         let saved_cfg = ConnectionsConfig::load_default();
-        let connection_items: Vec<SidebarItem> = saved_cfg
+        let mut connection_items: Vec<SidebarItem> = saved_cfg
             .connections
             .iter()
             .map(|p| SidebarItem {
@@ -915,6 +944,21 @@ impl ManifoldAppState {
                 expanded: false,
             })
             .collect();
+        #[cfg(target_os = "linux")]
+        if let Ok(mountinfo) = std::fs::read_to_string("/proc/self/mountinfo") {
+            connection_items.extend(linux_network_mounts(&mountinfo).into_iter().map(
+                |(label, path)| SidebarItem {
+                    id: format!("linux-mount-{path}"),
+                    label,
+                    vfs_url: format!("file://{path}"),
+                    icon_kind: "share-mount".to_string(),
+                    capacity_badge: None,
+                    can_eject: false,
+                    children: vec![],
+                    expanded: false,
+                },
+            ));
+        }
 
         let sidebar_sections = vec![
             SidebarSection {
@@ -1089,6 +1133,16 @@ impl ManifoldAppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_network_mounts_reads_mountinfo_and_unescapes_paths() {
+        let mounts = linux_network_mounts("36 25 0:32 / /mnt/team\\040share rw - cifs //server/team rw\n37 25 0:33 / / rw - ext4 /dev/sda1 rw");
+        assert_eq!(
+            mounts,
+            vec![("team share".to_string(), "/mnt/team share".to_string())]
+        );
+    }
 
     #[test]
     fn test_reference_workspace_matches_image1_image2_image3() {
