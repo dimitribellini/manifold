@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 
 use manifold_config::{
     AppPreferences, AuthType, ConnectionProfile, ConnectionsConfig, CredentialStore,
-    FavoriteFolderEntry, PaneViewMode, ProtocolType, SortColumn, SortDirection,
+    FavoriteFolderEntry, PaneSessionConfig, PaneViewMode, ProtocolType, SessionState, SortColumn,
+    SortDirection, SplitDirection, TabSessionConfig, WindowSessionConfig,
 };
 use manifold_preview::FileInspectorViewModel;
 use manifold_sync::{ComparisonMode, SyncExecutionPlan, SyncStrategy};
@@ -297,6 +298,7 @@ struct GuiRuntime {
     sidebar_targets: Vec<(String, String)>,
     sidebar_colors: HashMap<String, ColorLabel>,
     sidebar_context_idx: usize,
+    selected_sidebar_id: Option<String>,
     transfers: Vec<TransferTask>,
     logs: Vec<String>,
     pending_batch: Option<PendingBatchTransfer>,
@@ -315,6 +317,10 @@ struct GuiRuntime {
     pty_shell: Option<InteractivePtyShell>,
     thumbnail_cache: HashMap<String, Option<Image>>,
     dir_cache: RefCell<HashMap<String, Vec<FileMetadata>>>,
+    dir_fingerprints: RefCell<HashMap<String, u64>>,
+    fs_poll_tick: u32,
+    session_save_tick: u32,
+    native_os_drag_handed_off: bool,
 }
 
 impl GuiRuntime {
@@ -328,7 +334,30 @@ impl GuiRuntime {
                 sidebar_colors.insert(prof.id.clone(), prof.color_label);
             }
         }
+        if !prefs.removed_favorites.is_empty() {
+            if let Some(sec) = app_state
+                .sidebar_sections
+                .iter_mut()
+                .find(|s| s.title == "Favorites")
+            {
+                sec.items.retain(|i| {
+                    let norm = normalize_fav_target(&i.vfs_url);
+                    !prefs
+                        .removed_favorites
+                        .iter()
+                        .any(|r| r == &i.id || r == &i.vfs_url || r == &norm)
+                });
+            }
+        }
         for fav in &prefs.custom_favorites {
+            let norm_fav = normalize_fav_target(&fav.vfs_url);
+            let is_removed = prefs
+                .removed_favorites
+                .iter()
+                .any(|r| r == &fav.id || r == &fav.vfs_url || r == &norm_fav);
+            if is_removed {
+                continue;
+            }
             if fav.color_label != ColorLabel::None {
                 sidebar_colors.insert(fav.id.clone(), fav.color_label);
             }
@@ -337,7 +366,11 @@ impl GuiRuntime {
                 .iter_mut()
                 .find(|s| s.title == "Favorites")
             {
-                if !sec.items.iter().any(|i| i.vfs_url == fav.vfs_url) {
+                let already_present = sec
+                    .items
+                    .iter()
+                    .any(|i| i.id == fav.id || normalize_fav_target(&i.vfs_url) == norm_fav);
+                if !already_present {
                     sec.items.push(SidebarItem {
                         id: fav.id.clone(),
                         label: fav.label.clone(),
@@ -348,6 +381,25 @@ impl GuiRuntime {
                         children: vec![],
                         expanded: false,
                     });
+                }
+            }
+        }
+        for (sb_id, color_lbl) in &prefs.sidebar_colors {
+            if *color_lbl != ColorLabel::None {
+                sidebar_colors.insert(sb_id.clone(), *color_lbl);
+            }
+        }
+        if !prefs.sidebar_labels.is_empty() {
+            for sec in &mut app_state.sidebar_sections {
+                for item in &mut sec.items {
+                    if let Some(lbl) = prefs.sidebar_labels.get(&item.id) {
+                        item.label = lbl.clone();
+                    }
+                    for child in &mut item.children {
+                        if let Some(lbl) = prefs.sidebar_labels.get(&child.id) {
+                            child.label = lbl.clone();
+                        }
+                    }
                 }
             }
         }
@@ -366,6 +418,8 @@ impl GuiRuntime {
                 });
             }
         }
+        let local_vfs = LocalFsBackend::new();
+        local_vfs.restore_color_labels(&prefs.file_color_labels);
         let credential_store = CredentialStore::with_os_backend();
         let (worker_tx, worker_rx) = mpsc::channel();
         let init_log = "[INFO] Manifold VFS initialized (Local POSIX + Remote VFS).";
@@ -382,7 +436,7 @@ impl GuiRuntime {
             format!("Manifold Interactive Shell ready ({init_cwd}). Type commands below.\n");
         let mut runtime = Self {
             app_state,
-            local_vfs: LocalFsBackend::new(),
+            local_vfs,
             mounted_vfs,
             remote_backends: HashMap::new(),
             saved_connections,
@@ -412,6 +466,7 @@ impl GuiRuntime {
             sidebar_targets: Vec::new(),
             sidebar_colors,
             sidebar_context_idx: 0,
+            selected_sidebar_id: None,
             transfers: Vec::new(),
             logs: vec![init_log.to_string(), keyring_log.to_string()],
             pending_batch: None,
@@ -430,10 +485,338 @@ impl GuiRuntime {
             pty_shell,
             thumbnail_cache: HashMap::new(),
             dir_cache: RefCell::new(HashMap::new()),
+            dir_fingerprints: RefCell::new(HashMap::new()),
+            fs_poll_tick: 0,
+            session_save_tick: 0,
+            native_os_drag_handed_off: false,
         };
         runtime.reload_pane_entries(false);
         runtime.reload_pane_entries(true);
+        runtime.sync_selected_sidebar_to_active_dir();
         runtime
+    }
+
+    fn restore_saved_session(&mut self, window: &ManifoldWindow) {
+        let Some(sess) = SessionState::load_default() else {
+            return;
+        };
+        let home_fallback = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .ok()
+            .filter(|s| !s.is_empty() && Path::new(s).is_dir())
+            .unwrap_or_else(|| "/".to_string());
+
+        let mut restored_left = Vec::new();
+        for (idx, t) in sess.left_pane.tabs.iter().enumerate() {
+            let raw_path = if !t.current_path.is_empty() {
+                t.current_path.clone()
+            } else {
+                vfs_url_to_target(&t.vfs_url)
+            };
+            let is_valid = split_remote_uri(&raw_path).is_some() || Path::new(&raw_path).is_dir();
+            let valid_path = if is_valid {
+                raw_path
+            } else if idx == 0 {
+                home_fallback.clone()
+            } else {
+                continue;
+            };
+            let title = t
+                .title
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| self.format_tab_title(&valid_path));
+            let vfs_url = if valid_path.contains("://") {
+                valid_path.clone()
+            } else {
+                format!("file://{valid_path}")
+            };
+            let exp_set: HashSet<String> = t
+                .expanded_folders
+                .iter()
+                .filter(|p| Path::new(p.as_str()).is_dir())
+                .cloned()
+                .collect();
+            restored_left.push(crate::PaneTabModel {
+                id: format!("l-tab-{}", idx + 1),
+                title,
+                icon_kind: "folder".to_string(),
+                vfs_url,
+                current_path: valid_path,
+                view_mode: t.view_mode,
+                sort_column: t.sort_column,
+                sort_direction: t.sort_direction,
+                inline_filter: String::new(),
+                expanded_folders: exp_set,
+                selected_paths: HashSet::new(),
+            });
+        }
+        if !restored_left.is_empty() {
+            let max_l = restored_left.len() - 1;
+            self.app_state.left_tabs = restored_left;
+            self.app_state.left_active_tab = sess.left_pane.active_tab_index.min(max_l);
+        }
+
+        let mut restored_right = Vec::new();
+        for (idx, t) in sess.right_pane.tabs.iter().enumerate() {
+            let raw_path = if !t.current_path.is_empty() {
+                t.current_path.clone()
+            } else {
+                vfs_url_to_target(&t.vfs_url)
+            };
+            let is_valid = split_remote_uri(&raw_path).is_some() || Path::new(&raw_path).is_dir();
+            let valid_path = if is_valid {
+                raw_path
+            } else if idx == 0 {
+                home_fallback.clone()
+            } else {
+                continue;
+            };
+            let title = t
+                .title
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| self.format_tab_title(&valid_path));
+            let vfs_url = if valid_path.contains("://") {
+                valid_path.clone()
+            } else {
+                format!("file://{valid_path}")
+            };
+            let exp_set: HashSet<String> = t
+                .expanded_folders
+                .iter()
+                .filter(|p| Path::new(p.as_str()).is_dir())
+                .cloned()
+                .collect();
+            restored_right.push(crate::PaneTabModel {
+                id: format!("r-tab-{}", idx + 1),
+                title,
+                icon_kind: "folder".to_string(),
+                vfs_url,
+                current_path: valid_path,
+                view_mode: t.view_mode,
+                sort_column: t.sort_column,
+                sort_direction: t.sort_direction,
+                inline_filter: String::new(),
+                expanded_folders: exp_set,
+                selected_paths: HashSet::new(),
+            });
+        }
+        if !restored_right.is_empty() {
+            let max_r = restored_right.len() - 1;
+            self.app_state.right_tabs = restored_right;
+            self.app_state.right_active_tab = sess.right_pane.active_tab_index.min(max_r);
+        }
+
+        self.app_state.dual_pane_enabled = sess.window.dual_pane_enabled;
+        self.app_state.panes_layout = if sess.window.dual_pane_enabled {
+            PanesLayout::SplitHorizontal
+        } else {
+            PanesLayout::Single
+        };
+        self.app_state.active_pane =
+            if sess.window.dual_pane_enabled && sess.window.active_pane == "right" {
+                ActivePane::Right
+            } else {
+                ActivePane::Left
+            };
+        self.app_state.split_ratio = (sess.window.split_ratio as f32).clamp(0.20, 0.80);
+        self.app_state.toolbar.show_hidden_files = sess.window.show_hidden_files;
+        self.app_state.inspector_open = sess.window.inspector_open;
+
+        let w_px = sess.window.width.clamp(920, 3840) as f32;
+        let h_px = sess.window.height.clamp(580, 2400) as f32;
+        window
+            .window()
+            .set_size(slint::LogicalSize::new(w_px, h_px));
+        window.set_sidebar_width(sess.window.sidebar_width.clamp(155.0, 340.0));
+        window.set_inspector_width(sess.window.inspector_width.clamp(256.0, 460.0));
+        window.set_size_col_width(sess.window.size_col_width.clamp(68.0, 220.0));
+        window.set_date_col_width(sess.window.date_col_width.clamp(110.0, 260.0));
+        window.set_miller_col_width(sess.window.miller_parent_width.clamp(120.0, 420.0));
+        window.set_terminal_drawer_height(sess.window.terminal_drawer_height.clamp(130.0, 600.0));
+        window.set_inspector_tab_index(sess.window.inspector_tab_index.min(1) as i32);
+        window.set_show_terminal_drawer(sess.window.terminal_drawer_open);
+
+        self.reload_pane_entries(false);
+        self.reload_pane_entries(true);
+        self.sync_selected_sidebar_to_active_dir();
+        self.sync_terminal_cwd();
+    }
+
+    fn capture_and_save_session(&self, window: &ManifoldWindow) {
+        let scale = window.window().scale_factor().max(1.0);
+        let phys = window.window().size();
+        let raw_w = ((phys.width as f32) / scale).round() as u32;
+        let raw_h = ((phys.height as f32) / scale).round() as u32;
+        let width = if raw_w >= 600 { raw_w } else { 1360 };
+        let height = if raw_h >= 400 { raw_h } else { 840 };
+
+        let is_right_pane =
+            self.app_state.active_pane == ActivePane::Right && self.app_state.dual_pane_enabled;
+        let active_pane_str = if is_right_pane {
+            "right".to_string()
+        } else {
+            "left".to_string()
+        };
+        let insp_tab = window.get_inspector_tab_index().clamp(0, 1) as usize;
+        let win_cfg = WindowSessionConfig {
+            width,
+            height,
+            split_ratio: f64::from(self.app_state.split_ratio),
+            split_direction: SplitDirection::Vertical,
+            show_hidden_files: self.app_state.toolbar.show_hidden_files,
+            show_preview_pane: true,
+            dual_pane_enabled: self.app_state.dual_pane_enabled,
+            active_pane: active_pane_str,
+            sidebar_width: window.get_sidebar_width(),
+            inspector_open: self.app_state.inspector_open,
+            inspector_width: window.get_inspector_width(),
+            size_col_width: window.get_size_col_width(),
+            date_col_width: window.get_date_col_width(),
+            miller_parent_width: window.get_miller_col_width(),
+            terminal_drawer_height: window.get_terminal_drawer_height(),
+            inspector_tab_index: insp_tab,
+            terminal_drawer_open: window.get_show_terminal_drawer(),
+        };
+
+        let left_tabs: Vec<TabSessionConfig> = self
+            .app_state
+            .left_tabs
+            .iter()
+            .map(|t| {
+                let exp_vec: Vec<String> = t.expanded_folders.iter().cloned().collect();
+                TabSessionConfig {
+                    vfs_url: t.vfs_url.clone(),
+                    current_path: t.current_path.clone(),
+                    title: Some(t.title.clone()),
+                    view_mode: t.view_mode,
+                    sort_column: t.sort_column,
+                    sort_direction: t.sort_direction,
+                    expanded_folders: exp_vec,
+                }
+            })
+            .collect();
+
+        let right_tabs: Vec<TabSessionConfig> = self
+            .app_state
+            .right_tabs
+            .iter()
+            .map(|t| {
+                let exp_vec: Vec<String> = t.expanded_folders.iter().cloned().collect();
+                TabSessionConfig {
+                    vfs_url: t.vfs_url.clone(),
+                    current_path: t.current_path.clone(),
+                    title: Some(t.title.clone()),
+                    view_mode: t.view_mode,
+                    sort_column: t.sort_column,
+                    sort_direction: t.sort_direction,
+                    expanded_folders: exp_vec,
+                }
+            })
+            .collect();
+
+        let state = SessionState {
+            window: win_cfg,
+            left_pane: PaneSessionConfig {
+                active_tab_index: self.app_state.left_active_tab,
+                tabs: left_tabs,
+            },
+            right_pane: PaneSessionConfig {
+                active_tab_index: self.app_state.right_active_tab,
+                tabs: right_tabs,
+            },
+        };
+        let _ = state.save_default();
+    }
+
+    fn poll_external_directory_changes(&mut self) -> bool {
+        let mut left_changed = false;
+        let mut right_changed = false;
+
+        let left_dir = self.current_pane_path(false);
+        let mut left_watch = vec![left_dir];
+        if let Some(tab) = self.app_state.left_tabs.get(self.app_state.left_active_tab) {
+            left_watch.extend(tab.expanded_folders.iter().cloned());
+        }
+        for dir in left_watch {
+            if let Some(fp) = compute_local_dir_fingerprint(&dir) {
+                let prev = self.dir_fingerprints.borrow().get(&dir).copied();
+                if prev != Some(fp) {
+                    self.dir_fingerprints.borrow_mut().insert(dir.clone(), fp);
+                    self.dir_cache.borrow_mut().remove(&dir);
+                    left_changed = true;
+                }
+            }
+        }
+
+        if self.app_state.dual_pane_enabled {
+            let right_dir = self.current_pane_path(true);
+            let mut right_watch = vec![right_dir];
+            if let Some(tab) = self
+                .app_state
+                .right_tabs
+                .get(self.app_state.right_active_tab)
+            {
+                right_watch.extend(tab.expanded_folders.iter().cloned());
+            }
+            for dir in right_watch {
+                if let Some(fp) = compute_local_dir_fingerprint(&dir) {
+                    let prev = self.dir_fingerprints.borrow().get(&dir).copied();
+                    if prev != Some(fp) {
+                        self.dir_fingerprints.borrow_mut().insert(dir.clone(), fp);
+                        self.dir_cache.borrow_mut().remove(&dir);
+                        right_changed = true;
+                    }
+                }
+            }
+        }
+
+        if left_changed {
+            let sel_paths: HashSet<String> = self
+                .left_selected_indices
+                .iter()
+                .filter_map(|&i| self.left_entries.get(i).map(|r| r.meta.path.clone()))
+                .collect();
+            self.reload_pane_entries(false);
+            if !sel_paths.is_empty() {
+                let mut restored = HashSet::new();
+                for (i, r) in self.left_entries.iter().enumerate() {
+                    if sel_paths.contains(&r.meta.path) {
+                        restored.insert(i);
+                    }
+                }
+                if !restored.is_empty() {
+                    let first = restored.iter().copied().min();
+                    self.left_selected_indices = restored;
+                    self.left_selected_idx = first;
+                }
+            }
+        }
+
+        if right_changed {
+            let sel_paths: HashSet<String> = self
+                .right_selected_indices
+                .iter()
+                .filter_map(|&i| self.right_entries.get(i).map(|r| r.meta.path.clone()))
+                .collect();
+            self.reload_pane_entries(true);
+            if !sel_paths.is_empty() {
+                let mut restored = HashSet::new();
+                for (i, r) in self.right_entries.iter().enumerate() {
+                    if sel_paths.contains(&r.meta.path) {
+                        restored.insert(i);
+                    }
+                }
+                if !restored.is_empty() {
+                    let first = restored.iter().copied().min();
+                    self.right_selected_indices = restored;
+                    self.right_selected_idx = first;
+                }
+            }
+        }
+
+        left_changed || right_changed
     }
 
     fn format_tab_title(&self, path: &str) -> String {
@@ -487,19 +870,165 @@ impl GuiRuntime {
         appended
     }
 
+    fn is_path_in_favorites(&self, target_path: &str) -> bool {
+        let norm = normalize_fav_target(target_path);
+        if norm.is_empty() {
+            return false;
+        }
+        self.app_state
+            .sidebar_sections
+            .iter()
+            .find(|s| s.title == "Favorites")
+            .is_some_and(|sec| {
+                sec.items
+                    .iter()
+                    .any(|item| normalize_fav_target(&item.vfs_url) == norm)
+            })
+    }
+
+    fn unpin_folder_from_favorites(&mut self, id_hint: &str, target_path: &str) {
+        let norm = normalize_fav_target(target_path);
+        let mut removed_ids = Vec::new();
+        let mut removed_label = String::new();
+        if let Some(sec) = self
+            .app_state
+            .sidebar_sections
+            .iter_mut()
+            .find(|s| s.title == "Favorites")
+        {
+            sec.items.retain(|i| {
+                let i_norm = normalize_fav_target(&i.vfs_url);
+                let by_id = !id_hint.is_empty() && i.id == id_hint;
+                let by_path = !norm.is_empty() && i_norm == norm;
+                let matched = by_id || by_path;
+                if matched {
+                    if removed_label.is_empty() {
+                        removed_label = i.label.clone();
+                    }
+                    removed_ids.push((i.id.clone(), i.vfs_url.clone()));
+                }
+                !matched
+            });
+        }
+        if !id_hint.is_empty() {
+            self.prefs
+                .remove_favorite_by_id_or_path(id_hint, target_path);
+        }
+        for (rem_id, rem_url) in removed_ids {
+            self.prefs.remove_favorite_by_id_or_path(&rem_id, &rem_url);
+        }
+        if !norm.is_empty() {
+            let file_url = if norm.contains("://") {
+                norm.clone()
+            } else {
+                format!("file://{norm}")
+            };
+            self.prefs.remove_favorite_by_id_or_path("", &file_url);
+            self.prefs.remove_favorite_by_id_or_path("", &norm);
+        }
+        self.prefs.favorite_order = self
+            .app_state
+            .sidebar_sections
+            .iter()
+            .find(|s| s.title == "Favorites")
+            .map(|sec| sec.items.iter().map(|i| i.id.clone()).collect())
+            .unwrap_or_default();
+        let _ = self.prefs.save_default();
+        let disp = if removed_label.is_empty() {
+            vfs_display_title(&norm)
+        } else {
+            removed_label
+        };
+        let toast = format!("Removed \"{disp}\" from Favorites");
+        self.logs.push(format!("[FAVORITES] {toast}"));
+        self.show_toast("info", toast);
+    }
+
+    fn sync_selected_sidebar_to_active_dir(&mut self) {
+        let active_dir = self.current_pane_path(self.is_right_effective());
+        let norm_active = normalize_fav_target(&active_dir);
+        if norm_active.is_empty() {
+            self.selected_sidebar_id = None;
+            return;
+        }
+        if let Some(cur_id) = &self.selected_sidebar_id {
+            let still_matches = self.app_state.sidebar_sections.iter().any(|sec| {
+                sec.items.iter().any(|it| {
+                    let top_ok =
+                        it.id == *cur_id && normalize_fav_target(&it.vfs_url) == norm_active;
+                    let child_ok = it.children.iter().any(|ch| {
+                        let ch_norm = normalize_fav_target(&ch.vfs_url);
+                        ch.id == *cur_id && ch_norm == norm_active
+                    });
+                    top_ok || child_ok
+                })
+            });
+            if still_matches {
+                return;
+            }
+        }
+        for sec_title in ["Favorites", "Connections", "Devices"] {
+            if let Some(sec) = self
+                .app_state
+                .sidebar_sections
+                .iter()
+                .find(|s| s.title == sec_title)
+            {
+                for item in &sec.items {
+                    if normalize_fav_target(&item.vfs_url) == norm_active {
+                        self.selected_sidebar_id = Some(item.id.clone());
+                        return;
+                    }
+                    for child in &item.children {
+                        if normalize_fav_target(&child.vfs_url) == norm_active {
+                            self.selected_sidebar_id = Some(child.id.clone());
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        self.selected_sidebar_id = None;
+    }
+
     fn pin_folder_to_favorites(&mut self, folder_path: &str, label: &str) {
+        let norm = normalize_fav_target(folder_path);
         let vfs_url = if folder_path.contains("://") {
             folder_path.to_string()
         } else {
             format!("file://{folder_path}")
         };
-        let fav_id = format!("fav-pin-{}", self.prefs.custom_favorites.len() + 1);
+        self.prefs
+            .removed_favorites
+            .retain(|r| r != &vfs_url && r != folder_path && r != &norm);
+        let existing_id = self
+            .prefs
+            .custom_favorites
+            .iter()
+            .find(|f| normalize_fav_target(&f.vfs_url) == norm)
+            .map(|f| f.id.clone());
+        let fav_id = existing_id.unwrap_or_else(|| {
+            let mut n = self.prefs.custom_favorites.len() + 1;
+            loop {
+                let cand = format!("fav-pin-{n}");
+                let taken = self.prefs.custom_favorites.iter().any(|f| f.id == cand);
+                if !taken {
+                    break cand;
+                }
+                n += 1;
+            }
+        });
+        let color_lbl = self
+            .sidebar_colors
+            .get(&fav_id)
+            .copied()
+            .unwrap_or(ColorLabel::None);
         let fav_entry = FavoriteFolderEntry {
             id: fav_id.clone(),
             label: label.to_string(),
             vfs_url: vfs_url.clone(),
             icon_kind: "folder".to_string(),
-            color_label: ColorLabel::None,
+            color_label: color_lbl,
         };
         self.prefs.upsert_favorite(fav_entry);
         let _ = self.prefs.save_default();
@@ -510,7 +1039,10 @@ impl GuiRuntime {
             .iter_mut()
             .find(|s| s.title == "Favorites");
         if let Some(sec) = fav_sec {
-            let exists = sec.items.iter().any(|i| i.vfs_url == vfs_url);
+            let exists = sec
+                .items
+                .iter()
+                .any(|i| normalize_fav_target(&i.vfs_url) == norm);
             if !exists {
                 sec.items.push(SidebarItem {
                     id: fav_id,
@@ -1051,6 +1583,7 @@ impl GuiRuntime {
         from_right: bool,
         items: &[FileMetadata],
         coords: (f32, f32, f32, f32, f32),
+        bounds: (f32, f32, f32),
     ) -> ResolvedDropTarget {
         let mut res = ResolvedDropTarget {
             dst_dir: None,
@@ -1068,9 +1601,21 @@ impl GuiRuntime {
             return res;
         }
         let (abs_x, abs_y, left_pane_w, left_scroll_y, right_scroll_y) = coords;
+        let (sidebar_w, win_w, win_h) = bounds;
+        let sb_w = sidebar_w.max(150.0);
+
+        let is_outside_window = abs_x < 14.0
+            || abs_y < 14.0
+            || (win_w > 120.0 && abs_x > win_w - 14.0)
+            || (win_h > 120.0 && abs_y > win_h - 14.0);
+        if is_outside_window {
+            res.dst_dir = Some("__EXTERNAL_OS_DROP__".to_string());
+            res.dst_label = "→ Drop Outside Manifold (OS Drag & Drop)".to_string();
+            return res;
+        }
 
         // 1. Sidebar Hit-Testing (Devices, Connections, Favorites)
-        if (6.0..=208.0).contains(&abs_x) && abs_y >= 48.0 {
+        if (6.0..=(sb_w - 4.0)).contains(&abs_x) && abs_y >= 48.0 {
             let mut cur_y = 50.0f32;
             let mut sb_idx = 0usize;
             for section in &self.app_state.sidebar_sections {
@@ -1106,17 +1651,17 @@ impl GuiRuntime {
             return res;
         }
 
-        if abs_x < 210.0 {
+        if abs_x < sb_w - 2.0 {
             return res;
         }
 
         let pane_w = left_pane_w.max(260.0);
-        let right_pane_x = 212.0 + pane_w + 6.0;
+        let right_pane_x = sb_w + pane_w + 6.0;
         let target_is_right = self.app_state.dual_pane_enabled && abs_x >= right_pane_x;
         let rel_x = if target_is_right {
             abs_x - right_pane_x
         } else {
-            abs_x - 212.0
+            abs_x - sb_w
         };
 
         // 2. Tab Bar Hit-Testing (Responsive to Pane Width & Tab Count)
@@ -1475,7 +2020,73 @@ impl GuiRuntime {
         }
     }
 
+    fn prepare_local_paths_for_external_drag(&mut self, items: &[FileMetadata]) -> Vec<String> {
+        let mut out = Vec::with_capacity(items.len());
+        let stage_dir = std::env::temp_dir().join("manifold-drag");
+        for meta in items {
+            if split_remote_uri(&meta.path).is_none() {
+                if Path::new(&meta.path).exists() {
+                    out.push(meta.path.clone());
+                }
+                continue;
+            }
+            if meta.is_dir {
+                continue;
+            }
+            if std::fs::create_dir_all(&stage_dir).is_ok() {
+                let dst_file = stage_dir.join(&meta.name);
+                let dst_str = dst_file.to_string_lossy().to_string();
+                let staged_ok = if let Some((prefix, sub)) = split_remote_uri(&meta.path) {
+                    self.ensure_remote_connected(&prefix);
+                    self.remote_backends
+                        .get(&prefix)
+                        .is_some_and(|r| r.download_to_local_file(&sub, &dst_file).is_ok())
+                } else {
+                    self.backend_for_path(&meta.path)
+                        .read_bytes(&meta.path)
+                        .ok()
+                        .is_some_and(|b| std::fs::write(&dst_file, b).is_ok())
+                };
+                if staged_ok {
+                    out.push(dst_str);
+                }
+            }
+        }
+        out
+    }
+
     fn execute_drop_target(&mut self, items: &[FileMetadata], dst_dir: &str, is_move: bool) {
+        if dst_dir == "__EXTERNAL_OS_DROP__" {
+            let local_paths = self.prepare_local_paths_for_external_drag(items);
+            self.clipboard_paths = local_paths.clone();
+            self.clipboard_cut = false;
+            copy_files_to_os_clipboard(&local_paths);
+
+            if start_native_os_file_drag(&local_paths) {
+                let msg = format!(
+                    "[DRAG-OUT] Handed off {} item(s) to native OS drag session",
+                    local_paths.len()
+                );
+                self.logs.push(msg);
+                return;
+            }
+
+            if let Some(desktop_dir) = resolve_user_desktop_dir() {
+                let not_already_on_desktop = items
+                    .iter()
+                    .any(|m| vfs_parent_dir(&m.path).as_deref() != Some(desktop_dir.as_str()));
+                if not_already_on_desktop {
+                    self.begin_batch_transfer(items.to_vec(), desktop_dir, false, false);
+                    return;
+                }
+            }
+            let msg = format!(
+                "[DRAG-OUT] Exported {} item(s) to OS File Clipboard",
+                items.len()
+            );
+            self.logs.push(msg);
+            return;
+        }
         self.begin_batch_transfer(items.to_vec(), dst_dir.to_string(), is_move, false);
     }
 
@@ -1620,6 +2231,7 @@ impl GuiRuntime {
         }
         self.app_state.toolbar.active_folder_title = title;
         self.reload_pane_entries(is_right);
+        self.sync_selected_sidebar_to_active_dir();
     }
 
     fn list_raw_dir_cached(&self, dir_path: &str) -> Vec<FileMetadata> {
@@ -1646,6 +2258,12 @@ impl GuiRuntime {
             cache.clear();
         }
         cache.insert(dir_path.to_string(), raw_items.clone());
+        drop(cache);
+        if let Some(fp) = compute_local_dir_fingerprint(dir_path) {
+            self.dir_fingerprints
+                .borrow_mut()
+                .insert(dir_path.to_string(), fp);
+        }
         raw_items
     }
 
@@ -1900,7 +2518,7 @@ impl GuiRuntime {
             } else {
                 None
             };
-            let modified = meta.formatted_modified_datetime();
+            let modified = meta.formatted_iso_datetime();
             let mut vm = FileInspectorViewModel::from_metadata(&meta, &modified, sample.as_deref());
             if active_sel_count > 1 {
                 let total_sz: u64 = if is_right_active {
@@ -1988,6 +2606,440 @@ fn copy_string_to_system_clipboard(text: &str) {
         }
         let _ = child.wait();
     }
+}
+
+fn copy_files_to_os_clipboard(paths: &[String]) {
+    let local_paths: Vec<&str> = paths
+        .iter()
+        .map(String::as_str)
+        .filter(|p| split_remote_uri(p).is_none() && Path::new(p).exists())
+        .collect();
+    if local_paths.is_empty() {
+        return;
+    }
+    if cfg!(target_os = "macos") {
+        let items: Vec<String> = local_paths
+            .iter()
+            .map(|p| {
+                let escaped = p.replace('\\', "\\\\").replace('"', "\\\"");
+                format!("POSIX file \"{escaped}\"")
+            })
+            .collect();
+        let list_expr = items.join(", ");
+        let script = format!("set the clipboard to {{{list_expr}}}");
+        let _ = Command::new("osascript").args(["-e", &script]).spawn();
+    } else if cfg!(target_os = "windows") {
+        let items: Vec<String> = local_paths
+            .iter()
+            .map(|p| {
+                let escaped = p.replace('\'', "''");
+                format!("'{escaped}'")
+            })
+            .collect();
+        let list_expr = items.join(",");
+        let ps_cmd = format!("Set-Clipboard -Path {list_expr}");
+        let _ = Command::new("powershell")
+            .args(["-NoProfile", "-Command", &ps_cmd])
+            .spawn();
+    } else {
+        let uri_list: String = local_paths
+            .iter()
+            .map(|p| format!("file://{p}\r\n"))
+            .collect();
+        let child_res = Command::new("xclip")
+            .args(["-selection", "clipboard", "-t", "text/uri-list"])
+            .stdin(Stdio::piped())
+            .spawn();
+        if let Ok(mut child) = child_res {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(uri_list.as_bytes());
+            }
+            let _ = child.wait();
+        }
+    }
+}
+
+fn resolve_user_desktop_dir() -> Option<String> {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()?;
+    if home.trim().is_empty() {
+        return None;
+    }
+    let desk = Path::new(&home).join("Desktop");
+    if desk.is_dir() {
+        Some(desk.to_string_lossy().to_string())
+    } else {
+        None
+    }
+}
+
+fn compute_local_dir_fingerprint(dir_path: &str) -> Option<u64> {
+    if split_remote_uri(dir_path).is_some() {
+        return None;
+    }
+    let rd = std::fs::read_dir(dir_path).ok()?;
+    let mut count = 0u64;
+    let mut acc = 0x9E37_79B9_7F4A_7C15_u64;
+    for entry in rd.flatten() {
+        count = count.wrapping_add(1);
+        let mut h = 0xcbf2_9ce4_8422_2325_u64;
+        for &b in entry.file_name().as_encoded_bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+        if let Ok(meta) = entry.metadata() {
+            h ^= meta.len();
+            h = h.wrapping_mul(0x0100_0000_01b3);
+            if meta.is_dir() {
+                h ^= 0x5555_AAAA_5555_AAAA;
+            }
+            if let Ok(mtime) = meta.modified() {
+                if let Ok(dur) = mtime.duration_since(std::time::UNIX_EPOCH) {
+                    let secs_rot = dur.as_secs().rotate_left(16);
+                    let nanos = u64::from(dur.subsec_nanos());
+                    h ^= secs_rot ^ nanos;
+                    h = h.wrapping_mul(0x0100_0000_01b3);
+                }
+            }
+        }
+        acc = acc.wrapping_add(h);
+    }
+    Some(acc ^ count.rotate_left(32))
+}
+
+fn window_logical_bounds(w: &ManifoldWindow) -> (f32, f32, f32) {
+    let scale = w.window().scale_factor().max(1.0);
+    let phys = w.window().size();
+    let win_w = ((phys.width as f32) / scale).max(600.0);
+    let win_h = ((phys.height as f32) / scale).max(400.0);
+    (w.get_sidebar_width(), win_w, win_h)
+}
+
+fn clear_window_drag_overlay(w: &ManifoldWindow) {
+    w.set_is_dragging_row(false);
+    w.set_drag_ghost_label("".into());
+    w.set_drag_target_hint("".into());
+    w.set_drag_hover_sidebar_idx(-1);
+    w.set_drag_hover_left_tab(-1);
+    w.set_drag_hover_right_tab(-1);
+    w.set_drag_hover_left_row(-1);
+    w.set_drag_hover_right_row(-1);
+    w.set_drag_hover_left_pane(false);
+    w.set_drag_hover_right_pane(false);
+}
+
+fn schedule_async_pointer_release(win_weak: slint::Weak<ManifoldWindow>, abs_x: f32, abs_y: f32) {
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(w) = win_weak.upgrade() {
+            clear_window_drag_overlay(&w);
+            let rel_ev = slint::platform::WindowEvent::PointerReleased {
+                position: slint::LogicalPosition::new(abs_x, abs_y),
+                button: slint::platform::PointerEventButton::Left,
+            };
+            w.window().dispatch_event(rel_ev);
+        }
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn is_primary_mouse_button_pressed() -> bool {
+    type MsgRetUsize = unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> usize;
+    unsafe {
+        let ev_cls = objc_getClass(c"NSEvent".as_ptr());
+        if ev_cls.is_null() {
+            return true;
+        }
+        let msg_usize: MsgRetUsize = std::mem::transmute(objc_msgSend as *const ());
+        let mask = msg_usize(ev_cls, sel_registerName(c"pressedMouseButtons".as_ptr()));
+        (mask & 1) != 0
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_primary_mouse_button_pressed() -> bool {
+    true
+}
+
+/// Formats any raw version string (e.g. `"v.0.3.1"`, `".0.3.1.2"`, `"0.3.1.2"`)
+/// into the canonical `"v.<version>"` display format (`"v.0.3.1.2"`).
+pub fn format_app_version_label(raw: &str) -> String {
+    let cleaned = raw.trim().trim_start_matches(['v', 'V', '.']);
+    let ver = if cleaned.is_empty() { "0.1.0" } else { cleaned };
+    format!("v.{ver}")
+}
+
+/// Returns the current application version formatted as `"v.<version>"`.
+pub fn current_app_version_label() -> String {
+    let raw = option_env!("APP_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"));
+    format_app_version_label(raw)
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MacOsPoint {
+    x: f64,
+    y: f64,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MacOsSize {
+    width: f64,
+    height: f64,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MacOsRect {
+    origin: MacOsPoint,
+    size: MacOsSize,
+}
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn objc_getClass(name: *const std::ffi::c_char) -> *mut std::ffi::c_void;
+    fn sel_registerName(name: *const std::ffi::c_char) -> *mut std::ffi::c_void;
+    fn objc_msgSend();
+    fn objc_allocateClassPair(
+        superclass: *mut std::ffi::c_void,
+        name: *const std::ffi::c_char,
+        extra_bytes: usize,
+    ) -> *mut std::ffi::c_void;
+    fn class_addMethod(
+        cls: *mut std::ffi::c_void,
+        name: *mut std::ffi::c_void,
+        imp: *const std::ffi::c_void,
+        types: *const std::ffi::c_char,
+    ) -> bool;
+    fn objc_registerClassPair(cls: *mut std::ffi::c_void);
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn manifold_dragging_source_mask(
+    _this: *mut std::ffi::c_void,
+    _cmd: *mut std::ffi::c_void,
+    _session: *mut std::ffi::c_void,
+    _context: isize,
+) -> usize {
+    usize::MAX
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn ensure_macos_dragging_source_class() -> *mut std::ffi::c_void {
+    static REGISTER_ONCE: std::sync::Once = std::sync::Once::new();
+    let cls_name = c"ManifoldNativeDraggingSource";
+    REGISTER_ONCE.call_once(|| {
+        let existing = objc_getClass(cls_name.as_ptr());
+        if existing.is_null() {
+            let ns_obj = objc_getClass(c"NSObject".as_ptr());
+            let pair = objc_allocateClassPair(ns_obj, cls_name.as_ptr(), 0);
+            if !pair.is_null() {
+                let sel = sel_registerName(
+                    c"draggingSession:sourceOperationMaskForDraggingContext:".as_ptr(),
+                );
+                let imp = manifold_dragging_source_mask as *const std::ffi::c_void;
+                let _ = class_addMethod(pair, sel, imp, c"Q@:@q".as_ptr());
+                objc_registerClassPair(pair);
+            }
+        }
+    });
+    objc_getClass(cls_name.as_ptr())
+}
+
+#[cfg(target_os = "macos")]
+fn start_native_os_file_drag(paths: &[String]) -> bool {
+    type Msg0 =
+        unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+    type Msg1Ptr = unsafe extern "C" fn(
+        *mut std::ffi::c_void,
+        *mut std::ffi::c_void,
+        *const std::ffi::c_void,
+    ) -> *mut std::ffi::c_void;
+    type Msg1Void =
+        unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, *mut std::ffi::c_void);
+    type MsgRetPoint =
+        unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> MacOsPoint;
+    type MsgConvertPt = unsafe extern "C" fn(
+        *mut std::ffi::c_void,
+        *mut std::ffi::c_void,
+        MacOsPoint,
+        *mut std::ffi::c_void,
+    ) -> MacOsPoint;
+    type MsgSetFrame = unsafe extern "C" fn(
+        *mut std::ffi::c_void,
+        *mut std::ffi::c_void,
+        MacOsRect,
+        *mut std::ffi::c_void,
+    );
+    type MsgBeginDrag = unsafe extern "C" fn(
+        *mut std::ffi::c_void,
+        *mut std::ffi::c_void,
+        *mut std::ffi::c_void,
+        *mut std::ffi::c_void,
+        *mut std::ffi::c_void,
+    ) -> *mut std::ffi::c_void;
+
+    if paths.is_empty() {
+        return false;
+    }
+
+    unsafe {
+        let fn_ptr = objc_msgSend as *const ();
+        let msg0: Msg0 = std::mem::transmute(fn_ptr);
+        let msg1_ptr: Msg1Ptr = std::mem::transmute(fn_ptr);
+        let msg1_void: Msg1Void = std::mem::transmute(fn_ptr);
+        let msg_pt: MsgRetPoint = std::mem::transmute(fn_ptr);
+        let msg_conv_pt: MsgConvertPt = std::mem::transmute(fn_ptr);
+        let msg_set_frame: MsgSetFrame = std::mem::transmute(fn_ptr);
+        let msg_begin_drag: MsgBeginDrag = std::mem::transmute(fn_ptr);
+
+        let ns_app_cls = objc_getClass(c"NSApplication".as_ptr());
+        if ns_app_cls.is_null() {
+            return false;
+        }
+        let ns_app = msg0(ns_app_cls, sel_registerName(c"sharedApplication".as_ptr()));
+        if ns_app.is_null() {
+            return false;
+        }
+        let mut ns_win = msg0(ns_app, sel_registerName(c"keyWindow".as_ptr()));
+        if ns_win.is_null() {
+            let wins = msg0(ns_app, sel_registerName(c"windows".as_ptr()));
+            if !wins.is_null() {
+                ns_win = msg0(wins, sel_registerName(c"firstObject".as_ptr()));
+            }
+        }
+        if ns_win.is_null() {
+            return false;
+        }
+        let content_view = msg0(ns_win, sel_registerName(c"contentView".as_ptr()));
+        if content_view.is_null() {
+            return false;
+        }
+        let drag_ev = msg0(ns_app, sel_registerName(c"currentEvent".as_ptr()));
+        if drag_ev.is_null() {
+            return false;
+        }
+
+        let src_cls = ensure_macos_dragging_source_class();
+        if src_cls.is_null() {
+            return false;
+        }
+        let drag_source = msg0(src_cls, sel_registerName(c"new".as_ptr()));
+        if drag_source.is_null() {
+            return false;
+        }
+
+        let sel_mouse_loc = sel_registerName(c"mouseLocationOutsideOfEventStream".as_ptr());
+        let mouse_loc = msg_pt(ns_win, sel_mouse_loc);
+        let sel_conv = sel_registerName(c"convertPoint:fromView:".as_ptr());
+        let view_pt = msg_conv_pt(content_view, sel_conv, mouse_loc, std::ptr::null_mut());
+
+        let arr_cls = objc_getClass(c"NSMutableArray".as_ptr());
+        let items_arr = msg0(arr_cls, sel_registerName(c"array".as_ptr()));
+        let str_cls = objc_getClass(c"NSString".as_ptr());
+        let url_cls = objc_getClass(c"NSURL".as_ptr());
+        let item_cls = objc_getClass(c"NSDraggingItem".as_ptr());
+        let ws_cls = objc_getClass(c"NSWorkspace".as_ptr());
+        let workspace = msg0(ws_cls, sel_registerName(c"sharedWorkspace".as_ptr()));
+
+        let sel_utf8 = sel_registerName(c"stringWithUTF8String:".as_ptr());
+        let sel_url = sel_registerName(c"fileURLWithPath:".as_ptr());
+        let sel_alloc = sel_registerName(c"alloc".as_ptr());
+        let sel_writer = sel_registerName(c"initWithPasteboardWriter:".as_ptr());
+        let sel_icon = sel_registerName(c"iconForFile:".as_ptr());
+        let sel_frame = sel_registerName(c"setDraggingFrame:contents:".as_ptr());
+        let sel_add = sel_registerName(c"addObject:".as_ptr());
+
+        let mut added_count = 0usize;
+        for path in paths {
+            let Ok(c_path) = std::ffi::CString::new(path.as_str()) else {
+                continue;
+            };
+            let raw_ptr = c_path.as_ptr() as *const std::ffi::c_void;
+            let ns_str = msg1_ptr(str_cls, sel_utf8, raw_ptr);
+            if ns_str.is_null() {
+                continue;
+            }
+            let file_url = msg1_ptr(url_cls, sel_url, ns_str);
+            if file_url.is_null() {
+                continue;
+            }
+            let alloc_item = msg0(item_cls, sel_alloc);
+            if alloc_item.is_null() {
+                continue;
+            }
+            let drag_item = msg1_ptr(alloc_item, sel_writer, file_url);
+            if drag_item.is_null() {
+                continue;
+            }
+            let icon = if !workspace.is_null() {
+                msg1_ptr(workspace, sel_icon, ns_str)
+            } else {
+                std::ptr::null_mut()
+            };
+            let offset = (added_count as f64) * 6.0;
+            let frame = MacOsRect {
+                origin: MacOsPoint {
+                    x: view_pt.x - 16.0 + offset,
+                    y: view_pt.y - 16.0 - offset,
+                },
+                size: MacOsSize {
+                    width: 32.0,
+                    height: 32.0,
+                },
+            };
+            msg_set_frame(drag_item, sel_frame, frame, icon);
+            msg1_void(items_arr, sel_add, drag_item);
+            added_count += 1;
+        }
+
+        if added_count == 0 {
+            return false;
+        }
+
+        let sel_begin = sel_registerName(c"beginDraggingSessionWithItems:event:source:".as_ptr());
+        let session = msg_begin_drag(content_view, sel_begin, items_arr, drag_ev, drag_source);
+        !session.is_null()
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn start_native_os_file_drag(_paths: &[String]) -> bool {
+    false
+}
+
+fn is_executable_file(meta: &FileMetadata) -> bool {
+    if meta.is_dir {
+        return false;
+    }
+    let ext_opt = meta
+        .extension
+        .as_deref()
+        .map(|s| s.trim_start_matches('.').to_ascii_lowercase())
+        .filter(|s| !s.is_empty());
+    if let Some(ext) = ext_opt.as_deref() {
+        return matches!(
+            ext,
+            "sh" | "bash"
+                | "zsh"
+                | "fish"
+                | "command"
+                | "run"
+                | "bin"
+                | "exe"
+                | "bat"
+                | "cmd"
+                | "ps1"
+                | "app"
+                | "apk"
+                | "msi"
+        );
+    }
+    (meta.permissions & 0o111 != 0) && (meta.permissions & 0o777 != 0o777)
 }
 
 fn move_path_to_trash(vfs: &LocalFsBackend, path: &str) -> Result<String, String> {
@@ -2675,10 +3727,13 @@ fn sync_window_from_runtime(window: &ManifoldWindow, rt: &mut GuiRuntime) {
     window.set_terminal_prompt(term_prompt_str.into());
 
     let active_dir = rt.current_pane_path(is_right_active);
+    window.set_current_folder_is_favorite(rt.is_path_in_favorites(&active_dir));
 
     // Sidebar model
     let mut sb_entries = Vec::new();
     let mut sb_targets = Vec::new();
+    let mut fav_min_idx: i32 = -1;
+    let mut fav_max_idx: i32 = -1;
 
     for section in &rt.app_state.sidebar_sections {
         sb_entries.push(SidebarEntrySlint {
@@ -2697,9 +3752,19 @@ fn sync_window_from_runtime(window: &ManifoldWindow, rt: &mut GuiRuntime) {
         sb_targets.push((section.title.clone(), String::new()));
 
         for item in &section.items {
+            let cur_sb_idx = sb_entries.len() as i32;
+            if section.title == "Favorites" {
+                if fav_min_idx < 0 {
+                    fav_min_idx = cur_sb_idx;
+                }
+                fav_max_idx = cur_sb_idx;
+            }
             let target_path = vfs_url_to_target(&item.vfs_url);
             let badge_str = item.capacity_badge.as_deref().unwrap_or("");
-            let is_sel = !target_path.is_empty() && target_path == active_dir;
+            let is_sel = match &rt.selected_sidebar_id {
+                Some(sel_id) => item.id == *sel_id,
+                None => !target_path.is_empty() && target_path == active_dir,
+            };
             let color_lbl = rt
                 .sidebar_colors
                 .get(&item.id)
@@ -2724,7 +3789,10 @@ fn sync_window_from_runtime(window: &ManifoldWindow, rt: &mut GuiRuntime) {
             for child in &item.children {
                 let child_target = vfs_url_to_target(&child.vfs_url);
                 let c_badge = child.capacity_badge.as_deref().unwrap_or("");
-                let c_sel = !child_target.is_empty() && child_target == active_dir;
+                let c_sel = match &rt.selected_sidebar_id {
+                    Some(sel_id) => child.id == *sel_id,
+                    None => !child_target.is_empty() && child_target == active_dir,
+                };
                 let ch_color = rt
                     .sidebar_colors
                     .get(&child.id)
@@ -2749,6 +3817,8 @@ fn sync_window_from_runtime(window: &ManifoldWindow, rt: &mut GuiRuntime) {
         }
     }
     rt.sidebar_targets = sb_targets;
+    window.set_fav_min_sidebar_idx(fav_min_idx.max(0));
+    window.set_fav_max_sidebar_idx(fav_max_idx.max(0));
     window.set_sidebar_items(ModelRc::new(VecModel::from(sb_entries)));
 
     // Left & Right headers, interactive breadcrumbs, and tabs
@@ -2997,6 +4067,7 @@ fn sync_window_from_runtime(window: &ManifoldWindow, rt: &mut GuiRuntime) {
 
     let log_strings: Vec<SharedString> = rt.logs.iter().map(SharedString::from).collect();
     window.set_log_rows(ModelRc::new(VecModel::from(log_strings)));
+    rt.capture_and_save_session(window);
 }
 
 fn update_rows_selection_in_place(rows: &ModelRc<FileRowSlint>, selected_indices: &HashSet<usize>) {
@@ -3068,7 +4139,12 @@ fn sync_inspector_to_window(window: &ManifoldWindow, rt: &mut GuiRuntime) {
         let mod_s = vm.general.modified.clone();
         let cre_s = vm.general.created.clone();
         let add_s = vm.general.added.clone();
-        let ext_s = vm.general.extension.clone();
+        let raw_ext = vm.general.extension.trim().trim_start_matches('.');
+        let ext_s = if raw_ext.is_empty() {
+            "--".to_string()
+        } else {
+            format!(".{raw_ext}")
+        };
         let hide_ext = vm.general.hide_extension;
         window.set_inspector_title(title_s.into());
         window.set_inspector_subtitle(sub_s.into());
@@ -3201,27 +4277,29 @@ fn extract_media_metadata(
 
     if is_image_extension(Some(&ext_low)) {
         let (w, h) = img_dims.unwrap_or((0, 0));
-        let line1 = if w > 0 && h > 0 {
+        let (line1, line2) = if w > 0 && h > 0 {
             let mp = (f64::from(w) * f64::from(h)) / 1_000_000.0;
-            format!("Resolution: {w}×{h} px ({mp:.2} MP) • Format: {ext_up}")
+            (
+                format!("Resolution: {w} × {h} px"),
+                format!("Format: {ext_up} • {mp:.2} MP"),
+            )
         } else {
-            format!("Format: {ext_up} Image • Size: {sz_str}")
+            (
+                format!("Format: {ext_up} Image"),
+                format!("File Size: {sz_str}"),
+            )
         };
         let color_info = match ext_low.as_str() {
-            "png" | "webp" | "ico" => "Color Space: RGBA (8-bit/ch) • Alpha Channel",
-            "svg" => "Color Space: Vector SVG / XML Scalable",
-            "gif" => "Color Space: Indexed 256-Color Palette",
-            _ => "Color Space: sRGB (24-bit TrueColor)",
+            "png" | "webp" | "ico" => "Color: RGBA (8-bit, Alpha)",
+            "svg" => "Color: Vector SVG / XML",
+            "gif" => "Color: Indexed 256-Color",
+            _ => "Color: sRGB (24-bit TrueColor)",
         };
-        let line3 = format!(
-            "File Size: {sz_str} • Modified: {}",
-            meta.formatted_iso_datetime()
-        );
         return (
             "Photo / Image".to_string(),
             line1,
+            line2,
             color_info.to_string(),
-            line3,
         );
     }
 
@@ -3244,9 +4322,9 @@ fn extract_media_metadata(
             let kbps = (u64::from(br) * 8) / 1000;
             return (
                 "Audio / Music".to_string(),
-                format!("Codec: PCM WAV ({bps}-bit) • {khz:.1} kHz • {ch_lbl} ({ch} ch)"),
-                format!("Duration: {dur_str} • Bitrate: {kbps} kbps"),
-                format!("Container: RIFF WAVE • Size: {sz_str}"),
+                format!("Format: PCM WAV ({bps}-bit)"),
+                format!("Audio: {khz:.1} kHz • {ch_lbl} ({ch} ch)"),
+                format!("Duration: {dur_str} • {kbps} kbps"),
             );
         }
         if ext_low == "flac" && head.len() >= 26 && &head[0..4] == b"fLaC" {
@@ -3261,9 +4339,9 @@ fn extract_media_metadata(
             let dur_str = format_duration_secs(est_dur.max(1));
             return (
                 "Audio / Music".to_string(),
-                format!("Codec: FLAC Lossless ({bps}-bit) • {khz:.1} kHz • {ch} ch"),
-                format!("Est. Duration: {dur_str} • Lossless Audio"),
-                format!("Container: FLAC • Size: {sz_str}"),
+                format!("Format: FLAC Lossless ({bps}-bit)"),
+                format!("Audio: {khz:.1} kHz • {ch} ch"),
+                format!("Est. Duration: {dur_str}"),
             );
         }
         let est_kbps: u64 = match ext_low.as_str() {
@@ -3274,15 +4352,15 @@ fn extract_media_metadata(
         let dur_str = format_duration_secs(dur_s.max(1));
         let has_id3 = head.starts_with(b"ID3");
         let tag_lbl = if has_id3 {
-            "ID3v2 Audio Tags Present"
+            "ID3v2 Tags"
         } else {
-            "Standard Audio Stream"
+            "Audio Stream"
         };
         return (
             "Audio / Music".to_string(),
-            format!("Codec: {ext_up} Audio • Sample Rate: 44.1 kHz • Stereo (2 ch)"),
-            format!("Est. Duration: {dur_str} • Bitrate: ~{est_kbps} kbps"),
-            format!("{tag_lbl} • Size: {sz_str}"),
+            format!("Format: {ext_up} • {tag_lbl}"),
+            "Audio: 44.1 kHz • Stereo (2 ch)".to_string(),
+            format!("Duration: ~{dur_str} • ~{est_kbps} kbps"),
         );
     }
 
@@ -3297,17 +4375,14 @@ fn extract_media_metadata(
         let codec_lbl = match ext_low.as_str() {
             "mp4" | "m4v" | "mov" => "H.264 / HEVC + AAC",
             "webm" => "VP9 / AV1 + Opus",
-            "mkv" => "Matroska Video + Multi-Audio",
+            "mkv" => "Matroska + Multi-Audio",
             _ => "Digital Video Stream",
         };
         return (
             "Video / Media".to_string(),
-            format!("Container: {ext_up} Video • Codec: {codec_lbl}"),
-            format!("Est. Duration: {dur_str} • Stream: ~{est_mbps}.0 Mbps"),
-            format!(
-                "File Size: {sz_str} • Modified: {}",
-                meta.formatted_iso_datetime()
-            ),
+            format!("Container: {ext_up} Video"),
+            format!("Stream: {codec_lbl}"),
+            format!("Est. Duration: {dur_str} (~{est_mbps}.0 Mbps)"),
         );
     }
 
@@ -3622,7 +4697,7 @@ fn meta_to_slint_row(
     let tint = color_label_to_tint_color(meta.color_label);
     let ext_ref = meta.extension.as_deref();
     let is_img = is_image_extension(ext_ref);
-    let is_exec = !meta.is_dir && (meta.permissions & 0o111 != 0);
+    let is_exec = is_executable_file(meta);
     let can_thumb = load_thumbs
         && is_img
         && !meta.is_dir
@@ -3725,8 +4800,10 @@ fn build_icon_triples(rows: &[FileRowSlint]) -> Vec<IconGridTripleSlint> {
 /// Launches the native cross-platform Slint desktop GUI window for Manifold.
 pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
     let window = ManifoldWindow::new().map_err(|e| e.to_string())?;
+    window.set_app_version_label(current_app_version_label().into());
     let rt = Rc::new(RefCell::new(GuiRuntime::new(initial_state)));
 
+    rt.borrow_mut().restore_saved_session(&window);
     sync_window_from_runtime(&window, &mut rt.borrow_mut());
 
     // Activate Left or Right pane
@@ -3742,6 +4819,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 ActivePane::Left
             };
             guard.sync_terminal_cwd();
+            guard.sync_selected_sidebar_to_active_dir();
             guard.refresh_headers_and_inspector();
             if let Some(w) = win_weak.upgrade() {
                 w.set_show_tab_preview(true);
@@ -3767,6 +4845,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 guard.app_state.active_pane = ActivePane::Left;
             }
             guard.sync_terminal_cwd();
+            guard.sync_selected_sidebar_to_active_dir();
             guard.refresh_headers_and_inspector();
             if let Some(w) = win_weak.upgrade() {
                 w.set_show_tab_preview(true);
@@ -3940,11 +5019,9 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
         let win_weak = window.as_weak();
         window.on_select_sidebar_item(move |idx| {
             let mut guard = rt.borrow_mut();
-            let target = guard
-                .sidebar_targets
-                .get(idx as usize)
-                .map(|(_, p)| p.clone())
-                .unwrap_or_default();
+            let Some((item_id, target)) = guard.sidebar_targets.get(idx as usize).cloned() else {
+                return;
+            };
             if target == "connect://dialog" {
                 if let Some(w) = win_weak.upgrade() {
                     w.set_show_connect_modal(true);
@@ -3952,6 +5029,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 return;
             }
             if !target.is_empty() {
+                guard.selected_sidebar_id = Some(item_id);
                 let is_right = guard.is_right_effective();
                 guard.logs.push(format!("[NAV] Sidebar -> {target}"));
                 guard.navigate_to_path(is_right, target);
@@ -3977,9 +5055,13 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 if guard.saved_connections.remove_profile(&item_id) {
                     let _ = guard.saved_connections.save_default();
                 }
-                if guard.prefs.remove_favorite(&item_id) {
+                if guard
+                    .prefs
+                    .remove_favorite_by_id_or_path(&item_id, &target_path)
+                {
                     let _ = guard.prefs.save_default();
                 }
+                guard.sync_selected_sidebar_to_active_dir();
                 let msg = format!("[DISCONNECT] Disconnected {item_id}");
                 guard.logs.push(msg);
                 let toast = format!("Removed {item_id}");
@@ -4005,6 +5087,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 return;
             }
             guard.sidebar_context_idx = u_idx;
+            guard.selected_sidebar_id = Some(item_id.clone());
             let mut found_sec = "Devices".to_string();
             let mut found_label = item_id.clone();
             let mut found_icon = "drive".to_string();
@@ -4027,7 +5110,15 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                     }
                 }
             }
+            let is_fav = found_sec == "Favorites" || guard.is_path_in_favorites(&target_path);
+            let color_lbl = guard
+                .sidebar_colors
+                .get(&item_id)
+                .copied()
+                .unwrap_or(ColorLabel::None);
+            let color_idx = color_label_to_index(color_lbl);
             if let Some(w) = win_weak.upgrade() {
+                sync_window_from_runtime(&w, &mut guard);
                 w.set_sidebar_context_idx(idx);
                 w.set_sidebar_context_x(x);
                 w.set_sidebar_context_y(y);
@@ -4035,6 +5126,8 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 w.set_sidebar_context_section(found_sec.into());
                 w.set_sidebar_context_icon(found_icon.into());
                 w.set_sidebar_context_can_eject(found_eject);
+                w.set_sidebar_context_is_favorite(is_fav);
+                w.set_sidebar_context_color_index(color_idx);
                 w.set_show_sidebar_context_menu(true);
             }
         });
@@ -4181,6 +5274,15 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 "add_favorite" => {
                     guard.pin_folder_to_favorites(&target_path, &item_label);
                 }
+                "remove_favorite" => {
+                    let id_arg = if sec_name == "Favorites" {
+                        item_id.as_str()
+                    } else {
+                        ""
+                    };
+                    guard.unpin_folder_from_favorites(id_arg, &target_path);
+                    guard.sync_selected_sidebar_to_active_dir();
+                }
                 "duplicate_connection" => {
                     let prof_opt = guard
                         .saved_connections
@@ -4231,9 +5333,13 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                     if guard.saved_connections.remove_profile(&item_id) {
                         let _ = guard.saved_connections.save_default();
                     }
-                    if guard.prefs.remove_favorite(&item_id) {
+                    if guard
+                        .prefs
+                        .remove_favorite_by_id_or_path(&item_id, &target_path)
+                    {
                         let _ = guard.prefs.save_default();
                     }
+                    guard.sync_selected_sidebar_to_active_dir();
                     let toast = format!("Removed \"{item_label}\"");
                     guard.logs.push(format!("[EJECT] {toast}"));
                     guard.show_toast("info", toast);
@@ -4286,7 +5392,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
         window.on_set_sidebar_item_color(move |c_idx| {
             let mut guard = rt.borrow_mut();
             let u_idx = guard.sidebar_context_idx;
-            let Some((item_id, _)) = guard.sidebar_targets.get(u_idx).cloned() else {
+            let Some((item_id, target_path)) = guard.sidebar_targets.get(u_idx).cloned() else {
                 return;
             };
             let color = index_to_color_label(c_idx);
@@ -4295,6 +5401,13 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
             } else {
                 guard.sidebar_colors.insert(item_id.clone(), color);
             }
+            guard.prefs.set_sidebar_color(&item_id, color);
+            if !target_path.is_empty() && split_remote_uri(&target_path).is_none() {
+                let _ = guard.local_vfs.set_color_label(&target_path, color);
+                guard.prefs.set_file_color_label(&target_path, color);
+                guard.invalidate_dir_cache();
+            }
+            let _ = guard.prefs.save_default();
             if let Some(prof) = guard
                 .saved_connections
                 .connections
@@ -4307,6 +5420,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
             let toast = format!("Updated color tag for {item_id}");
             guard.show_toast("info", toast);
             if let Some(w) = win_weak.upgrade() {
+                w.set_sidebar_context_color_index(c_idx);
                 w.set_show_tab_preview(true);
                 sync_window_from_runtime(&w, &mut guard);
             }
@@ -4348,13 +5462,14 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
             let fav_id = format!("fav-conn-{}", guard.logs.len() + 1);
             if color != ColorLabel::None {
                 guard.sidebar_colors.insert(fav_id.clone(), color);
+                guard.prefs.set_sidebar_color(&fav_id, color);
             }
             guard.pin_folder_to_favorites(&vfs_url, &label);
             sync_window_from_runtime(&w, &mut guard);
         });
     }
 
-    // Pin current or selected directory to Sidebar Favorites (with persistence)
+    // Pin or unpin current or selected directory in Sidebar Favorites (with persistence)
     {
         let rt = Rc::clone(&rt);
         let win_weak = window.as_weak();
@@ -4370,7 +5485,12 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 let l = guard.format_tab_title(&p);
                 (p, l)
             });
-            guard.pin_folder_to_favorites(&target_path, &label);
+            if guard.is_path_in_favorites(&target_path) {
+                guard.unpin_folder_from_favorites("", &target_path);
+            } else {
+                guard.pin_folder_to_favorites(&target_path, &label);
+            }
+            guard.sync_selected_sidebar_to_active_dir();
             if let Some(w) = win_weak.upgrade() {
                 w.set_show_tab_preview(true);
                 sync_window_from_runtime(&w, &mut guard);
@@ -4383,16 +5503,14 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
         window.on_add_current_folder_to_favorites(move || {
             let mut guard = rt.borrow_mut();
             let is_right = guard.is_right_effective();
-            let sel_dir = guard
-                .selected_metadata()
-                .filter(|m| m.is_dir)
-                .map(|m| (m.path.clone(), m.name.clone()));
-            let (target_path, label) = sel_dir.unwrap_or_else(|| {
-                let p = guard.current_pane_path(is_right);
-                let l = guard.format_tab_title(&p);
-                (p, l)
-            });
-            guard.pin_folder_to_favorites(&target_path, &label);
+            let target_path = guard.current_pane_path(is_right);
+            let label = guard.format_tab_title(&target_path);
+            if guard.is_path_in_favorites(&target_path) {
+                guard.unpin_folder_from_favorites("", &target_path);
+            } else {
+                guard.pin_folder_to_favorites(&target_path, &label);
+            }
+            guard.sync_selected_sidebar_to_active_dir();
             if let Some(w) = win_weak.upgrade() {
                 w.set_show_tab_preview(true);
                 sync_window_from_runtime(&w, &mut guard);
@@ -4421,6 +5539,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 guard.left_selected_indices.insert(0);
             }
             guard.reload_pane_entries(is_right);
+            guard.sync_selected_sidebar_to_active_dir();
             if let Some(w) = win_weak.upgrade() {
                 w.set_show_tab_preview(true);
                 sync_window_from_runtime(&w, &mut guard);
@@ -4468,6 +5587,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 guard.app_state.left_active_tab = new_idx;
             }
             guard.reload_pane_entries(is_right);
+            guard.sync_selected_sidebar_to_active_dir();
             if let Some(w) = win_weak.upgrade() {
                 w.set_show_tab_preview(true);
                 sync_window_from_runtime(&w, &mut guard);
@@ -4497,6 +5617,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 }
             }
             guard.reload_pane_entries(is_right);
+            guard.sync_selected_sidebar_to_active_dir();
             if let Some(w) = win_weak.upgrade() {
                 w.set_show_tab_preview(true);
                 sync_window_from_runtime(&w, &mut guard);
@@ -4584,6 +5705,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
         let win_weak = window.as_weak();
         window.on_select_file_row(move |is_right, row_idx| {
             let mut guard = rt.borrow_mut();
+            guard.native_os_drag_handed_off = false;
             let idx = row_idx as usize;
             let use_right = is_right && guard.app_state.dual_pane_enabled;
             guard.apply_row_selection(use_right, idx, false, false);
@@ -4599,6 +5721,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
         let win_weak = window.as_weak();
         window.on_select_file_row_mod(move |is_right, row_idx, is_shift, is_cmd| {
             let mut guard = rt.borrow_mut();
+            guard.native_os_drag_handed_off = false;
             let idx = row_idx as usize;
             let use_right = is_right && guard.app_state.dual_pane_enabled;
             guard.apply_row_selection(use_right, idx, is_shift, is_cmd);
@@ -4830,9 +5953,21 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
             } else {
                 sel_list.first().map(|m| m.name.clone()).unwrap_or_default()
             };
+            let target_is_dir = sel_list.len() == 1 && sel_list[0].is_dir;
+            let target_is_archive = sel_list.len() == 1 && is_extractable_archive(&sel_list[0]);
+            let fav_check_path = sel_list
+                .first()
+                .filter(|m| m.is_dir)
+                .map(|m| m.path.clone())
+                .unwrap_or_else(|| guard.current_pane_path(use_right));
+            let target_is_fav = guard.is_path_in_favorites(&fav_check_path);
             if let Some(w) = win_weak.upgrade() {
                 w.set_has_clipboard_item(!guard.clipboard_paths.is_empty());
                 sync_selection_and_inspector(&w, &mut guard);
+                w.set_context_is_blank(false);
+                w.set_context_target_is_dir(target_is_dir);
+                w.set_context_target_is_archive(target_is_archive);
+                w.set_context_target_is_favorite(target_is_fav);
                 w.set_context_target_name(target_name.into());
                 w.set_context_menu_x(x_pos);
                 w.set_context_menu_y(y_pos);
@@ -4857,9 +5992,14 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
             guard.refresh_headers_and_inspector();
             let cur_path = guard.current_pane_path(use_right);
             let folder_label = guard.format_tab_title(&cur_path);
+            let target_is_fav = guard.is_path_in_favorites(&cur_path);
             if let Some(w) = win_weak.upgrade() {
                 w.set_has_clipboard_item(!guard.clipboard_paths.is_empty());
                 sync_selection_and_inspector(&w, &mut guard);
+                w.set_context_is_blank(true);
+                w.set_context_target_is_dir(true);
+                w.set_context_target_is_archive(false);
+                w.set_context_target_is_favorite(target_is_fav);
                 w.set_context_target_name(folder_label.into());
                 w.set_context_menu_x(x_pos);
                 w.set_context_menu_y(y_pos);
@@ -4882,41 +6022,52 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 "open" => {
                     guard.open_entry_at(is_right, None);
                 }
-                "open_new_tab" => {
-                    if let Some(meta) = sel_meta {
-                        let target_dir = if meta.is_dir {
-                            meta.path
-                        } else {
-                            vfs_parent_dir(&meta.path).unwrap_or_else(|| "/".to_string())
-                        };
-                        let title = guard.format_tab_title(&target_dir);
-                        let vfs_url = if target_dir.contains("://") {
-                            target_dir.clone()
-                        } else {
-                            format!("file://{target_dir}")
-                        };
-                        let new_tab = crate::PaneTabModel {
-                            id: format!("tab-{}", guard.logs.len()),
-                            title,
-                            icon_kind: "folder".to_string(),
-                            vfs_url,
-                            current_path: target_dir,
-                            view_mode: PaneViewMode::List,
-                            sort_column: SortColumn::Name,
-                            sort_direction: SortDirection::Ascending,
-                            inline_filter: String::new(),
-                            expanded_folders: HashSet::new(),
-                            selected_paths: HashSet::new(),
-                        };
-                        if is_right {
-                            guard.app_state.right_tabs.push(new_tab);
-                            guard.app_state.right_active_tab = guard.app_state.right_tabs.len() - 1;
-                        } else {
-                            guard.app_state.left_tabs.push(new_tab);
-                            guard.app_state.left_active_tab = guard.app_state.left_tabs.len() - 1;
-                        }
-                        guard.reload_pane_entries(is_right);
+                "open_with" => {
+                    if let (Some(meta), Some(w)) = (sel_meta, win_weak.upgrade()) {
+                        let apps = discover_open_with_apps(&meta);
+                        w.set_open_with_target_name(meta.name.into());
+                        w.set_open_with_target_path(meta.path.into());
+                        w.set_open_with_apps(ModelRc::new(VecModel::from(apps)));
+                        w.set_open_with_selected_idx(0);
+                        w.set_open_with_custom_cmd(SharedString::default());
+                        w.set_show_open_with_modal(true);
+                        return;
                     }
+                }
+                "open_new_tab" => {
+                    let target_dir = match sel_meta {
+                        Some(meta) if meta.is_dir => meta.path,
+                        Some(meta) => vfs_parent_dir(&meta.path).unwrap_or_else(|| "/".to_string()),
+                        None => guard.current_pane_path(is_right),
+                    };
+                    let title = guard.format_tab_title(&target_dir);
+                    let vfs_url = if target_dir.contains("://") {
+                        target_dir.clone()
+                    } else {
+                        format!("file://{target_dir}")
+                    };
+                    let new_tab = crate::PaneTabModel {
+                        id: format!("tab-{}", guard.logs.len()),
+                        title,
+                        icon_kind: "folder".to_string(),
+                        vfs_url,
+                        current_path: target_dir,
+                        view_mode: PaneViewMode::List,
+                        sort_column: SortColumn::Name,
+                        sort_direction: SortDirection::Ascending,
+                        inline_filter: String::new(),
+                        expanded_folders: HashSet::new(),
+                        selected_paths: HashSet::new(),
+                    };
+                    if is_right {
+                        guard.app_state.right_tabs.push(new_tab);
+                        guard.app_state.right_active_tab = guard.app_state.right_tabs.len() - 1;
+                    } else {
+                        guard.app_state.left_tabs.push(new_tab);
+                        guard.app_state.left_active_tab = guard.app_state.left_tabs.len() - 1;
+                    }
+                    guard.reload_pane_entries(is_right);
+                    guard.sync_selected_sidebar_to_active_dir();
                 }
                 "trash" => {
                     if let Some(w) = win_weak.upgrade() {
@@ -4976,13 +6127,30 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                     }
                 }
                 "add_favorite" => {
-                    let sel_dir = sel_meta.filter(|m| m.is_dir).map(|m| (m.path, m.name));
+                    let is_blank = win_weak.upgrade().is_some_and(|w| w.get_context_is_blank());
+                    let sel_dir = if is_blank {
+                        None
+                    } else {
+                        sel_meta.filter(|m| m.is_dir).map(|m| (m.path, m.name))
+                    };
                     let (target_path, label) = sel_dir.unwrap_or_else(|| {
                         let p = guard.current_pane_path(is_right);
                         let l = guard.format_tab_title(&p);
                         (p, l)
                     });
                     guard.pin_folder_to_favorites(&target_path, &label);
+                    guard.sync_selected_sidebar_to_active_dir();
+                }
+                "remove_favorite" => {
+                    let is_blank = win_weak.upgrade().is_some_and(|w| w.get_context_is_blank());
+                    let sel_dir = if is_blank {
+                        None
+                    } else {
+                        sel_meta.filter(|m| m.is_dir).map(|m| m.path)
+                    };
+                    let target_path = sel_dir.unwrap_or_else(|| guard.current_pane_path(is_right));
+                    guard.unpin_folder_from_favorites("", &target_path);
+                    guard.sync_selected_sidebar_to_active_dir();
                 }
                 "compress" => {
                     if let Some(meta) = sel_meta {
@@ -5003,6 +6171,26 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                         guard.start_tracked_task(&label, &archive_path, sz, label.clone(), "info");
                         guard.invalidate_dir_cache();
                         guard.reload_pane_entries(is_right);
+                    }
+                }
+                "extract" => {
+                    if let Some(meta) = sel_meta {
+                        match extract_archive_to_folder(&meta) {
+                            Ok(dest_dir) => {
+                                let label = format!("Extracted {}", meta.name);
+                                let sz = meta.size.unwrap_or(4096);
+                                let log_msg = format!("[EXTRACT] -> {dest_dir}");
+                                guard.logs.push(log_msg);
+                                let toast = label.clone();
+                                guard.start_tracked_task(&label, &dest_dir, sz, toast, "success");
+                                guard.invalidate_dir_cache();
+                                guard.reload_pane_entries(is_right);
+                            }
+                            Err(err) => {
+                                let log_msg = format!("[EXTRACT_ERR] {err}");
+                                guard.logs.push(log_msg);
+                            }
+                        }
                     }
                 }
                 "duplicate" => {
@@ -5058,8 +6246,17 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                     }
                 }
                 "reveal_in_finder" => {
-                    if let Some(meta) = sel_meta {
-                        reveal_in_system_file_manager(&meta.path);
+                    let is_blank = win_weak.upgrade().is_some_and(|w| w.get_context_is_blank());
+                    if !is_blank {
+                        if let Some(meta) = sel_meta {
+                            reveal_in_system_file_manager(&meta.path);
+                        } else {
+                            let cur_dir = guard.current_pane_path(is_right);
+                            reveal_in_system_file_manager(&cur_dir);
+                        }
+                    } else {
+                        let cur_dir = guard.current_pane_path(is_right);
+                        reveal_in_system_file_manager(&cur_dir);
                     }
                 }
                 "cut" if !sel_list.is_empty() => {
@@ -5080,6 +6277,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                     let first_name = sel_list[0].name.clone();
                     guard.clipboard_paths = sel_list.into_iter().map(|m| m.path).collect();
                     guard.clipboard_cut = false;
+                    copy_files_to_os_clipboard(&guard.clipboard_paths);
                     let toast = if count == 1 {
                         format!("Copied \"{first_name}\" to clipboard")
                     } else {
@@ -5092,20 +6290,29 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                     let dst_dir = guard.current_pane_path(is_right);
                     guard.paste_clipboard_into(&dst_dir);
                 }
-                "copy_path" if !sel_list.is_empty() => {
-                    let joined = sel_list
-                        .iter()
-                        .map(|m| m.path.as_str())
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    copy_string_to_system_clipboard(&joined);
-                    let toast = if sel_list.len() == 1 {
-                        format!("Copied path: {}", sel_list[0].path)
+                "copy_path" => {
+                    let is_blank = win_weak.upgrade().is_some_and(|w| w.get_context_is_blank());
+                    if is_blank || sel_list.is_empty() {
+                        let cur_dir = guard.current_pane_path(is_right);
+                        copy_string_to_system_clipboard(&cur_dir);
+                        let toast = format!("Copied path: {cur_dir}");
+                        guard.logs.push(format!("[PATH] {toast}"));
+                        guard.show_toast("copy", toast);
                     } else {
-                        format!("Copied {} paths to clipboard", sel_list.len())
-                    };
-                    guard.logs.push(format!("[PATH] {toast}"));
-                    guard.show_toast("copy", toast);
+                        let joined = sel_list
+                            .iter()
+                            .map(|m| m.path.as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        copy_string_to_system_clipboard(&joined);
+                        let toast = if sel_list.len() == 1 {
+                            format!("Copied path: {}", sel_list[0].path)
+                        } else {
+                            format!("Copied {} paths to clipboard", sel_list.len())
+                        };
+                        guard.logs.push(format!("[PATH] {toast}"));
+                        guard.show_toast("copy", toast);
+                    }
                 }
                 _ => {}
             }
@@ -5218,6 +6425,13 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                             }
                         }
                     }
+                    guard.prefs.set_sidebar_label(&item_id, trimmed);
+                    for fav in &mut guard.prefs.custom_favorites {
+                        if fav.id == item_id {
+                            fav.label = trimmed.to_string();
+                        }
+                    }
+                    let _ = guard.prefs.save_default();
                     if let Some(prof) = guard
                         .saved_connections
                         .connections
@@ -5230,6 +6444,53 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                     let toast = format!("Updated label to \"{trimmed}\"");
                     guard.logs.push(format!("[SIDEBAR] {toast}"));
                     guard.show_toast("success", toast);
+                }
+            }
+            sync_window_from_runtime(&w, &mut guard);
+        });
+    }
+
+    // Open With Application Picker confirmation
+    {
+        let rt = Rc::clone(&rt);
+        let win_weak = window.as_weak();
+        window.on_confirm_open_with(move |app_spec| {
+            let Some(w) = win_weak.upgrade() else {
+                return;
+            };
+            let app_str = app_spec.to_string();
+            let trimmed = app_str.trim();
+            if trimmed.is_empty() {
+                return;
+            }
+            let target = w.get_open_with_target_path().to_string();
+            let mut guard = rt.borrow_mut();
+            let local_target = if target.starts_with("sftp://")
+                || target.starts_with("s3://")
+                || target.starts_with("smb://")
+                || target.starts_with("ftp://")
+                || target.starts_with("webdav://")
+            {
+                let mut staged = None;
+                if let Some(meta) = guard.selected_metadata().cloned() {
+                    let staged_vec = guard.prepare_local_paths_for_external_drag(&[meta]);
+                    staged = staged_vec.into_iter().next();
+                }
+                staged.unwrap_or_else(|| target.clone())
+            } else {
+                target.clone()
+            };
+            match launch_file_with_app(&local_target, trimmed) {
+                Ok(app_label) => {
+                    let log = format!("[OPEN_WITH] Opened {local_target} with {app_label}");
+                    guard.logs.push(log);
+                    let toast = format!("Opened with {app_label}");
+                    guard.show_toast("info", toast);
+                }
+                Err(err) => {
+                    let log = format!("[OPEN_WITH] Failed ({trimmed}): {err}");
+                    guard.logs.push(log);
+                    guard.show_toast("error", err);
                 }
             }
             sync_window_from_runtime(&w, &mut guard);
@@ -5347,16 +6608,17 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
             let Some(w) = win_weak.upgrade() else {
                 return;
             };
-            let guard = rt.borrow();
+            let mut guard = rt.borrow_mut();
+            if guard.native_os_drag_handed_off || !is_primary_mouse_button_pressed() {
+                drop(guard);
+                clear_window_drag_overlay(&w);
+                schedule_async_pointer_release(w.as_weak(), abs_x, abs_y);
+                return;
+            }
             let items = guard.drag_items_for_row(from_right, row_idx.max(0) as usize);
             if items.is_empty() {
                 return;
             }
-            let ghost_label = if items.len() == 1 {
-                items[0].name.clone()
-            } else {
-                format!("{} items", items.len())
-            };
             let coords = (
                 abs_x,
                 abs_y,
@@ -5364,7 +6626,29 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 w.get_drag_left_scroll_y(),
                 w.get_drag_right_scroll_y(),
             );
-            let res = guard.resolve_drop_target(from_right, &items, coords);
+            let bounds = window_logical_bounds(&w);
+            let res = guard.resolve_drop_target(from_right, &items, coords, bounds);
+            if res.dst_dir.as_deref() == Some("__EXTERNAL_OS_DROP__") {
+                let local_paths = guard.prepare_local_paths_for_external_drag(&items);
+                copy_files_to_os_clipboard(&local_paths);
+                if start_native_os_file_drag(&local_paths) {
+                    guard.native_os_drag_handed_off = true;
+                    let msg = format!(
+                        "[DRAG-OUT] Handed off {} item(s) to native OS drag session",
+                        local_paths.len()
+                    );
+                    guard.logs.push(msg);
+                    drop(guard);
+                    clear_window_drag_overlay(&w);
+                    schedule_async_pointer_release(w.as_weak(), abs_x, abs_y);
+                    return;
+                }
+            }
+            let ghost_label = if items.len() == 1 {
+                items[0].name.clone()
+            } else {
+                format!("{} items", items.len())
+            };
             w.set_is_dragging_row(true);
             w.set_drag_ghost_x(abs_x);
             w.set_drag_ghost_y(abs_y);
@@ -5386,18 +6670,13 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
             let Some(w) = win_weak.upgrade() else {
                 return;
             };
-            w.set_is_dragging_row(false);
-            w.set_drag_ghost_label("".into());
-            w.set_drag_target_hint("".into());
-            w.set_drag_hover_sidebar_idx(-1);
-            w.set_drag_hover_left_tab(-1);
-            w.set_drag_hover_right_tab(-1);
-            w.set_drag_hover_left_row(-1);
-            w.set_drag_hover_right_row(-1);
-            w.set_drag_hover_left_pane(false);
-            w.set_drag_hover_right_pane(false);
+            clear_window_drag_overlay(&w);
 
             let mut guard = rt.borrow_mut();
+            if guard.native_os_drag_handed_off {
+                guard.native_os_drag_handed_off = false;
+                return;
+            }
             let items = guard.drag_items_for_row(from_right, row_idx.max(0) as usize);
             if items.is_empty() {
                 return;
@@ -5409,7 +6688,8 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 w.get_drag_left_scroll_y(),
                 w.get_drag_right_scroll_y(),
             );
-            let res = guard.resolve_drop_target(from_right, &items, coords);
+            let bounds = window_logical_bounds(&w);
+            let res = guard.resolve_drop_target(from_right, &items, coords, bounds);
             if let Some(dst_dir) = res.dst_dir {
                 guard.execute_drop_target(&items, &dst_dir, res.is_move);
                 sync_window_from_runtime(&w, &mut guard);
@@ -5728,10 +7008,29 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 }
             }
             if !selected_list.is_empty() {
+                let mut matched_sidebar_ids = Vec::new();
                 for meta in &selected_list {
                     let _ = guard.mounted_vfs.set_color_label(&meta.path, label);
                     let _ = guard.local_vfs.set_color_label(&meta.path, label);
+                    guard.prefs.set_file_color_label(&meta.path, label);
+                    if meta.is_dir {
+                        let norm_meta = normalize_fav_target(&meta.path);
+                        for (sb_id, sb_target) in &guard.sidebar_targets {
+                            if normalize_fav_target(sb_target) == norm_meta {
+                                matched_sidebar_ids.push(sb_id.clone());
+                            }
+                        }
+                    }
                 }
+                for sb_id in matched_sidebar_ids {
+                    if label == ColorLabel::None {
+                        guard.sidebar_colors.remove(&sb_id);
+                    } else {
+                        guard.sidebar_colors.insert(sb_id.clone(), label);
+                    }
+                    guard.prefs.set_sidebar_color(&sb_id, label);
+                }
+                let _ = guard.prefs.save_default();
                 let tag_name = color_label_to_name(label);
                 let toast_msg = if label == ColorLabel::None {
                     if selected_list.len() == 1 {
@@ -6670,6 +7969,31 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 }
             }
 
+            if (w.get_is_dragging_row() || guard.native_os_drag_handed_off)
+                && !is_primary_mouse_button_pressed()
+            {
+                guard.native_os_drag_handed_off = false;
+                let x = w.get_drag_ghost_x();
+                let y = w.get_drag_ghost_y();
+                clear_window_drag_overlay(&w);
+                schedule_async_pointer_release(w.as_weak(), x, y);
+            }
+
+            guard.fs_poll_tick = guard.fs_poll_tick.wrapping_add(1);
+            if guard.fs_poll_tick.is_multiple_of(16)
+                && guard.bg_tasks_in_flight == 0
+                && !w.get_is_dragging_row()
+                && !w.get_show_conflict_modal()
+                && guard.poll_external_directory_changes()
+            {
+                need_full_sync = true;
+            }
+
+            guard.session_save_tick = guard.session_save_tick.wrapping_add(1);
+            if guard.session_save_tick.is_multiple_of(64) && !need_full_sync {
+                guard.capture_and_save_session(&w);
+            }
+
             if need_full_sync {
                 sync_window_from_runtime(&w, &mut guard);
             } else if need_transfer_sync {
@@ -6693,7 +8017,9 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
         });
     }
 
-    window.run().map_err(|e| e.to_string())
+    let run_res = window.run().map_err(|e| e.to_string());
+    rt.borrow().capture_and_save_session(&window);
+    run_res
 }
 
 fn prompt_delete_confirmation(w: &ManifoldWindow, guard: &mut GuiRuntime, permanent: bool) {
@@ -6885,8 +8211,10 @@ fn handle_keyboard_shortcut(
     // Escape closes active popovers, modals, hover preview, path edit mode, or terminal drawer
     if key == "\u{001b}" {
         let had_overlay = w.get_show_app_menu()
+            || w.get_show_about_modal()
             || w.get_show_context_menu()
             || w.get_show_sidebar_context_menu()
+            || w.get_show_open_with_modal()
             || w.get_show_sibling_dropdown()
             || w.get_show_tasks_popover()
             || w.get_show_preview_minion()
@@ -6899,8 +8227,10 @@ fn handle_keyboard_shortcut(
             || w.get_left_path_edit_mode()
             || w.get_right_path_edit_mode();
         w.set_show_app_menu(false);
+        w.set_show_about_modal(false);
         w.set_show_context_menu(false);
         w.set_show_sidebar_context_menu(false);
+        w.set_show_open_with_modal(false);
         w.set_show_sibling_dropdown(false);
         w.set_show_tasks_popover(false);
         w.set_show_preview_minion(false);
@@ -7365,6 +8695,399 @@ fn run_local_command_bounded(run_dir: &str, cmd: &str, timeout: Duration) -> Str
     combined
 }
 
+fn normalize_fav_target(raw: &str) -> String {
+    let trimmed = raw.trim().strip_prefix("file://").unwrap_or(raw.trim());
+    if trimmed == "/" {
+        "/".to_string()
+    } else {
+        trimmed.trim_end_matches('/').to_string()
+    }
+}
+
+fn push_unique_open_with_app(
+    out: &mut Vec<OpenWithAppSlint>,
+    id: &str,
+    name: &str,
+    detail: &str,
+    icon_kind: &str,
+) {
+    if out.iter().any(|a| a.id.as_str() == id) {
+        return;
+    }
+    out.push(OpenWithAppSlint {
+        id: id.into(),
+        name: name.into(),
+        detail: detail.into(),
+        icon_kind: icon_kind.into(),
+    });
+}
+
+fn discover_open_with_apps(meta: &FileMetadata) -> Vec<OpenWithAppSlint> {
+    let mut apps = Vec::new();
+    let default_detail = if cfg!(target_os = "macos") {
+        "System LaunchServices default handler (/usr/bin/open)"
+    } else if cfg!(target_os = "windows") {
+        "Windows Shell default handler (explorer)"
+    } else {
+        "Freedesktop MIME default handler (xdg-open)"
+    };
+    push_unique_open_with_app(
+        &mut apps,
+        "__DEFAULT__",
+        "System Default Application",
+        default_detail,
+        "external-link",
+    );
+
+    let ext = meta
+        .extension
+        .as_deref()
+        .unwrap_or("")
+        .trim_start_matches('.')
+        .to_lowercase();
+    let is_image = matches!(
+        ext.as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "ico" | "tiff" | "heic"
+    );
+    let is_media = matches!(
+        ext.as_str(),
+        "mp3" | "wav" | "flac" | "m4a" | "ogg" | "aac" | "mp4" | "mov" | "mkv" | "webm" | "avi"
+    );
+    let is_pdf_or_doc = matches!(
+        ext.as_str(),
+        "pdf" | "doc" | "docx" | "rtf" | "odt" | "pages" | "xls" | "xlsx" | "ppt" | "pptx"
+    );
+    let is_archive = matches!(
+        ext.as_str(),
+        "zip" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "7z" | "rar" | "dmg" | "iso"
+    );
+
+    if cfg!(target_os = "macos") {
+        let mut mac_candidates: Vec<(&str, &str, &str)> = Vec::new();
+        if meta.is_dir {
+            mac_candidates.push((
+                "/System/Applications/Utilities/Terminal.app",
+                "Terminal",
+                "terminal",
+            ));
+            mac_candidates.push(("/Applications/iTerm.app", "iTerm", "terminal"));
+            mac_candidates.push((
+                "/Applications/Visual Studio Code.app",
+                "Visual Studio Code",
+                "code",
+            ));
+            mac_candidates.push(("/Applications/Zed.app", "Zed", "code"));
+            mac_candidates.push(("/Applications/Cursor.app", "Cursor", "code"));
+        } else {
+            if is_image || is_pdf_or_doc {
+                mac_candidates.push(("/System/Applications/Preview.app", "Preview", "image"));
+            }
+            if is_media {
+                mac_candidates.push((
+                    "/System/Applications/QuickTime Player.app",
+                    "QuickTime Player",
+                    "movies",
+                ));
+                mac_candidates.push(("/Applications/VLC.app", "VLC", "movies"));
+                mac_candidates.push(("/Applications/IINA.app", "IINA", "movies"));
+                mac_candidates.push(("/System/Applications/Music.app", "Music", "music"));
+            }
+            if is_archive {
+                mac_candidates.push((
+                    "/System/Library/CoreServices/Applications/Archive Utility.app",
+                    "Archive Utility",
+                    "archive",
+                ));
+                mac_candidates.push((
+                    "/Applications/The Unarchiver.app",
+                    "The Unarchiver",
+                    "archive",
+                ));
+                mac_candidates.push(("/Applications/Keka.app", "Keka", "archive"));
+            }
+            mac_candidates.push((
+                "/Applications/Visual Studio Code.app",
+                "Visual Studio Code",
+                "code",
+            ));
+            mac_candidates.push(("/Applications/Cursor.app", "Cursor", "code"));
+            mac_candidates.push(("/Applications/Zed.app", "Zed", "code"));
+            mac_candidates.push(("/Applications/Sublime Text.app", "Sublime Text", "code"));
+            mac_candidates.push(("/System/Applications/TextEdit.app", "TextEdit", "documents"));
+            mac_candidates.push(("/System/Applications/Preview.app", "Preview", "image"));
+            mac_candidates.push(("/Applications/Google Chrome.app", "Google Chrome", "globe"));
+            mac_candidates.push(("/Applications/Firefox.app", "Firefox", "globe"));
+            mac_candidates.push(("/Applications/Safari.app", "Safari", "globe"));
+            mac_candidates.push(("/Applications/LibreOffice.app", "LibreOffice", "documents"));
+            mac_candidates.push((
+                "/Applications/Microsoft Word.app",
+                "Microsoft Word",
+                "documents",
+            ));
+            mac_candidates.push((
+                "/Applications/Microsoft Excel.app",
+                "Microsoft Excel",
+                "documents",
+            ));
+        }
+        for (bundle_path, label, icon) in mac_candidates {
+            if std::path::Path::new(bundle_path).exists() {
+                push_unique_open_with_app(&mut apps, bundle_path, label, bundle_path, icon);
+            }
+        }
+        if let Ok(entries) = std::fs::read_dir("/Applications") {
+            let mut extra_apps: Vec<(String, String)> = entries
+                .flatten()
+                .filter_map(|e| {
+                    let path = e.path();
+                    let name = path.file_name()?.to_string_lossy().to_string();
+                    if name.ends_with(".app") {
+                        let label = name.trim_end_matches(".app").to_string();
+                        Some((path.to_string_lossy().to_string(), label))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            extra_apps.sort_by_key(|(_, label)| label.to_lowercase());
+            for (path_str, label) in extra_apps.into_iter().take(18) {
+                push_unique_open_with_app(&mut apps, &path_str, &label, &path_str, "folder");
+            }
+        }
+    } else if cfg!(target_os = "windows") {
+        let win_bins: [(&str, &str, &str, &str); 5] = [
+            (
+                "notepad.exe",
+                "Notepad",
+                "Windows Text Editor (notepad.exe)",
+                "documents",
+            ),
+            ("code", "Visual Studio Code", "Code Editor (code)", "code"),
+            (
+                "explorer.exe",
+                "Windows Explorer",
+                "File Explorer (explorer.exe)",
+                "folder",
+            ),
+            (
+                "mspaint.exe",
+                "Paint",
+                "Image Editor (mspaint.exe)",
+                "image",
+            ),
+            (
+                "powershell.exe",
+                "PowerShell",
+                "Windows PowerShell",
+                "terminal",
+            ),
+        ];
+        for (bin, label, detail, icon) in win_bins {
+            push_unique_open_with_app(&mut apps, bin, label, detail, icon);
+        }
+    } else {
+        let linux_bins: [(&str, &str, &str); 18] = [
+            ("code", "Visual Studio Code", "code"),
+            ("codium", "VSCodium", "code"),
+            ("zed", "Zed Editor", "code"),
+            ("subl", "Sublime Text", "code"),
+            ("gedit", "GNOME Text Editor (gedit)", "documents"),
+            ("kate", "KDE Kate", "documents"),
+            ("mousepad", "Mousepad", "documents"),
+            ("nano", "GNU Nano (Terminal)", "terminal"),
+            ("vim", "Vim (Terminal)", "terminal"),
+            ("evince", "Document Viewer (Evince)", "documents"),
+            ("okular", "Okular Document Viewer", "documents"),
+            ("eog", "Image Viewer (Eye of GNOME)", "image"),
+            ("feh", "Feh Image Viewer", "image"),
+            ("gimp", "GNU Image Manipulation Program", "image"),
+            ("vlc", "VLC Media Player", "movies"),
+            ("mpv", "mpv Media Player", "movies"),
+            ("libreoffice", "LibreOffice", "documents"),
+            ("firefox", "Mozilla Firefox", "globe"),
+        ];
+        let search_dirs = ["/usr/bin", "/usr/local/bin", "/bin", "/snap/bin"];
+        for (bin, label, icon) in linux_bins {
+            for dir in search_dirs {
+                let full = format!("{dir}/{bin}");
+                if std::path::Path::new(&full).exists() {
+                    push_unique_open_with_app(&mut apps, &full, label, &full, icon);
+                    break;
+                }
+            }
+        }
+    }
+    apps
+}
+
+fn launch_file_with_app(target_path: &str, app_spec: &str) -> Result<String, String> {
+    let trimmed = app_spec.trim();
+    if trimmed.is_empty() {
+        return Err("No application specified".to_string());
+    }
+    if trimmed == "__DEFAULT__" {
+        #[cfg(target_os = "macos")]
+        let status = Command::new("/usr/bin/open")
+            .arg(target_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        #[cfg(target_os = "windows")]
+        let status = Command::new("explorer")
+            .arg(target_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let status = Command::new("xdg-open")
+            .arg(target_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        return status
+            .map(|_| "System Default Application".to_string())
+            .map_err(|e| format!("Failed to launch system handler: {e}"));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let label = std::path::Path::new(trimmed)
+            .file_name()
+            .map(|n| n.to_string_lossy().trim_end_matches(".app").to_string())
+            .unwrap_or_else(|| trimmed.to_string());
+        if trimmed.ends_with(".app") || !trimmed.contains('/') {
+            return Command::new("/usr/bin/open")
+                .args(["-a", trimmed, target_path])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map(|_| label)
+                .map_err(|e| format!("Failed to open with {trimmed}: {e}"));
+        }
+    }
+
+    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+    let program = parts[0];
+    let extra_args = &parts[1..];
+    let label = std::path::Path::new(program)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| program.to_string());
+    Command::new(program)
+        .args(extra_args)
+        .arg(target_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| label)
+        .map_err(|e| format!("Failed to execute {program}: {e}"))
+}
+
+fn is_extractable_archive(meta: &FileMetadata) -> bool {
+    if meta.is_dir {
+        return false;
+    }
+    let lower = meta.name.to_lowercase();
+    let suffixes = [
+        ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz", ".tar", ".zip", ".7z", ".rar",
+        ".gz", ".bz2", ".xz",
+    ];
+    suffixes.iter().any(|s| lower.ends_with(s))
+}
+
+fn archive_output_stem(file_name: &str) -> String {
+    let lower = file_name.to_lowercase();
+    let compound = [
+        ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz", ".tar", ".zip", ".7z", ".rar",
+        ".gz", ".bz2", ".xz",
+    ];
+    for suf in compound {
+        if lower.ends_with(suf) && file_name.len() > suf.len() {
+            let cut = file_name.len() - suf.len();
+            return file_name[..cut].to_string();
+        }
+    }
+    format!("{file_name}_extracted")
+}
+
+fn extract_archive_to_folder(meta: &FileMetadata) -> Result<String, String> {
+    if meta.path.contains("://") {
+        return Err("Remote archive extraction requires downloading first".to_string());
+    }
+    let parent = Path::new(&meta.path)
+        .parent()
+        .and_then(|p| p.to_str())
+        .unwrap_or("/tmp");
+    let trimmed_parent = parent.trim_end_matches('/');
+    let stem = archive_output_stem(&meta.name);
+    let mut dest_dir = format!("{trimmed_parent}/{stem}");
+    let mut counter = 2usize;
+    while Path::new(&dest_dir).exists() {
+        dest_dir = format!("{trimmed_parent}/{stem} {counter}");
+        counter += 1;
+    }
+    std::fs::create_dir_all(&dest_dir).map_err(|e| format!("Failed to create {dest_dir}: {e}"))?;
+
+    let lower = meta.name.to_lowercase();
+    let status = if lower.ends_with(".zip") {
+        Command::new("unzip")
+            .args(["-q", "-o", &meta.path, "-d", &dest_dir])
+            .status()
+            .or_else(|_| {
+                Command::new("tar")
+                    .args(["-xf", &meta.path, "-C", &dest_dir])
+                    .status()
+            })
+    } else if lower.ends_with(".tar.gz")
+        || lower.ends_with(".tgz")
+        || lower.ends_with(".tar.bz2")
+        || lower.ends_with(".tbz2")
+        || lower.ends_with(".tar.xz")
+        || lower.ends_with(".txz")
+        || lower.ends_with(".tar")
+    {
+        Command::new("tar")
+            .args(["-xf", &meta.path, "-C", &dest_dir])
+            .status()
+    } else if lower.ends_with(".7z") {
+        let out_arg = format!("-o{dest_dir}");
+        Command::new("7z")
+            .args(["x", "-y", &meta.path, &out_arg])
+            .status()
+    } else if lower.ends_with(".rar") {
+        Command::new("unrar")
+            .args(["x", "-y", &meta.path, &dest_dir])
+            .status()
+    } else if lower.ends_with(".gz") {
+        let out_file = format!("{dest_dir}/{stem}");
+        let cmd = format!("gzip -dc \"{}\" > \"{out_file}\"", meta.path);
+        Command::new("sh").args(["-c", &cmd]).status()
+    } else if lower.ends_with(".bz2") {
+        let out_file = format!("{dest_dir}/{stem}");
+        let cmd = format!("bzip2 -dc \"{}\" > \"{out_file}\"", meta.path);
+        Command::new("sh").args(["-c", &cmd]).status()
+    } else if lower.ends_with(".xz") {
+        let out_file = format!("{dest_dir}/{stem}");
+        let cmd = format!("xz -dc \"{}\" > \"{out_file}\"", meta.path);
+        Command::new("sh").args(["-c", &cmd]).status()
+    } else {
+        Command::new("tar")
+            .args(["-xf", &meta.path, "-C", &dest_dir])
+            .status()
+    };
+
+    match status {
+        Ok(s) if s.success() => Ok(dest_dir),
+        Ok(s) => Err(format!("Extractor exited with status {s}")),
+        Err(e) => Err(format!("Failed to run archive extractor: {e}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7509,5 +9232,131 @@ mod tests {
 
         let _ = rt.local_vfs.remove(src_dir, true);
         let _ = rt.local_vfs.remove(dst_dir, true);
+    }
+
+    #[test]
+    fn test_executable_classification_ignores_mount_exec_bits_on_documents() {
+        let mut pdf = sample_meta("Quadrata_FZCO_salary_certificate_2026.pdf");
+        pdf.extension = Some("pdf".to_string());
+        pdf.permissions = 0o755;
+        assert!(!is_executable_file(&pdf));
+
+        let mut doc = sample_meta("Quadrata_FZCO_Doc_template_2023.doc");
+        doc.extension = Some("doc".to_string());
+        doc.permissions = 0o777;
+        assert!(!is_executable_file(&doc));
+
+        let mut script = sample_meta("deploy.sh");
+        script.extension = Some("sh".to_string());
+        script.permissions = 0o644;
+        assert!(is_executable_file(&script));
+
+        let mut elf_bin = sample_meta("manifold");
+        elf_bin.extension = None;
+        elf_bin.permissions = 0o755;
+        assert!(is_executable_file(&elf_bin));
+
+        let mut fat_no_ext = sample_meta("README");
+        fat_no_ext.extension = None;
+        fat_no_ext.permissions = 0o777;
+        assert!(!is_executable_file(&fat_no_ext));
+    }
+
+    #[test]
+    fn test_external_directory_fingerprint_detects_new_and_deleted_entries() {
+        let mut rt = GuiRuntime::new(ManifoldAppState::new_reference_workspace());
+        let watch_dir = "/tmp/manifold_live_watch_test";
+        let _ = rt.local_vfs.remove(watch_dir, true);
+        rt.local_vfs.create_dir(watch_dir).unwrap();
+        rt.navigate_to_path(false, watch_dir.to_string());
+
+        assert!(!rt.poll_external_directory_changes());
+
+        let ext_file = format!("{watch_dir}/created_outside.txt");
+        std::fs::write(&ext_file, b"hello").unwrap();
+        assert!(rt.poll_external_directory_changes());
+        let found_after_add = rt
+            .left_entries
+            .iter()
+            .any(|r| r.meta.name == "created_outside.txt");
+        assert!(found_after_add);
+
+        std::fs::remove_file(&ext_file).unwrap();
+        assert!(rt.poll_external_directory_changes());
+        let found_after_del = rt
+            .left_entries
+            .iter()
+            .any(|r| r.meta.name == "created_outside.txt");
+        assert!(!found_after_del);
+
+        let _ = rt.local_vfs.remove(watch_dir, true);
+    }
+
+    #[test]
+    fn test_format_app_version_label_normalizes_leading_dots_and_v_prefix() {
+        assert_eq!(format_app_version_label(".0.3.1.2"), "v.0.3.1.2");
+        assert_eq!(format_app_version_label("v.0.3.1.2"), "v.0.3.1.2");
+        assert_eq!(format_app_version_label("v0.3.1"), "v.0.3.1");
+        assert_eq!(format_app_version_label("0.3.1.2"), "v.0.3.1.2");
+        assert_eq!(format_app_version_label("V.1.2.0"), "v.1.2.0");
+        assert_eq!(format_app_version_label(""), "v.0.1.0");
+    }
+
+    #[test]
+    fn test_external_drag_out_resolves_at_window_edges() {
+        let rt = GuiRuntime::new(ManifoldAppState::new_reference_workspace());
+        let items = [sample_meta("report.pdf")];
+        let bounds = (205.0, 1360.0, 840.0);
+
+        let l_coords = (8.0, 300.0, 700.0, 0.0, 0.0);
+        let left_edge = rt.resolve_drop_target(false, &items, l_coords, bounds);
+        assert_eq!(left_edge.dst_dir.as_deref(), Some("__EXTERNAL_OS_DROP__"));
+
+        let r_coords = (1352.0, 300.0, 700.0, 0.0, 0.0);
+        let right_edge = rt.resolve_drop_target(false, &items, r_coords, bounds);
+        assert_eq!(right_edge.dst_dir.as_deref(), Some("__EXTERNAL_OS_DROP__"));
+
+        let b_coords = (500.0, 832.0, 700.0, 0.0, 0.0);
+        let bottom_edge = rt.resolve_drop_target(false, &items, b_coords, bounds);
+        assert_eq!(bottom_edge.dst_dir.as_deref(), Some("__EXTERNAL_OS_DROP__"));
+    }
+
+    #[test]
+    fn test_favorites_membership_and_unpin_persistence() {
+        let mut rt = GuiRuntime::new(ManifoldAppState::new_reference_workspace());
+        let custom_dir = "/tmp/manifold_fav_test_dir";
+        assert!(!rt.is_path_in_favorites(custom_dir));
+
+        rt.pin_folder_to_favorites(custom_dir, "Fav Test");
+        assert!(rt.is_path_in_favorites(custom_dir));
+
+        rt.unpin_folder_from_favorites("", custom_dir);
+        assert!(!rt.is_path_in_favorites(custom_dir));
+    }
+
+    #[test]
+    fn test_discover_open_with_apps_includes_system_default() {
+        let mut pdf = sample_meta("invoice.pdf");
+        pdf.extension = Some("pdf".to_string());
+        let apps = discover_open_with_apps(&pdf);
+        assert!(!apps.is_empty());
+        assert_eq!(apps[0].id.as_str(), "__DEFAULT__");
+    }
+
+    #[test]
+    fn test_archive_detection_and_extract_to_folder() {
+        let targz = sample_meta("manifold-main-71634bd-macos-arm64.tar.gz");
+        assert!(is_extractable_archive(&targz));
+        assert_eq!(
+            archive_output_stem(&targz.name),
+            "manifold-main-71634bd-macos-arm64"
+        );
+
+        let zip = sample_meta("release_bundle.zip");
+        assert!(is_extractable_archive(&zip));
+        assert_eq!(archive_output_stem(&zip.name), "release_bundle");
+
+        let txt = sample_meta("notes.txt");
+        assert!(!is_extractable_archive(&txt));
     }
 }

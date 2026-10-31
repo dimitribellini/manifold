@@ -3,7 +3,7 @@
 <div align="center">
 
 [![GitHub](https://img.shields.io/badge/GITHUB-DIMITRIBELLINI%2FMANIFOLD-24292F?style=for-the-badge&logo=github&logoColor=white)](https://github.com/dimitribellini/manifold)
-[![Release](https://img.shields.io/badge/RELEASE-V0.1.0-0A84FF?style=for-the-badge&logo=github&logoColor=white)](https://github.com/dimitribellini/manifold/releases)
+[![Release](https://img.shields.io/badge/RELEASE-V0.3.1-0A84FF?style=for-the-badge&logo=github&logoColor=white)](https://github.com/dimitribellini/manifold/releases)
 [![Platforms](https://img.shields.io/badge/PLATFORMS-MACOS%20ARM64%20%7C%20LINUX%20X86__64%20%7C%20WINDOWS%20X86__64-EE7F2D?style=for-the-badge&logo=apple&logoColor=white)](#quick-start)
 [![Engine](https://img.shields.io/badge/ENGINE-RUST%20%2B%20SLINT-8A2BE2?style=for-the-badge&logo=rust&logoColor=white)](#architecture)
 [![License](https://img.shields.io/badge/LICENSE-MIT-4CC61E?style=for-the-badge)](#license)
@@ -52,14 +52,14 @@ Expand-Archive -Path manifold-windows-x86_64.zip -DestinationPath .
 
 ## Features
 
-- **Single & Dual-Pane Workspace**: Switch between Single Pane and Dual Pane with resizable splitters for the sidebar, panes, table columns, inspector drawer, and bottom terminal.
-- **Folder Tabs & Breadcrumb Navigation**: Manage multiple tabs per pane with drag-and-drop tab reordering, clickable breadcrumb paths, and `Cmd/Ctrl + L` path editing with `Tab` completion.
+- **Single & Dual-Pane Workspace**: Switch between Single Pane and Dual Pane with resizable splitters for the sidebar, panes, table columns, inspector drawer, and bottom terminal, with automatic session restoration (`session.toml`) on launch.
+- **Animated Tabs, Sidebar Favorites & Breadcrumb Navigation**: Manage multiple tabs per pane with smooth animated drag-and-drop reordering for both folder tabs and sidebar `Favorites`, live external file-change detection, clickable breadcrumb paths, and `Cmd/Ctrl + L` path editing with `Tab` completion.
 - **Three View Modes (`List`, `Columns`, `Icons`)**: Browse files in a sortable details table, Miller columns with a live preview column, or an icon grid with inline image thumbnails.
-- **File Previews & Media Metadata**: Inspect image, audio, video, text, source code, and document metadata in the right-hand Inspector drawer (`Cmd/Ctrl + I`), on hover, or via the Quick Look viewer (`Space`).
-- **Background Transfers & Conflict Resolution**: Run local and remote file transfers on background threads with progress tracking and pre-flight conflict resolution (`Replace`, `Replace Older`, `Keep Both`, `Skip`, `Stop`, and `Apply to all`).
+- **Card-Structured Inspector & Quick Look Previews**: Inspect files in the right-hand Inspector drawer (`Cmd/Ctrl + I`) organized into dedicated cards for Hero Preview, 8-color tag swatches, General metadata (`YYYY-MM-DD HH:mm`), media details (`Photo / Image`, `Audio / Music`, `Video / Media`), and interactive `R/W/X` + `Octal` permissions & ownership, or preview items on hover and via Quick Look (`Space`).
+- **Background Transfers & Conflict Resolution**: Run local and remote file transfers on background threads with progress tracking in the `Tasks` inspector tab and pre-flight conflict resolution (`Replace`, `Replace Older`, `Keep Both`, `Skip`, `Stop`, and `Apply to all`).
 - **Integrated Terminal**: Open an embedded PTY shell (`>_`) that stays synchronized with the active pane's working directory and supports command history and `Ctrl+C` interrupts.
-- **Fast Search & Keyboard Navigation**: Filter directories per tab with wildcard queries (`*`, `?`) and navigate using arrow keys, shortcuts, or drag-and-drop across panes, tabs, and sidebar targets.
-- **Archives, Sync & Batch Tools**: Browse `.zip`, `.tar.gz`, `.7z`, and `.rar` archives inline, compare and synchronize directories (`SHA-256`, metadata, or binary diff), apply 8-color tags, and batch-rename files.
+- **Fast Search & Keyboard Navigation**: Filter directories per tab with wildcard queries (`*`, `?`) and navigate using arrow keys, shortcuts, or drag-and-drop across panes, tabs, sidebar targets, and external OS applications/Desktop.
+- **Archives, Sync, Open With & Batch Tools**: Open files with any installed OS application or custom command (`Open With…`), compress or extract `.zip`, `.tar.gz`, `.tar.bz2`, `.tar.xz`, `.7z`, and `.rar` archives directly from the context menu (`Extract "<name>" Here`), compare and synchronize directories (`SHA-256`, metadata, or binary diff), apply persistent 8-color tags to files and sidebar favorites, and batch-rename files.
 - **Themes & Typography**: Customize font family, font size, font weight, and color themes (`Dark Zinc`, `Midnight Ocean`, `Dracula Pro`, `Nordic Slate`, `Solarized Dark`, `High Contrast`) via `Preferences & Themes…` (`Cmd/Ctrl + ,`).
 
 ---
@@ -72,7 +72,7 @@ Expand-Archive -Path manifold-windows-x86_64.zip -DestinationPath .
 
 - **Supported Protocols**: `SFTP / SSH` (password or private key), `Amazon S3` (and S3-compatible storage), `SMB`, `FTP / FTPS`, and `WebDAV`.
 - **Direct Streaming Transfers**: Large remote transfers stream directly between disk and remote endpoints without buffering entire files in memory.
-- **OS Keychain Integration**: Connection profiles are stored in `~/.config/manifold/connections.toml`, while passwords and key passphrases are kept in the native OS keychain (`macOS Keychain` or Linux `libsecret`).
+- **OS Keychain Integration**: Connection profiles are stored in `~/.config/manifold/connections.toml` (or `%APPDATA%\Manifold\connections.toml` on Windows), while passwords and key passphrases are kept in the native OS credential store (`macOS Keychain`, Linux `libsecret`, or Windows Credential Manager).
 
 ---
 

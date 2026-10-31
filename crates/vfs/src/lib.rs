@@ -537,6 +537,21 @@ impl LocalFsBackend {
         guard.get(path).cloned()
     }
 
+    /// Seeds persistent file/folder color labels from `preferences.toml` into the overlay.
+    pub fn restore_color_labels(&self, labels: &HashMap<String, ColorLabel>) {
+        let Ok(mut guard) = self.attrs_overlay.write() else {
+            return;
+        };
+        for (raw_path, color) in labels {
+            if *color == ColorLabel::None {
+                continue;
+            }
+            if let Ok(resolved) = self.resolve_safe_path(raw_path) {
+                guard.entry(resolved).or_default().color_label = *color;
+            }
+        }
+    }
+
     fn build_metadata(&self, path: &Path) -> Result<FileMetadata, VfsError> {
         let sym_meta = fs::symlink_metadata(path).map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => VfsError::NotFound(path.display().to_string()),

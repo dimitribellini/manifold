@@ -463,6 +463,34 @@ pub enum SplitDirection {
     Horizontal,
 }
 
+fn default_active_pane() -> String {
+    "left".to_string()
+}
+
+const fn default_sidebar_width() -> f32 {
+    212.0
+}
+
+const fn default_inspector_width() -> f32 {
+    296.0
+}
+
+const fn default_size_col_width() -> f32 {
+    88.0
+}
+
+const fn default_date_col_width() -> f32 {
+    136.0
+}
+
+const fn default_miller_parent_width() -> f32 {
+    210.0
+}
+
+const fn default_terminal_drawer_height() -> f32 {
+    220.0
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WindowSessionConfig {
     pub width: u32,
@@ -473,6 +501,28 @@ pub struct WindowSessionConfig {
     pub show_hidden_files: bool,
     #[serde(default = "default_true")]
     pub show_preview_pane: bool,
+    #[serde(default)]
+    pub dual_pane_enabled: bool,
+    #[serde(default = "default_active_pane")]
+    pub active_pane: String,
+    #[serde(default = "default_sidebar_width")]
+    pub sidebar_width: f32,
+    #[serde(default)]
+    pub inspector_open: bool,
+    #[serde(default = "default_inspector_width")]
+    pub inspector_width: f32,
+    #[serde(default = "default_size_col_width")]
+    pub size_col_width: f32,
+    #[serde(default = "default_date_col_width")]
+    pub date_col_width: f32,
+    #[serde(default = "default_miller_parent_width")]
+    pub miller_parent_width: f32,
+    #[serde(default = "default_terminal_drawer_height")]
+    pub terminal_drawer_height: f32,
+    #[serde(default)]
+    pub inspector_tab_index: usize,
+    #[serde(default)]
+    pub terminal_drawer_open: bool,
 }
 
 impl Default for WindowSessionConfig {
@@ -484,6 +534,17 @@ impl Default for WindowSessionConfig {
             split_direction: SplitDirection::Vertical,
             show_hidden_files: false,
             show_preview_pane: true,
+            dual_pane_enabled: false,
+            active_pane: default_active_pane(),
+            sidebar_width: default_sidebar_width(),
+            inspector_open: false,
+            inspector_width: default_inspector_width(),
+            size_col_width: default_size_col_width(),
+            date_col_width: default_date_col_width(),
+            miller_parent_width: default_miller_parent_width(),
+            terminal_drawer_height: default_terminal_drawer_height(),
+            inspector_tab_index: 0,
+            terminal_drawer_open: false,
         }
     }
 }
@@ -491,6 +552,8 @@ impl Default for WindowSessionConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TabSessionConfig {
     pub vfs_url: String,
+    #[serde(default)]
+    pub current_path: String,
     #[serde(default)]
     pub title: Option<String>,
     pub view_mode: PaneViewMode,
@@ -521,6 +584,45 @@ impl SessionState {
 
     pub fn to_toml_string(&self) -> Result<String, ConfigError> {
         Ok(toml::to_string_pretty(self)?)
+    }
+
+    pub fn default_config_path() -> PathBuf {
+        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+            if !xdg.trim().is_empty() {
+                return PathBuf::from(xdg).join("manifold").join("session.toml");
+            }
+        }
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            if !appdata.trim().is_empty() {
+                return PathBuf::from(appdata).join("Manifold").join("session.toml");
+            }
+        }
+        let home_var = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"));
+        if let Ok(home) = home_var {
+            if !home.trim().is_empty() {
+                return PathBuf::from(home)
+                    .join(".config")
+                    .join("manifold")
+                    .join("session.toml");
+            }
+        }
+        std::env::temp_dir().join("manifold").join("session.toml")
+    }
+
+    pub fn load_default() -> Option<Self> {
+        let path = Self::default_config_path();
+        let raw = fs::read_to_string(path).ok()?;
+        Self::from_toml_str(&raw).ok()
+    }
+
+    pub fn save_default(&self) -> Result<(), ConfigError> {
+        let path = Self::default_config_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let serialized = self.to_toml_string()?;
+        fs::write(path, serialized)?;
+        Ok(())
     }
 }
 
@@ -567,6 +669,14 @@ pub struct AppPreferences {
     pub custom_favorites: Vec<FavoriteFolderEntry>,
     #[serde(default)]
     pub favorite_order: Vec<String>,
+    #[serde(default)]
+    pub sidebar_colors: HashMap<String, ColorLabel>,
+    #[serde(default)]
+    pub sidebar_labels: HashMap<String, String>,
+    #[serde(default)]
+    pub removed_favorites: Vec<String>,
+    #[serde(default)]
+    pub file_color_labels: HashMap<String, ColorLabel>,
 }
 
 impl Default for AppPreferences {
@@ -578,6 +688,10 @@ impl Default for AppPreferences {
             font_bold: false,
             custom_favorites: Vec::new(),
             favorite_order: Vec::new(),
+            sidebar_colors: HashMap::new(),
+            sidebar_labels: HashMap::new(),
+            removed_favorites: Vec::new(),
+            file_color_labels: HashMap::new(),
         }
     }
 }
@@ -637,6 +751,8 @@ impl AppPreferences {
     }
 
     pub fn upsert_favorite(&mut self, entry: FavoriteFolderEntry) {
+        self.removed_favorites
+            .retain(|r| r != &entry.id && r != &entry.vfs_url);
         let existing = self
             .custom_favorites
             .iter_mut()
@@ -653,6 +769,64 @@ impl AppPreferences {
         self.custom_favorites
             .retain(|f| f.id != id_or_url && f.vfs_url != id_or_url);
         self.custom_favorites.len() != prev
+    }
+
+    pub fn remove_favorite_by_id_or_path(&mut self, id: &str, target_path: &str) -> bool {
+        let prev = self.custom_favorites.len();
+        self.custom_favorites
+            .retain(|f| f.id != id && (target_path.is_empty() || f.vfs_url != target_path));
+        let removed_custom = self.custom_favorites.len() != prev;
+        let mut recorded_builtin = false;
+        if !id.is_empty() && !self.removed_favorites.iter().any(|r| r == id) {
+            self.removed_favorites.push(id.to_string());
+            recorded_builtin = true;
+        }
+        if !target_path.is_empty() && !self.removed_favorites.iter().any(|r| r == target_path) {
+            self.removed_favorites.push(target_path.to_string());
+            recorded_builtin = true;
+        }
+        removed_custom || recorded_builtin
+    }
+
+    pub fn set_sidebar_color(&mut self, id: &str, color: ColorLabel) {
+        if id.is_empty() {
+            return;
+        }
+        if color == ColorLabel::None {
+            self.sidebar_colors.remove(id);
+        } else {
+            self.sidebar_colors.insert(id.to_string(), color);
+        }
+        for fav in &mut self.custom_favorites {
+            if fav.id == id {
+                fav.color_label = color;
+            }
+        }
+    }
+
+    pub fn set_sidebar_label(&mut self, id: &str, label: &str) {
+        let trimmed = label.trim();
+        if id.is_empty() || trimmed.is_empty() {
+            return;
+        }
+        self.sidebar_labels
+            .insert(id.to_string(), trimmed.to_string());
+        for fav in &mut self.custom_favorites {
+            if fav.id == id {
+                fav.label = trimmed.to_string();
+            }
+        }
+    }
+
+    pub fn set_file_color_label(&mut self, path: &str, color: ColorLabel) {
+        if path.is_empty() {
+            return;
+        }
+        if color == ColorLabel::None {
+            self.file_color_labels.remove(path);
+        } else {
+            self.file_color_labels.insert(path.to_string(), color);
+        }
     }
 }
 
@@ -766,14 +940,30 @@ sort_direction = "ascending"
             icon_kind: "folder".to_string(),
             color_label: ColorLabel::Blue,
         });
+        prefs.set_sidebar_color("fav-documents", ColorLabel::Purple);
+        prefs.set_sidebar_label("fav-documents", "My Docs");
+        prefs.set_file_color_label("/tmp/workspace/report.pdf", ColorLabel::Green);
         assert_eq!(prefs.custom_favorites.len(), 1);
+        assert_eq!(
+            prefs.sidebar_colors.get("fav-documents"),
+            Some(&ColorLabel::Purple)
+        );
+        assert_eq!(
+            prefs.sidebar_labels.get("fav-documents"),
+            Some(&"My Docs".to_string())
+        );
+        assert_eq!(
+            prefs.file_color_labels.get("/tmp/workspace/report.pdf"),
+            Some(&ColorLabel::Green)
+        );
 
         let serialized = prefs.to_toml_string().unwrap();
         let parsed = AppPreferences::from_toml_str(&serialized).unwrap();
         assert_eq!(parsed, prefs);
 
         let mut updated = parsed;
-        assert!(updated.remove_favorite("/tmp/workspace"));
+        assert!(updated.remove_favorite_by_id_or_path("fav-work", "/tmp/workspace"));
         assert!(updated.custom_favorites.is_empty());
+        assert!(updated.removed_favorites.iter().any(|r| r == "fav-work"));
     }
 }
