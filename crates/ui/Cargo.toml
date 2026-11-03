@@ -9,6 +9,7 @@ description = "Dual-pane GUI state store, virtualized 500k+ entry viewport, Slin
 [dependencies]
 fontique.workspace = true
 indexmap.workspace = true
+libc.workspace = true
 log.workspace = true
 manifold-config.workspace = true
 manifold-preview.workspace = true

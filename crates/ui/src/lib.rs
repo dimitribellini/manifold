@@ -13,6 +13,7 @@ use manifold_vfs::{ColorLabel, FileMetadata, FileSystemBackend, LocalFsBackend, 
 use serde::{Deserialize, Serialize};
 
 pub mod gui;
+pub mod terminal;
 
 /// Exact color tokens audited from `doc/image1.png` – `doc/image4.png`.
 pub mod theme {
@@ -177,6 +178,143 @@ impl PathAndStatusHeader {
         }
         nodes
     }
+}
+
+/// Decodes octal-escaped (`\040` space, `\011` tab, `\012` newline, `\134` backslash, or UTF-8
+/// octal byte sequences) and backslash-escaped strings from Linux `/proc/mounts` or `/etc/mtab`.
+pub fn decode_mount_escaped_str(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 3 < bytes.len() {
+            let d0 = bytes[i + 1];
+            let d1 = bytes[i + 2];
+            let d2 = bytes[i + 3];
+            let is_oct = (b'0'..=b'7').contains(&d0)
+                && (b'0'..=b'7').contains(&d1)
+                && (b'0'..=b'7').contains(&d2);
+            if is_oct {
+                let val =
+                    ((d0 - b'0') as u16) * 64 + ((d1 - b'0') as u16) * 8 + ((d2 - b'0') as u16);
+                if val <= 255 {
+                    out.push(val as u8);
+                    i += 4;
+                    continue;
+                }
+            }
+        }
+        if bytes[i] == b'\\' && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+            out.push(b'\\');
+            i += 2;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Parses Linux `/proc/mounts` or `/etc/mtab` lines to detect active NFS (`nfs`, `nfs4`),
+/// CIFS/SMB (`cifs`, `smb`, `smb2`, `smb3`, `smbfs`), and SSHFS (`fuse.sshfs`, `sshfs`) mounts,
+/// decoding mount paths with spaces and escaped characters into `Connections` [`SidebarItem`]s.
+pub fn parse_linux_network_mounts(mounts_content: &str) -> Vec<SidebarItem> {
+    let mut items = Vec::new();
+    let mut seen_mounts = HashSet::new();
+
+    for line in mounts_content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let mut parts = trimmed.split_whitespace();
+        let Some(raw_spec) = parts.next() else {
+            continue;
+        };
+        let Some(raw_mount) = parts.next() else {
+            continue;
+        };
+        let Some(raw_fstype) = parts.next() else {
+            continue;
+        };
+
+        let spec = decode_mount_escaped_str(raw_spec);
+        let mount_point = decode_mount_escaped_str(raw_mount);
+        let fstype = raw_fstype.to_ascii_lowercase();
+
+        if mount_point.is_empty()
+            || mount_point == "/"
+            || mount_point.starts_with("/proc")
+            || mount_point.starts_with("/sys")
+            || mount_point.starts_with("/dev")
+            || mount_point.starts_with("/var/lib/nfs")
+        {
+            continue;
+        }
+
+        let proto_badge = match fstype.as_str() {
+            "nfs" | "nfs4" => Some("NFS"),
+            "cifs" | "smb" | "smb2" | "smb3" | "smbfs" => Some("SMB"),
+            "fuse.sshfs" | "sshfs" => Some("SSHFS"),
+            "fuse" if spec.starts_with("sshfs#") => Some("SSHFS"),
+            _ => None,
+        };
+        let Some(proto) = proto_badge else {
+            continue;
+        };
+
+        if !seen_mounts.insert(mount_point.clone()) {
+            continue;
+        }
+
+        let slug: String = mount_point
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let clean_slug = slug.trim_matches('-');
+        let id = if clean_slug.is_empty() {
+            format!("conn-mnt-{}", items.len() + 1)
+        } else {
+            format!("conn-mnt-{clean_slug}")
+        };
+
+        let folder_name = Path::new(&mount_point)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&spec);
+        let label = format!("{folder_name} ({proto})");
+
+        items.push(SidebarItem {
+            id,
+            label,
+            vfs_url: format!("file://{mount_point}"),
+            icon_kind: "globe".to_string(),
+            capacity_badge: None,
+            can_eject: true,
+            children: vec![],
+            expanded: false,
+        });
+    }
+
+    items
+}
+
+/// Detects active Linux NFS, CIFS/SMB, and SSHFS mounts from `/proc/mounts` (or `/etc/mtab`).
+/// Safe and cross-platform across Linux, macOS, and Windows.
+pub fn detect_active_network_mounts() -> Vec<SidebarItem> {
+    if !cfg!(target_os = "linux") {
+        return Vec::new();
+    }
+    let candidates = ["/proc/mounts", "/proc/self/mounts", "/etc/mtab"];
+    for path in candidates {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            if !content.trim().is_empty() {
+                return parse_linux_network_mounts(&content);
+            }
+        }
+    }
+    Vec::new()
 }
 
 /// Converts a [`ConnectionProfile`] into its canonical VFS URI (e.g. `sftp://root@192.168.8.110:22/root`).
@@ -901,7 +1039,7 @@ impl ManifoldAppState {
         }
 
         let saved_cfg = ConnectionsConfig::load_default();
-        let connection_items: Vec<SidebarItem> = saved_cfg
+        let mut connection_items: Vec<SidebarItem> = saved_cfg
             .connections
             .iter()
             .map(|p| SidebarItem {
@@ -915,6 +1053,14 @@ impl ManifoldAppState {
                 expanded: false,
             })
             .collect();
+        for mnt_item in detect_active_network_mounts() {
+            let exists = connection_items
+                .iter()
+                .any(|c| c.id == mnt_item.id || c.vfs_url == mnt_item.vfs_url);
+            if !exists {
+                connection_items.push(mnt_item);
+            }
+        }
 
         let sidebar_sections = vec![
             SidebarSection {
@@ -1191,5 +1337,40 @@ mod tests {
         assert_eq!(state.panes_layout, PanesLayout::Single);
         assert!(!state.left_tabs.is_empty());
         assert!(!state.right_tabs.is_empty());
+    }
+
+    #[test]
+    fn test_parse_linux_network_mounts_decodes_spaces_and_escaped_chars() {
+        let sample_mounts = "\
+sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0
+proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0
+/dev/nvme0n1p2 / ext4 rw,relatime 0 0
+nfsd /proc/fs/nfsd nfsd rw,relatime 0 0
+sunrpc /var/lib/nfs/rpc_pipefs rpc_pipefs rw,relatime 0 0
+192.168.1.50:/export/Media\\040Vault /mnt/NAS\\040Media\\040Vault nfs4 rw,relatime,vers=4.2 0 0
+//fileserver.local/Public\\040Share /media/dimi/Office\\040Share\\134Docs cifs rw,vers=3.0 0 0
+//10.0.0.20/Team\\040Drive /mnt/Team\\040SMB3 smb3 rw,relatime 0 0
+dimi@prod.local:/var/www /home/dimi/Mounts/Prod\\040Web\\040SSHFS fuse.sshfs rw 0 0
+sshfs#deploy@10.0.0.9:/srv /mnt/Caf\\303\\251\\040Deploy fuse rw,nosuid 0 0
+";
+        let items = parse_linux_network_mounts(sample_mounts);
+        assert_eq!(items.len(), 5);
+
+        assert_eq!(items[0].label, "NAS Media Vault (NFS)");
+        assert_eq!(items[0].vfs_url, "file:///mnt/NAS Media Vault");
+        assert_eq!(items[0].icon_kind, "globe");
+        assert!(items[0].can_eject);
+
+        assert_eq!(items[1].label, "Office Share\\Docs (SMB)");
+        assert_eq!(items[1].vfs_url, "file:///media/dimi/Office Share\\Docs");
+
+        assert_eq!(items[2].label, "Team SMB3 (SMB)");
+        assert_eq!(items[2].vfs_url, "file:///mnt/Team SMB3");
+
+        assert_eq!(items[3].label, "Prod Web SSHFS (SSHFS)");
+        assert_eq!(items[3].vfs_url, "file:///home/dimi/Mounts/Prod Web SSHFS");
+
+        assert_eq!(items[4].label, "Café Deploy (SSHFS)");
+        assert_eq!(items[4].vfs_url, "file:///mnt/Café Deploy");
     }
 }

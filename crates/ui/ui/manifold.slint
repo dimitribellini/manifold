@@ -95,6 +95,67 @@ export struct OpenWithAppSlint {
     icon-kind: string,
 }
 
+export struct TerminalSpanSlint {
+    text: string,
+    char-count: int,
+    fg: brush,
+    bg: brush,
+    has-bg: bool,
+    bold: bool,
+    underline: bool,
+}
+
+export struct TerminalLineSlint {
+    s0: TerminalSpanSlint,
+    s1: TerminalSpanSlint,
+    s2: TerminalSpanSlint,
+    s3: TerminalSpanSlint,
+    s4: TerminalSpanSlint,
+    s5: TerminalSpanSlint,
+    s6: TerminalSpanSlint,
+    s7: TerminalSpanSlint,
+    s8: TerminalSpanSlint,
+    s9: TerminalSpanSlint,
+    s10: TerminalSpanSlint,
+    s11: TerminalSpanSlint,
+    s12: TerminalSpanSlint,
+    s13: TerminalSpanSlint,
+    s14: TerminalSpanSlint,
+    s15: TerminalSpanSlint,
+}
+
+component TermSpanCell inherits Rectangle {
+    in property <TerminalSpanSlint> span;
+    in property <int> font-delta: 1;
+    in property <string> mono-font-family: "Menlo";
+    in property <length> cell-width: 7.8px;
+    width: span.char-count <= 0 ? 0px : span.char-count * root.cell-width;
+    height: 18px + font-delta * 1.5px;
+    background: span.has-bg && span.char-count > 0 ? span.bg : transparent;
+
+    span-txt := Text {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
+        text: span.text;
+        color: span.fg;
+        font-size: 13px + root.font-delta * 1px;
+        font-family: root.mono-font-family;
+        font-weight: span.bold ? 700 : 400;
+        vertical-alignment: center;
+        wrap: no-wrap;
+    }
+
+    if span.char-count > 0 && span.underline : Rectangle {
+        x: 0px;
+        y: parent.height - 2px;
+        width: parent.width;
+        height: 1px;
+        background: span.fg;
+    }
+}
+
 // Unified Lucide Vector Icon System (16x16px, 1.5px stroke width — doc/specification_2.md §2.5 & §4.5)
 component LucideIcon inherits Rectangle {
     in property <string> kind: "file";
@@ -154,6 +215,10 @@ component LucideIcon inherits Rectangle {
             ? "M 9 6 A 3 3 0 1 1 3 6 A 3 3 0 1 1 9 6 Z M 9 18 A 3 3 0 1 1 3 18 A 3 3 0 1 1 9 18 Z M 20 4 L 8.12 15.88 M 14.47 14.48 L 20 20 M 8.12 8.12 L 12 12"
             : root.kind == "arrow-up"
             ? "M 12 19 L 12 5 M 5 12 L 12 5 L 19 12"
+            : root.kind == "folder-up"
+            ? "M 22 19 A 2 2 0 0 1 20 21 L 4 21 A 2 2 0 0 1 2 19 L 2 5 A 2 2 0 0 1 4 3 L 9 3 L 11 6 L 20 6 A 2 2 0 0 1 22 8 Z M 12 17 L 12 10 M 9 13 L 12 10 L 15 13"
+            : root.kind == "search-circle"
+            ? "M 22 12 A 10 10 0 1 1 2 12 A 10 10 0 1 1 22 12 Z M 14.2 10.7 A 3.5 3.5 0 1 1 7.2 10.7 A 3.5 3.5 0 1 1 14.2 10.7 Z M 16.5 16.5 L 13.3 13.3"
             : root.kind == "search"
             ? "M 18 11 A 7 7 0 1 1 4 11 A 7 7 0 1 1 18 11 Z M 21 21 L 16.65 16.65"
             : root.kind == "plus"
@@ -219,6 +284,11 @@ component CleanLineEdit inherits Rectangle {
     callback edited(string);
     callback accepted(string);
     callback escape-pressed();
+
+    public function focus-input() {
+        inner-input.focus();
+        inner-input.select-all();
+    }
 
     height: 28px;
     border-radius: 5px;
@@ -1110,6 +1180,7 @@ export component ManifoldWindow inherits Window {
     in-out property <length> font-size-delta: root.ui-font-size-delta * 1px;
     in-out property <string> ui-font-family: "sans-serif";
     in-out property <string> resolved-font-family: "";
+    in-out property <string> resolved-mono-font-family: "Menlo";
     in-out property <bool> ui-font-bold: false;
     in-out property <string> app-version-label: "v.0.3.1";
     in-out property <bool> show-app-menu: false;
@@ -1129,6 +1200,8 @@ export component ManifoldWindow inherits Window {
     in-out property <string> search-query: "";
     in-out property <string> left-filter-query: "";
     in-out property <string> right-filter-query: "";
+    in-out property <bool> left-search-running: false;
+    in-out property <bool> right-search-running: false;
 
     // Resizable Panel & Column Dimensions + Non-Oscillating Drag Anchors
     in-out property <length> sidebar-width: 205px;
@@ -1292,13 +1365,21 @@ export component ManifoldWindow inherits Window {
 
     // Embedded Bottom Terminal Drawer State
     in-out property <bool> show-terminal-drawer: false;
-    in-out property <length> terminal-drawer-height: 210px;
+    in-out property <length> terminal-drawer-height: 240px;
     in-out property <string> terminal-cwd: "/";
-    in-out property <string> terminal-session-label: "LOCAL SHELL";
+    in-out property <string> terminal-session-label: "zsh";
     in-out property <string> terminal-prompt: "$";
     in-out property <string> terminal-output: "";
     in-out property <string> terminal-input-text: "";
     in-out property <string> terminal-command-input: "";
+    in-out property <[TerminalLineSlint]> terminal-lines: [];
+    in-out property <bool> terminal-focused: true;
+    in-out property <int> terminal-scroll-offset: 0;
+    in-out property <int> terminal-max-scroll: 0;
+    in-out property <bool> terminal-alt-screen: false;
+    out property <length> terminal-cell-width: Math.max(6px, window-mono-probe.preferred-width / 10.0);
+    in-out property <length> terminal-canvas-width: 960px;
+    in-out property <length> terminal-canvas-height: 200px;
 
     // 3x3 Permissions Matrix
     in-out property <bool> perm-ur: true;
@@ -1367,11 +1448,13 @@ export component ManifoldWindow inherits Window {
     in-out property <string> delete-modal-message: "";
     in-out property <bool> delete-modal-permanent: false;
 
-    // Input Modal for New Folder / New File / Rename / Edit Sidebar Label
+    // Input Modal for New Folder / New File / Rename / Edit Sidebar Label / Compress Archive
     in-out property <bool> show-input-modal: false;
     in-out property <string> input-modal-mode: "new_folder";
     in-out property <string> input-modal-title: "New Folder";
     in-out property <string> input-modal-value: "";
+    in-out property <string> compress-format: "tar.gz";
+    in-out property <string> compress-items-summary: "";
 
     // Dynamic Connection / Inspector Modal
     in-out property <bool> show-connect-modal: false;
@@ -1480,6 +1563,10 @@ export component ManifoldWindow inherits Window {
     callback open-terminal-here();
     callback run-terminal-command(string);
     callback terminal-key-event(string, bool) -> bool;
+    callback terminal-key-input(string, string, bool, bool, bool);
+    callback terminal-paste();
+    callback terminal-scroll(int);
+    callback restart-terminal();
     callback clear-terminal();
     callback open-external-terminal();
     callback select-theme-preset(string);
@@ -1501,6 +1588,24 @@ export component ManifoldWindow inherits Window {
     public function focus-filter-box() {
         filter-text-input.focus();
         filter-text-input.select-all();
+    }
+
+    public function focus-input-modal() {
+        root.show-input-modal = true;
+    }
+
+    window-mono-probe := Text {
+        visible: false;
+        x: 0px;
+        y: 0px;
+        text: "0123456789";
+        font-family: root.resolved-mono-font-family;
+        font-size: 13px + root.ui-font-size-delta * 1px;
+        font-weight: 400;
+    }
+
+    public function focus-terminal-input() {
+        root.show-terminal-drawer = true;
     }
 
     in-out property <length> right-scroll-y: 0px;
@@ -1643,14 +1748,26 @@ export component ManifoldWindow inherits Window {
                             width: 4px;
                             background: transparent;
                         }
-                        Text {
+                        Rectangle {
                             horizontal-stretch: 1;
-                            text: root.active-folder-title;
-                            color: root.theme-text-primary;
-                            font-size: 15px + root.font-size-delta;
-                            font-weight: 700;
-                            vertical-alignment: center;
-                            overflow: elide;
+                            background: transparent;
+                            Text {
+                                width: 100%;
+                                height: 100%;
+                                text: root.active-folder-title;
+                                color: root.theme-text-primary;
+                                font-size: 15px + root.font-size-delta;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                            if (root.right-pane-active && root.dual-pane-mode ? root.right-filter-query : root.left-filter-query) != "" : TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => {
+                                    key-router.focus();
+                                    root.clear-pane-filter(root.right-pane-active && root.dual-pane-mode);
+                                }
+                            }
                         }
                     }
 
@@ -2442,7 +2559,7 @@ export component ManifoldWindow inherits Window {
                             background: (!root.right-pane-active || !root.dual-pane-mode) ? root.theme-accent : #2C2C34;
                         }
 
-                        // TWO-LINE PATH & STATUS HEADER BAR (Matches original screenshot: 28px icon on left, Breadcrumbs on Line 1, "4 items, 100,58 GB available" on Line 2)
+                        // TWO-LINE PATH & STATUS HEADER BAR (Switches to clickable "Search: \"...\"" pill during search, matching reference UI)
                         Rectangle {
                             height: 50px + Math.max(0px, root.font-size-delta * 2.0);
                             background: root.theme-bg-surface;
@@ -2453,7 +2570,7 @@ export component ManifoldWindow inherits Window {
                                 padding-right: 12px;
                                 spacing: 10px;
 
-                                // Large 28x28px Crisp White Outline Home / Volume / Server Icon
+                                // Large 28x28px Crisp White Outline Home / Volume / Server / Search Circle Icon
                                 Rectangle {
                                     width: 30px;
                                     background: transparent;
@@ -2461,18 +2578,56 @@ export component ManifoldWindow inherits Window {
                                         x: 1px;
                                         y: (parent.height - self.height) / 2;
                                         icon-size: 28px;
-                                        kind: root.left-header-icon != "" ? root.left-header-icon : "home";
+                                        kind: root.left-filter-query != ""
+                                            ? "search-circle"
+                                            : (root.left-header-icon != "" ? root.left-header-icon : "home");
                                         icon-color: #F2F2F7;
+                                    }
+                                    if root.left-filter-query != "" : TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => {
+                                            key-router.focus();
+                                            root.clear-pane-filter(false);
+                                        }
                                     }
                                 }
 
-                                // Stacked Line 1 (Clickable Breadcrumbs) + Line 2 (Items & Available Space Subtitle)
+                                // Stacked Line 1 (Clickable Search Pill or Breadcrumbs) + Line 2 (Items & Available Space Subtitle)
                                 VerticalLayout {
                                     alignment: center;
                                     spacing: 1px;
                                     horizontal-stretch: 1;
 
-                                    HorizontalLayout {
+                                    if root.left-filter-query != "" : HorizontalLayout {
+                                        alignment: start;
+                                        Rectangle {
+                                            height: 22px + Math.max(0px, root.font-size-delta * 1.0);
+                                            border-radius: 5px;
+                                            background: l-search-pill-touch.pressed
+                                                ? #2E2E38
+                                                : (l-search-pill-touch.has-hover ? #24242C : #0C0C0E);
+                                            HorizontalLayout {
+                                                padding-left: 8px;
+                                                padding-right: 8px;
+                                                Text {
+                                                    text: "Search: \"" + root.left-filter-query + "\"";
+                                                    color: #FFFFFF;
+                                                    font-size: 13.5px + root.font-size-delta;
+                                                    font-weight: 700;
+                                                    vertical-alignment: center;
+                                                }
+                                            }
+                                            l-search-pill-touch := TouchArea {
+                                                mouse-cursor: pointer;
+                                                clicked => {
+                                                    key-router.focus();
+                                                    root.clear-pane-filter(false);
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if root.left-filter-query == "" : HorizontalLayout {
                                         spacing: 2px;
                                         alignment: start;
                                         for seg[s-idx] in root.left-breadcrumb-segments : HorizontalLayout {
@@ -2576,8 +2731,10 @@ export component ManifoldWindow inherits Window {
                                         padding-left: 4px;
                                         alignment: start;
                                         Text {
-                                            text: root.left-status-subtitle;
-                                            color: #8E8E98;
+                                            text: root.left-search-running && root.left-filter-query != ""
+                                                ? ("Searching subfolders… • " + root.left-status-subtitle)
+                                                : root.left-status-subtitle;
+                                            color: root.left-search-running && root.left-filter-query != "" ? #6E92B8 : #8E8E98;
                                             font-size: 12px + root.font-size-delta * 0.75;
                                             font-weight: 500;
                                             vertical-alignment: center;
@@ -2633,91 +2790,6 @@ export component ManifoldWindow inherits Window {
                                     tooltip: "Cancel Path Edit (Esc)";
                                     tooltip-align-right: true;
                                     clicked => { root.left-path-edit-mode = false; }
-                                }
-                            }
-                        }
-
-                        // PER-TAB SEARCH HEADER BANNER
-                        if root.left-filter-query != "" : Rectangle {
-                            z: 15;
-                            height: 44px;
-                            background: root.theme-bg-sidebar;
-                            border-width: 1px;
-                            border-color: root.theme-border;
-                            HorizontalLayout {
-                                padding-left: 12px;
-                                padding-right: 12px;
-                                spacing: 10px;
-                                alignment: space-between;
-
-                                HorizontalLayout {
-                                    spacing: 10px;
-                                    alignment: start;
-                                    Rectangle {
-                                        width: 28px;
-                                        height: 28px;
-                                        y: 7px;
-                                        border-radius: 14px;
-                                        background: #222228;
-                                        border-width: 1px;
-                                        border-color: #3A3A44;
-                                        LucideIcon {
-                                            x: 7px;
-                                            y: 7px;
-                                            icon-size: 14px;
-                                            kind: "search";
-                                            icon-color: root.theme-text-secondary;
-                                        }
-                                    }
-                                    VerticalLayout {
-                                        alignment: center;
-                                        spacing: 2px;
-                                        Text {
-                                            text: "Search: \"" + root.left-filter-query + "\"";
-                                            color: root.theme-text-primary;
-                                            font-size: 13px + root.font-size-delta;
-                                            font-weight: 600;
-                                        }
-                                        Text {
-                                            text: root.left-status-subtitle;
-                                            color: root.theme-text-muted;
-                                            font-size: 11px + root.font-size-delta;
-                                        }
-                                    }
-                                }
-
-                                Rectangle {
-                                    width: 64px;
-                                    height: 24px;
-                                    y: 9px;
-                                    border-radius: 4px;
-                                    background: l-clr-banner.has-hover ? #2C2C34 : #202026;
-                                    border-width: 1px;
-                                    border-color: #32323A;
-                                    HorizontalLayout {
-                                        padding-left: 8px;
-                                        padding-right: 8px;
-                                        spacing: 4px;
-                                        alignment: center;
-                                        LucideIcon {
-                                            y: (parent.height - self.height) / 2;
-                                            icon-size: 10px;
-                                            kind: "close";
-                                            icon-color: #E1E1E6;
-                                        }
-                                        Text {
-                                            text: "Clear";
-                                            color: #E1E1E6;
-                                            font-size: 11px;
-                                            font-weight: 500;
-                                            vertical-alignment: center;
-                                        }
-                                    }
-                                    l-clr-banner := TouchArea {
-                                        clicked => {
-                                            root.clear-pane-filter(false);
-                                        }
-                                    }
                                 }
                             }
                         }
@@ -2956,7 +3028,7 @@ export component ManifoldWindow inherits Window {
                                 VerticalLayout {
                                     alignment: start;
 
-                                    // Blank / Empty Directory Action Card (Left-click or right-click to create file/folder or paste)
+                                    // Blank / Empty Directory or Search Result Action Card
                                     if root.left-rows.length == 0 : VerticalLayout {
                                         alignment: center;
                                         padding-top: 56px;
@@ -2974,21 +3046,29 @@ export component ManifoldWindow inherits Window {
                                                     x: 12px;
                                                     y: 12px;
                                                     icon-size: 24px;
-                                                    kind: "folder";
+                                                    kind: root.left-filter-query != "" ? "search" : "folder";
                                                     icon-color: #38B6FF;
-                                                    fill-color: #4CC2FF55;
+                                                    fill-color: root.left-filter-query != "" ? transparent : #4CC2FF55;
                                                 }
                                             }
                                         }
                                         Text {
-                                            text: "Folder is Empty";
+                                            text: root.left-filter-query != ""
+                                                ? (root.left-search-running
+                                                    ? "Searching subfolders…"
+                                                    : "No matching items found")
+                                                : "Folder is Empty";
                                             color: root.theme-text-primary;
                                             font-size: 13.5px + root.font-size-delta;
                                             font-weight: 700;
                                             horizontal-alignment: center;
                                         }
                                         Text {
-                                            text: "Click anywhere or use the actions below to create items or paste.";
+                                            text: root.left-filter-query != ""
+                                                ? (root.left-search-running
+                                                    ? "Scanning downstream directories for matching files and folders…"
+                                                    : ("No files or folders matched \"" + root.left-filter-query + "\" in this directory or its subfolders."))
+                                                : "Click anywhere or use the actions below to create items or paste.";
                                             color: root.theme-text-muted;
                                             font-size: 11.5px + root.font-size-delta;
                                             horizontal-alignment: center;
@@ -2996,7 +3076,14 @@ export component ManifoldWindow inherits Window {
                                         HorizontalLayout {
                                             alignment: center;
                                             spacing: 8px;
-                                            ToolbarButton {
+                                            if root.left-filter-query != "" : ToolbarButton {
+                                                icon-kind: "close";
+                                                label: "Clear Search";
+                                                clicked => {
+                                                    root.clear-pane-filter(false);
+                                                }
+                                            }
+                                            if root.left-filter-query == "" : ToolbarButton {
                                                 icon-kind: "folder";
                                                 label: "New Folder";
                                                 clicked => {
@@ -3004,7 +3091,7 @@ export component ManifoldWindow inherits Window {
                                                     root.open-new-folder-modal();
                                                 }
                                             }
-                                            ToolbarButton {
+                                            if root.left-filter-query == "" : ToolbarButton {
                                                 icon-kind: "file";
                                                 label: "New File";
                                                 clicked => {
@@ -3012,7 +3099,7 @@ export component ManifoldWindow inherits Window {
                                                     root.open-new-file-modal();
                                                 }
                                             }
-                                            if root.has-clipboard-item : ToolbarButton {
+                                            if root.left-filter-query == "" && root.has-clipboard-item : ToolbarButton {
                                                 icon-kind: "downloads";
                                                 label: "Paste Here";
                                                 active: true;
@@ -3120,9 +3207,18 @@ export component ManifoldWindow inherits Window {
                                                 font-bold: root.ui-font-bold;
                                                 font-family: root.resolved-font-family;
                                                 accent-bg: root.theme-accent;
-                                                select-cell(sh, cmd) => { root.select-file-row-mod(false, triple.idx-0, sh, cmd); }
-                                                open-cell => { root.open-file-row(false, triple.idx-0); }
-                                                context-cell(cx, cy) => { root.open-context-menu-for-row(false, triple.idx-0, cx, cy); }
+                                                select-cell(sh, cmd) => {
+                                                    key-router.focus();
+                                                    root.select-file-row-mod(false, triple.idx-0, sh, cmd);
+                                                }
+                                                open-cell => {
+                                                    key-router.focus();
+                                                    root.open-file-row(false, triple.idx-0);
+                                                }
+                                                context-cell(cx, cy) => {
+                                                    key-router.focus();
+                                                    root.open-context-menu-for-row(false, triple.idx-0, cx, cy);
+                                                }
                                                 cell-hovered(abs_x, abs_y) => { root.hover-file-row(false, triple.idx-0, abs_x, abs_y); }
                                                 cell-drag-moved(abs_x, abs_y) => {
                                                     root.drag-left-pane-w = l-flick.width;
@@ -3151,9 +3247,18 @@ export component ManifoldWindow inherits Window {
                                                 font-bold: root.ui-font-bold;
                                                 font-family: root.resolved-font-family;
                                                 accent-bg: root.theme-accent;
-                                                select-cell(sh, cmd) => { root.select-file-row-mod(false, triple.idx-1, sh, cmd); }
-                                                open-cell => { root.open-file-row(false, triple.idx-1); }
-                                                context-cell(cx, cy) => { root.open-context-menu-for-row(false, triple.idx-1, cx, cy); }
+                                                select-cell(sh, cmd) => {
+                                                    key-router.focus();
+                                                    root.select-file-row-mod(false, triple.idx-1, sh, cmd);
+                                                }
+                                                open-cell => {
+                                                    key-router.focus();
+                                                    root.open-file-row(false, triple.idx-1);
+                                                }
+                                                context-cell(cx, cy) => {
+                                                    key-router.focus();
+                                                    root.open-context-menu-for-row(false, triple.idx-1, cx, cy);
+                                                }
                                                 cell-hovered(abs_x, abs_y) => { root.hover-file-row(false, triple.idx-1, abs_x, abs_y); }
                                                 cell-drag-moved(abs_x, abs_y) => {
                                                     root.drag-left-pane-w = l-flick.width;
@@ -3182,9 +3287,18 @@ export component ManifoldWindow inherits Window {
                                                 font-bold: root.ui-font-bold;
                                                 font-family: root.resolved-font-family;
                                                 accent-bg: root.theme-accent;
-                                                select-cell(sh, cmd) => { root.select-file-row-mod(false, triple.idx-2, sh, cmd); }
-                                                open-cell => { root.open-file-row(false, triple.idx-2); }
-                                                context-cell(cx, cy) => { root.open-context-menu-for-row(false, triple.idx-2, cx, cy); }
+                                                select-cell(sh, cmd) => {
+                                                    key-router.focus();
+                                                    root.select-file-row-mod(false, triple.idx-2, sh, cmd);
+                                                }
+                                                open-cell => {
+                                                    key-router.focus();
+                                                    root.open-file-row(false, triple.idx-2);
+                                                }
+                                                context-cell(cx, cy) => {
+                                                    key-router.focus();
+                                                    root.open-context-menu-for-row(false, triple.idx-2, cx, cy);
+                                                }
                                                 cell-hovered(abs_x, abs_y) => { root.hover-file-row(false, triple.idx-2, abs_x, abs_y); }
                                                 cell-drag-moved(abs_x, abs_y) => {
                                                     root.drag-left-pane-w = l-flick.width;
@@ -4014,7 +4128,7 @@ export component ManifoldWindow inherits Window {
                             background: root.right-pane-active ? root.theme-accent : #2C2C34;
                         }
 
-                        // Right Pane Two-Line Path & Status Header Bar
+                        // Right Pane Two-Line Path & Status Header Bar (Switches to clickable "Search: \"...\"" pill during search)
                         Rectangle {
                             height: 50px + Math.max(0px, root.font-size-delta * 2.0);
                             background: root.theme-bg-surface;
@@ -4032,8 +4146,17 @@ export component ManifoldWindow inherits Window {
                                         x: 1px;
                                         y: (parent.height - self.height) / 2;
                                         icon-size: 28px;
-                                        kind: root.right-header-icon != "" ? root.right-header-icon : "home";
+                                        kind: root.right-filter-query != ""
+                                            ? "search-circle"
+                                            : (root.right-header-icon != "" ? root.right-header-icon : "home");
                                         icon-color: #F2F2F7;
+                                    }
+                                    if root.right-filter-query != "" : TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => {
+                                            key-router.focus();
+                                            root.clear-pane-filter(true);
+                                        }
                                     }
                                 }
 
@@ -4042,7 +4165,36 @@ export component ManifoldWindow inherits Window {
                                     spacing: 1px;
                                     horizontal-stretch: 1;
 
-                                    HorizontalLayout {
+                                    if root.right-filter-query != "" : HorizontalLayout {
+                                        alignment: start;
+                                        Rectangle {
+                                            height: 22px + Math.max(0px, root.font-size-delta * 1.0);
+                                            border-radius: 5px;
+                                            background: r-search-pill-touch.pressed
+                                                ? #2E2E38
+                                                : (r-search-pill-touch.has-hover ? #24242C : #0C0C0E);
+                                            HorizontalLayout {
+                                                padding-left: 8px;
+                                                padding-right: 8px;
+                                                Text {
+                                                    text: "Search: \"" + root.right-filter-query + "\"";
+                                                    color: #FFFFFF;
+                                                    font-size: 13.5px + root.font-size-delta;
+                                                    font-weight: 700;
+                                                    vertical-alignment: center;
+                                                }
+                                            }
+                                            r-search-pill-touch := TouchArea {
+                                                mouse-cursor: pointer;
+                                                clicked => {
+                                                    key-router.focus();
+                                                    root.clear-pane-filter(true);
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if root.right-filter-query == "" : HorizontalLayout {
                                         spacing: 2px;
                                         alignment: start;
                                         for seg[s-idx] in root.right-breadcrumb-segments : HorizontalLayout {
@@ -4142,8 +4294,10 @@ export component ManifoldWindow inherits Window {
                                         padding-left: 4px;
                                         alignment: start;
                                         Text {
-                                            text: root.right-status-subtitle;
-                                            color: #8E8E98;
+                                            text: root.right-search-running && root.right-filter-query != ""
+                                                ? ("Searching subfolders… • " + root.right-status-subtitle)
+                                                : root.right-status-subtitle;
+                                            color: root.right-search-running && root.right-filter-query != "" ? #6E92B8 : #8E8E98;
                                             font-size: 12px + root.font-size-delta * 0.75;
                                             font-weight: 500;
                                             vertical-alignment: center;
@@ -4192,91 +4346,6 @@ export component ManifoldWindow inherits Window {
                                     y: 9px;
                                     icon-kind: "close";
                                     clicked => { root.right-path-edit-mode = false; }
-                                }
-                            }
-                        }
-
-                        // Right Pane Per-Tab Search Header Banner
-                        if root.right-filter-query != "" : Rectangle {
-                            z: 15;
-                            height: 44px;
-                            background: root.theme-bg-sidebar;
-                            border-width: 1px;
-                            border-color: root.theme-border;
-                            HorizontalLayout {
-                                padding-left: 12px;
-                                padding-right: 12px;
-                                spacing: 10px;
-                                alignment: space-between;
-
-                                HorizontalLayout {
-                                    spacing: 10px;
-                                    alignment: start;
-                                    Rectangle {
-                                        width: 28px;
-                                        height: 28px;
-                                        y: 7px;
-                                        border-radius: 14px;
-                                        background: #222228;
-                                        border-width: 1px;
-                                        border-color: #3A3A44;
-                                        LucideIcon {
-                                            x: 7px;
-                                            y: 7px;
-                                            icon-size: 14px;
-                                            kind: "search";
-                                            icon-color: root.theme-text-secondary;
-                                        }
-                                    }
-                                    VerticalLayout {
-                                        alignment: center;
-                                        spacing: 2px;
-                                        Text {
-                                            text: "Search: \"" + root.right-filter-query + "\"";
-                                            color: root.theme-text-primary;
-                                            font-size: 13px + root.font-size-delta;
-                                            font-weight: 600;
-                                        }
-                                        Text {
-                                            text: root.right-status-subtitle;
-                                            color: root.theme-text-muted;
-                                            font-size: 11px + root.font-size-delta;
-                                        }
-                                    }
-                                }
-
-                                Rectangle {
-                                    width: 64px;
-                                    height: 24px;
-                                    y: 9px;
-                                    border-radius: 4px;
-                                    background: r-clr-banner.has-hover ? #2C2C34 : #202026;
-                                    border-width: 1px;
-                                    border-color: #32323A;
-                                    HorizontalLayout {
-                                        padding-left: 8px;
-                                        padding-right: 8px;
-                                        spacing: 4px;
-                                        alignment: center;
-                                        LucideIcon {
-                                            y: (parent.height - self.height) / 2;
-                                            icon-size: 10px;
-                                            kind: "close";
-                                            icon-color: #E1E1E6;
-                                        }
-                                        Text {
-                                            text: "Clear";
-                                            color: #E1E1E6;
-                                            font-size: 11px;
-                                            font-weight: 500;
-                                            vertical-alignment: center;
-                                        }
-                                    }
-                                    r-clr-banner := TouchArea {
-                                        clicked => {
-                                            root.clear-pane-filter(true);
-                                        }
-                                    }
                                 }
                             }
                         }
@@ -4525,12 +4594,14 @@ export component ManifoldWindow inherits Window {
                                         LucideIcon {
                                             y: (parent.height - self.height) / 2;
                                             icon-size: 16px;
-                                            kind: "folder";
+                                            kind: root.right-filter-query != "" ? "search" : "folder";
                                             icon-color: root.theme-text-secondary;
                                         }
                                         Text {
                                             text: root.right-filter-query != ""
-                                                ? "No matching items in this folder"
+                                                ? (root.right-search-running
+                                                    ? "Searching subfolders…"
+                                                    : "No matching items found")
                                                 : "Folder is empty — Click to create or paste";
                                             color: root.theme-text-secondary;
                                             font-size: 12px + root.ui-font-size-delta * 1px;
@@ -4544,7 +4615,15 @@ export component ManifoldWindow inherits Window {
                                         spacing: 8px;
                                         alignment: center;
 
-                                        ToolbarButton {
+                                        if root.right-filter-query != "" : ToolbarButton {
+                                            icon-kind: "close";
+                                            label: "Clear Search";
+                                            clicked => {
+                                                root.clear-pane-filter(true);
+                                            }
+                                        }
+
+                                        if root.right-filter-query == "" : ToolbarButton {
                                             icon-kind: "plus";
                                             label: "New Folder";
                                             clicked => {
@@ -4553,7 +4632,7 @@ export component ManifoldWindow inherits Window {
                                             }
                                         }
 
-                                        ToolbarButton {
+                                        if root.right-filter-query == "" : ToolbarButton {
                                             icon-kind: "file";
                                             label: "New File";
                                             clicked => {
@@ -4562,7 +4641,7 @@ export component ManifoldWindow inherits Window {
                                             }
                                         }
 
-                                        if root.has-clipboard-item : ToolbarButton {
+                                        if root.right-filter-query == "" && root.has-clipboard-item : ToolbarButton {
                                             icon-kind: "downloads";
                                             label: "Paste Here";
                                             active: true;
@@ -4700,14 +4779,17 @@ export component ManifoldWindow inherits Window {
                                                 accent-bg: root.theme-accent;
                                                 drag-drop-highlight: root.drag-hover-right-row == triple.idx-0;
                                                 select-cell(sh, cmd) => {
+                                                    key-router.focus();
                                                     root.show-hover-preview = false;
                                                     root.select-file-row-mod(true, triple.idx-0, sh, cmd);
                                                 }
                                                 open-cell => {
+                                                    key-router.focus();
                                                     root.show-hover-preview = false;
                                                     root.open-file-row(true, triple.idx-0);
                                                 }
                                                 context-cell(abs_x, abs_y) => {
+                                                    key-router.focus();
                                                     root.show-hover-preview = false;
                                                     root.open-context-menu-for-row(true, triple.idx-0, abs_x, abs_y);
                                                 }
@@ -4745,14 +4827,17 @@ export component ManifoldWindow inherits Window {
                                                 accent-bg: root.theme-accent;
                                                 drag-drop-highlight: root.drag-hover-right-row == triple.idx-1;
                                                 select-cell(sh, cmd) => {
+                                                    key-router.focus();
                                                     root.show-hover-preview = false;
                                                     root.select-file-row-mod(true, triple.idx-1, sh, cmd);
                                                 }
                                                 open-cell => {
+                                                    key-router.focus();
                                                     root.show-hover-preview = false;
                                                     root.open-file-row(true, triple.idx-1);
                                                 }
                                                 context-cell(abs_x, abs_y) => {
+                                                    key-router.focus();
                                                     root.show-hover-preview = false;
                                                     root.open-context-menu-for-row(true, triple.idx-1, abs_x, abs_y);
                                                 }
@@ -4790,14 +4875,17 @@ export component ManifoldWindow inherits Window {
                                                 accent-bg: root.theme-accent;
                                                 drag-drop-highlight: root.drag-hover-right-row == triple.idx-2;
                                                 select-cell(sh, cmd) => {
+                                                    key-router.focus();
                                                     root.show-hover-preview = false;
                                                     root.select-file-row-mod(true, triple.idx-2, sh, cmd);
                                                 }
                                                 open-cell => {
+                                                    key-router.focus();
                                                     root.show-hover-preview = false;
                                                     root.open-file-row(true, triple.idx-2);
                                                 }
                                                 context-cell(abs_x, abs_y) => {
+                                                    key-router.focus();
                                                     root.show-hover-preview = false;
                                                     root.open-context-menu-for-row(true, triple.idx-2, abs_x, abs_y);
                                                 }
@@ -6324,13 +6412,18 @@ export component ManifoldWindow inherits Window {
                 }
             }
 
-            // 3. EMBEDDED BOTTOM TERMINAL DRAWER (Interactive PTY Shell, automatically follows active folder / tab)
+            // 3. EMBEDDED BOTTOM TERMINAL DRAWER (Full Interactive VT100/Xterm PTY Shell)
             if root.show-terminal-drawer : Rectangle {
                 height: root.terminal-drawer-height;
                 vertical-stretch: 0;
-                background: root.theme-bg-sidebar;
+                background: #0B0C10;
                 border-width: 1px;
-                border-color: root.theme-border;
+                border-color: root.terminal-focused ? #2A4365 : root.theme-border;
+                init => {
+                    root.terminal-canvas-width = term-canvas-rect.width;
+                    root.terminal-canvas-height = term-canvas-rect.height;
+                    term-focus-scope.focus();
+                }
 
                 // Top 5px Height Resize Handle
                 Rectangle {
@@ -6352,9 +6445,11 @@ export component ManifoldWindow inherits Window {
                             if self.pressed {
                                 root.terminal-drawer-height = Math.clamp(
                                     root.col-resize-start-w - ((self.absolute-position.y + self.mouse-y) - root.col-resize-start-x),
-                                    130px,
-                                    Math.max(220px, root.height - 200px)
+                                    140px,
+                                    Math.max(240px, root.height - 180px)
                                 );
+                                root.terminal-canvas-width = term-canvas-rect.width;
+                                root.terminal-canvas-height = term-canvas-rect.height;
                             }
                         }
                     }
@@ -6364,83 +6459,149 @@ export component ManifoldWindow inherits Window {
                     padding: 0px;
                     spacing: 0px;
 
-                    // Terminal Header Bar (32px)
+                    // Sleek Integrated Terminal Title Strip (28px)
                     Rectangle {
-                        height: 32px;
-                        background: root.theme-bg-toolbar;
-                        border-width: 1px;
-                        border-color: root.theme-border;
+                        height: 28px;
+                        background: #14151A;
+
+                        Rectangle {
+                            x: 0px;
+                            y: parent.height - 1px;
+                            width: parent.width;
+                            height: 1px;
+                            background: #23252E;
+                        }
 
                         HorizontalLayout {
-                            padding-left: 10px;
-                            padding-right: 10px;
+                            padding-left: 12px;
+                            padding-right: 8px;
                             spacing: 8px;
                             alignment: space-between;
 
                             HorizontalLayout {
-                                spacing: 8px;
+                                spacing: 7px;
                                 alignment: start;
+                                Rectangle {
+                                    width: 7px;
+                                    height: 7px;
+                                    y: (parent.height - self.height) / 2;
+                                    border-radius: 3.5px;
+                                    background: root.terminal-focused ? #4E9A5E : #585864;
+                                }
                                 LucideIcon {
                                     y: (parent.height - self.height) / 2;
-                                    icon-size: 14px;
+                                    icon-size: 13px;
                                     kind: "terminal";
-                                    icon-color: root.theme-text-secondary;
+                                    icon-color: #C9D1D9;
                                 }
                                 Text {
                                     text: root.terminal-session-label;
-                                    color: root.theme-text-primary;
-                                    font-size: 12.5px + root.ui-font-size-delta * 1px;
-                                    font-family: root.ui-font-family;
+                                    color: #E6EDF3;
+                                    font-size: 12px + root.ui-font-size-delta * 0.5px;
+                                    font-family: root.resolved-mono-font-family;
                                     font-weight: 700;
                                     vertical-alignment: center;
                                 }
-                                Rectangle {
-                                    height: 22px;
+                                Text {
+                                    text: "·";
+                                    color: #585B66;
+                                    font-size: 12px;
+                                    font-weight: 700;
+                                    vertical-alignment: center;
+                                }
+                                Text {
+                                    text: root.terminal-cwd;
+                                    color: #8B949E;
+                                    font-size: 11.5px + root.ui-font-size-delta * 0.5px;
+                                    font-family: root.resolved-mono-font-family;
+                                    font-weight: 400;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                                if root.terminal-alt-screen : Rectangle {
+                                    height: 18px;
                                     y: (parent.height - self.height) / 2;
-                                    border-radius: 4px;
-                                    background: root.theme-bg-surface;
+                                    border-radius: 3px;
+                                    background: #1F2937;
                                     border-width: 1px;
-                                    border-color: root.theme-border;
+                                    border-color: #374151;
                                     HorizontalLayout {
-                                        padding-left: 8px;
-                                        padding-right: 8px;
-                                        spacing: 5px;
-                                        LucideIcon {
-                                            y: (parent.height - self.height) / 2;
-                                            icon-size: 11px;
-                                            kind: "folder";
-                                            icon-color: root.theme-text-secondary;
-                                        }
+                                        padding-left: 6px;
+                                        padding-right: 6px;
                                         Text {
-                                            text: root.terminal-cwd;
-                                            color: root.theme-text-secondary;
-                                            font-size: 11.5px + root.ui-font-size-delta * 1px;
-                                            font-family: "monospace";
+                                            text: "TUI / ALT";
+                                            color: #9CA3AF;
+                                            font-family: root.resolved-mono-font-family;
+                                            font-size: 10px;
                                             font-weight: 600;
                                             vertical-alignment: center;
                                         }
                                     }
                                 }
-                                Text {
-                                    text: "• Interactive Shell (Up/Down History • Ctrl+C / Esc)";
-                                    color: root.theme-text-secondary;
-                                    font-size: 11px + root.ui-font-size-delta * 0.5px;
-                                    vertical-alignment: center;
+                                if root.terminal-scroll-offset > 0 : Rectangle {
+                                    height: 18px;
+                                    y: (parent.height - self.height) / 2;
+                                    border-radius: 3px;
+                                    background: #0D52BF44;
+                                    border-width: 1px;
+                                    border-color: root.theme-accent;
+                                    HorizontalLayout {
+                                        padding-left: 6px;
+                                        padding-right: 6px;
+                                        Text {
+                                            text: "↑ -" + root.terminal-scroll-offset + " lines";
+                                            color: #E6EDF3;
+                                            font-family: root.resolved-mono-font-family;
+                                            font-size: 10.5px;
+                                            font-weight: 600;
+                                            vertical-alignment: center;
+                                        }
+                                    }
                                 }
                             }
 
                             HorizontalLayout {
-                                spacing: 6px;
+                                spacing: 4px;
                                 alignment: end;
                                 ToolbarButton {
-                                    label: "Clear";
-                                    tooltip: "Clear terminal output";
+                                    label: "Paste";
+                                    tooltip: "Paste clipboard into terminal (Cmd+V / Ctrl+Shift+V)";
                                     tooltip-above: true;
-                                    clicked => { root.clear-terminal(); }
+                                    clicked => {
+                                        term-focus-scope.focus();
+                                        root.terminal-paste();
+                                    }
+                                }
+                                ToolbarButton {
+                                    label: "^C";
+                                    tooltip: "Send SIGINT (Interrupt Running Command)";
+                                    tooltip-above: true;
+                                    clicked => {
+                                        term-focus-scope.focus();
+                                        root.terminal-key-input("c", "", true, false, false);
+                                    }
+                                }
+                                ToolbarButton {
+                                    label: "Clear";
+                                    tooltip: "Clear terminal screen (Ctrl+L / Cmd+K)";
+                                    tooltip-above: true;
+                                    clicked => {
+                                        term-focus-scope.focus();
+                                        root.clear-terminal();
+                                    }
+                                }
+                                ToolbarButton {
+                                    label: "Restart";
+                                    tooltip: "Restart shell session in current folder";
+                                    tooltip-above: true;
+                                    clicked => {
+                                        term-focus-scope.focus();
+                                        root.restart-terminal();
+                                    }
                                 }
                                 ToolbarButton {
                                     icon-kind: "close";
-                                    tooltip: "Hide Bottom Terminal (Esc)";
+                                    tooltip: "Hide Bottom Terminal";
                                     tooltip-align-right: true;
                                     tooltip-above: true;
                                     clicked => {
@@ -6452,117 +6613,182 @@ export component ManifoldWindow inherits Window {
                         }
                     }
 
-                    // Terminal Scrollable Output Viewport
-                    Rectangle {
+                    // Direct Interactive Terminal Canvas (Exact Monospace Cell Grid)
+                    term-canvas-rect := Rectangle {
                         vertical-stretch: 1;
-                        background: #0E0E11;
+                        background: #0B0C10;
                         clip: true;
 
-                        term-scroll := ScrollView {
+                        property <length> live-cell-w: root.terminal-cell-width;
+
+                        term-focus-scope := FocusScope {
+                            x: 0px;
+                            y: 0px;
                             width: parent.width;
                             height: parent.height;
-                            viewport-height: Math.max(self.height, term-out-text.preferred-height + 16px);
-                            VerticalLayout {
-                                padding: 8px;
-                                alignment: start;
-                                term-out-text := Text {
-                                    text: root.terminal-output;
-                                    color: #D4D4DC;
-                                    font-size: 13px + root.ui-font-size-delta * 1px;
-                                    font-family: "monospace";
-                                    wrap: word-wrap;
+                            focus-changed-event => {
+                                root.terminal-focused = self.has-focus;
+                                root.terminal-canvas-width = term-canvas-rect.width;
+                                root.terminal-canvas-height = term-canvas-rect.height;
+                            }
+                            key-pressed(ev) => {
+                                root.terminal-canvas-width = term-canvas-rect.width;
+                                root.terminal-canvas-height = term-canvas-rect.height;
+                                if (ev.modifiers.meta && (ev.text == "v" || ev.text == "V"))
+                                    || (ev.modifiers.control && ev.modifiers.shift && (ev.text == "v" || ev.text == "V")) {
+                                    root.terminal-paste();
+                                    return accept;
                                 }
+                                if ev.modifiers.meta && (ev.text == "k" || ev.text == "K") {
+                                    root.clear-terminal();
+                                    return accept;
+                                }
+                                if ev.text == Key.Return || ev.text == "\n" || ev.text == "\u{000d}" {
+                                    root.terminal-key-input("", "return", ev.modifiers.control, ev.modifiers.alt, ev.modifiers.shift);
+                                    return accept;
+                                }
+                                if ev.text == Key.Backspace || ev.text == "\u{0008}" || ev.text == "\u{007f}" {
+                                    root.terminal-key-input("", "backspace", ev.modifiers.control, ev.modifiers.alt, ev.modifiers.shift);
+                                    return accept;
+                                }
+                                if ev.text == Key.Tab || ev.text == Key.Backtab || ev.text == "\u{0009}" {
+                                    root.terminal-key-input("", "tab", ev.modifiers.control, ev.modifiers.alt, ev.modifiers.shift);
+                                    return accept;
+                                }
+                                if ev.text == Key.Escape || ev.text == "\u{001b}" {
+                                    root.terminal-key-input("", "escape", ev.modifiers.control, ev.modifiers.alt, ev.modifiers.shift);
+                                    return accept;
+                                }
+                                if ev.text == Key.UpArrow || ev.text == "\u{f700}" {
+                                    root.terminal-key-input("", "up", ev.modifiers.control, ev.modifiers.alt, ev.modifiers.shift);
+                                    return accept;
+                                }
+                                if ev.text == Key.DownArrow || ev.text == "\u{f701}" {
+                                    root.terminal-key-input("", "down", ev.modifiers.control, ev.modifiers.alt, ev.modifiers.shift);
+                                    return accept;
+                                }
+                                if ev.text == Key.LeftArrow || ev.text == "\u{f702}" {
+                                    root.terminal-key-input("", "left", ev.modifiers.control, ev.modifiers.alt, ev.modifiers.shift);
+                                    return accept;
+                                }
+                                if ev.text == Key.RightArrow || ev.text == "\u{f703}" {
+                                    root.terminal-key-input("", "right", ev.modifiers.control, ev.modifiers.alt, ev.modifiers.shift);
+                                    return accept;
+                                }
+                                if ev.text == Key.Home || ev.text == "\u{f729}" {
+                                    root.terminal-key-input("", "home", ev.modifiers.control, ev.modifiers.alt, ev.modifiers.shift);
+                                    return accept;
+                                }
+                                if ev.text == Key.End || ev.text == "\u{f72b}" {
+                                    root.terminal-key-input("", "end", ev.modifiers.control, ev.modifiers.alt, ev.modifiers.shift);
+                                    return accept;
+                                }
+                                if ev.text == Key.Delete || ev.text == "\u{f728}" {
+                                    root.terminal-key-input("", "delete", ev.modifiers.control, ev.modifiers.alt, ev.modifiers.shift);
+                                    return accept;
+                                }
+                                if ev.text == Key.PageUp || ev.text == "\u{f72c}" {
+                                    if ev.modifiers.shift {
+                                        root.terminal-scroll(8);
+                                    } else {
+                                        root.terminal-key-input("", "pageup", ev.modifiers.control, ev.modifiers.alt, ev.modifiers.shift);
+                                    }
+                                    return accept;
+                                }
+                                if ev.text == Key.PageDown || ev.text == "\u{f72d}" {
+                                    if ev.modifiers.shift {
+                                        root.terminal-scroll(-8);
+                                    } else {
+                                        root.terminal-key-input("", "pagedown", ev.modifiers.control, ev.modifiers.alt, ev.modifiers.shift);
+                                    }
+                                    return accept;
+                                }
+                                root.terminal-key-input(ev.text, "", ev.modifiers.control, ev.modifiers.alt, ev.modifiers.shift);
+                                return accept;
                             }
-                        }
-                    }
 
-                    // Terminal Interactive Shell Prompt Bar (34px)
-                    Rectangle {
-                        height: 34px;
-                        background: #141418;
-                        border-width: 1px;
-                        border-color: root.theme-border;
-
-                        HorizontalLayout {
-                            padding-left: 10px;
-                            padding-right: 10px;
-                            spacing: 8px;
-
-                            Text {
-                                text: root.terminal-prompt;
-                                color: root.theme-text-secondary;
-                                font-size: 13px + root.ui-font-size-delta * 1px;
-                                font-family: "monospace";
-                                font-weight: 700;
-                                vertical-alignment: center;
-                            }
-
-                            Rectangle {
-                                horizontal-stretch: 1;
-                                height: 26px;
-                                y: (parent.height - self.height) / 2;
-                                border-radius: 4px;
-                                background: #1C1C22;
-                                border-width: 1px;
-                                border-color: term-cmd-input.has-focus ? root.theme-accent : #2C2C34;
-
-                                HorizontalLayout {
-                                    padding-left: 8px;
-                                    padding-right: 8px;
-                                    term-cmd-input := TextInput {
-                                        text <=> root.terminal-command-input;
-                                        color: #FFFFFF;
-                                        font-size: 13px + root.ui-font-size-delta * 1px;
-                                        font-family: "monospace";
-                                        vertical-alignment: center;
-                                        single-line: true;
-                                        accepted => {
-                                            root.run-terminal-command(root.terminal-command-input);
-                                            root.terminal-command-input = "";
-                                        }
-                                        key-pressed(ev) => {
-                                            if ev.text == "\u{001b}" {
-                                                if !root.terminal-key-event("escape", false) {
-                                                    root.show-terminal-drawer = false;
-                                                    key-router.focus();
-                                                }
-                                                return accept;
-                                            }
-                                            if ev.modifiers.control && (ev.text == "c" || ev.text == "C" || ev.text == "\u{0003}") {
-                                                root.terminal-key-event("ctrl_c", true);
-                                                return accept;
-                                            }
-                                            if ev.text == "\u{f700}" {
-                                                root.terminal-key-event("up", false);
-                                                return accept;
-                                            }
-                                            if ev.text == "\u{f701}" {
-                                                root.terminal-key-event("down", false);
-                                                return accept;
-                                            }
-                                            return reject;
-                                        }
+                            VerticalLayout {
+                                padding-top: 4px;
+                                padding-bottom: 4px;
+                                spacing: 0px;
+                                alignment: start;
+                                for line in root.terminal-lines : Rectangle {
+                                    height: 18px + root.ui-font-size-delta * 1.5px;
+                                    background: transparent;
+                                    HorizontalLayout {
+                                        padding-left: 12px;
+                                        padding-right: 12px;
+                                        spacing: 0px;
+                                        alignment: start;
+                                        TermSpanCell { span: line.s0; font-delta: root.ui-font-size-delta; mono-font-family: root.resolved-mono-font-family; cell-width: term-canvas-rect.live-cell-w; }
+                                        TermSpanCell { span: line.s1; font-delta: root.ui-font-size-delta; mono-font-family: root.resolved-mono-font-family; cell-width: term-canvas-rect.live-cell-w; }
+                                        TermSpanCell { span: line.s2; font-delta: root.ui-font-size-delta; mono-font-family: root.resolved-mono-font-family; cell-width: term-canvas-rect.live-cell-w; }
+                                        TermSpanCell { span: line.s3; font-delta: root.ui-font-size-delta; mono-font-family: root.resolved-mono-font-family; cell-width: term-canvas-rect.live-cell-w; }
+                                        TermSpanCell { span: line.s4; font-delta: root.ui-font-size-delta; mono-font-family: root.resolved-mono-font-family; cell-width: term-canvas-rect.live-cell-w; }
+                                        TermSpanCell { span: line.s5; font-delta: root.ui-font-size-delta; mono-font-family: root.resolved-mono-font-family; cell-width: term-canvas-rect.live-cell-w; }
+                                        TermSpanCell { span: line.s6; font-delta: root.ui-font-size-delta; mono-font-family: root.resolved-mono-font-family; cell-width: term-canvas-rect.live-cell-w; }
+                                        TermSpanCell { span: line.s7; font-delta: root.ui-font-size-delta; mono-font-family: root.resolved-mono-font-family; cell-width: term-canvas-rect.live-cell-w; }
+                                        TermSpanCell { span: line.s8; font-delta: root.ui-font-size-delta; mono-font-family: root.resolved-mono-font-family; cell-width: term-canvas-rect.live-cell-w; }
+                                        TermSpanCell { span: line.s9; font-delta: root.ui-font-size-delta; mono-font-family: root.resolved-mono-font-family; cell-width: term-canvas-rect.live-cell-w; }
+                                        TermSpanCell { span: line.s10; font-delta: root.ui-font-size-delta; mono-font-family: root.resolved-mono-font-family; cell-width: term-canvas-rect.live-cell-w; }
+                                        TermSpanCell { span: line.s11; font-delta: root.ui-font-size-delta; mono-font-family: root.resolved-mono-font-family; cell-width: term-canvas-rect.live-cell-w; }
+                                        TermSpanCell { span: line.s12; font-delta: root.ui-font-size-delta; mono-font-family: root.resolved-mono-font-family; cell-width: term-canvas-rect.live-cell-w; }
+                                        TermSpanCell { span: line.s13; font-delta: root.ui-font-size-delta; mono-font-family: root.resolved-mono-font-family; cell-width: term-canvas-rect.live-cell-w; }
+                                        TermSpanCell { span: line.s14; font-delta: root.ui-font-size-delta; mono-font-family: root.resolved-mono-font-family; cell-width: term-canvas-rect.live-cell-w; }
+                                        TermSpanCell { span: line.s15; font-delta: root.ui-font-size-delta; mono-font-family: root.resolved-mono-font-family; cell-width: term-canvas-rect.live-cell-w; }
                                     }
                                 }
-                                if root.terminal-command-input == "" && !term-cmd-input.has-focus : Text {
-                                    x: 8px;
-                                    y: 0px;
-                                    height: parent.height;
-                                    text: "Interactive shell prompt (e.g. ls -la, git status, top, cd ..) — Press Enter…";
-                                    color: #6E6E77;
-                                    font-size: 12px + root.ui-font-size-delta * 1px;
-                                    font-family: "monospace";
-                                    vertical-alignment: center;
+                            }
+
+                            // Subtle Right-Edge Scrollback Position Bar (when scrollback history exists)
+                            if !root.terminal-alt-screen && root.terminal-max-scroll > 0 : Rectangle {
+                                x: parent.width - 7px;
+                                y: 4px;
+                                width: 4px;
+                                height: parent.height - 8px;
+                                border-radius: 2px;
+                                background: #1A1C23;
+
+                                property <float> thumb-ratio: Math.clamp(
+                                    root.terminal-lines.length / Math.max(1.0, root.terminal-lines.length + root.terminal-max-scroll),
+                                    0.12,
+                                    1.0
+                                );
+                                property <length> thumb-h: Math.max(20px, self.height * self.thumb-ratio);
+                                property <float> scroll-frac: Math.clamp(
+                                    1.0 - (root.terminal-scroll-offset / Math.max(1.0, root.terminal-max-scroll)),
+                                    0.0,
+                                    1.0
+                                );
+
+                                Rectangle {
+                                    x: 0px;
+                                    y: (parent.height - parent.thumb-h) * parent.scroll-frac;
+                                    width: 4px;
+                                    height: parent.thumb-h;
+                                    border-radius: 2px;
+                                    background: root.terminal-scroll-offset > 0 ? root.theme-accent : #484C58;
                                 }
                             }
 
-                            ToolbarButton {
-                                label: "Ctrl+C";
-                                tooltip: "Send SIGINT (Interrupt Running Command)";
-                                tooltip-align-right: true;
-                                tooltip-above: true;
+                            TouchArea {
+                                width: parent.width;
+                                height: parent.height;
+                                mouse-cursor: text;
                                 clicked => {
-                                    root.terminal-key-event("ctrl_c", true);
+                                    root.terminal-canvas-width = term-canvas-rect.width;
+                                    root.terminal-canvas-height = term-canvas-rect.height;
+                                    term-focus-scope.focus();
+                                }
+                                pointer-event(ev) => {
+                                    if ev.button == PointerEventButton.right && ev.kind == PointerEventKind.down {
+                                        term-focus-scope.focus();
+                                        root.terminal-paste();
+                                    }
+                                }
+                                scroll-event(ev) => {
+                                    root.terminal-scroll(ev.delta-y > 0px ? 3 : -3);
+                                    return accept;
                                 }
                             }
                         }
@@ -6708,6 +6934,17 @@ export component ManifoldWindow inherits Window {
                     triggered => {
                         root.show-context-menu = false;
                         root.execute-context-action("open_new_tab");
+                    }
+                }
+
+                if !root.context-is-blank : Rectangle { height: 1px; background: #323238; }
+
+                if !root.context-is-blank : ContextMenuItem {
+                    icon-kind: "folder-up";
+                    label: "Show in Enclosing Folder";
+                    triggered => {
+                        root.show-context-menu = false;
+                        root.execute-context-action("show_in_enclosing_folder");
                     }
                 }
 
@@ -7259,12 +7496,15 @@ export component ManifoldWindow inherits Window {
         }
     }
 
-    // LAYER 4 (z: 2000): NEW FOLDER / RENAME INPUT MODAL
+    // LAYER 4 (z: 2000): NEW FOLDER / RENAME / COMPRESS ARCHIVE INPUT MODAL
     if root.show-input-modal : Rectangle {
         z: 2000;
         width: 100%;
         height: 100%;
         background: #00000099;
+        init => {
+            input-modal-edit.focus-input();
+        }
         TouchArea {
             clicked => {
                 root.show-input-modal = false;
@@ -7273,7 +7513,11 @@ export component ManifoldWindow inherits Window {
         }
 
         Rectangle {
-            width: Math.clamp(420px + root.font-size-delta * 18, 390px, root.width - 40px);
+            width: Math.clamp(
+                (root.input-modal-mode == "compress" ? 450px : 420px) + root.font-size-delta * 18,
+                390px,
+                root.width - 40px
+            );
             height: input-modal-layout.preferred-height;
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
@@ -7308,13 +7552,15 @@ export component ManifoldWindow inherits Window {
                             icon-size: 16px;
                             kind: root.input-modal-mode == "new_folder"
                                 ? "folder"
-                                : (root.input-modal-mode == "new_file" ? "file" : "edit");
+                                : (root.input-modal-mode == "new_file"
+                                    ? "file"
+                                    : (root.input-modal-mode == "compress" ? "archive" : "edit"));
                             icon-color: root.theme-text-primary;
                         }
                     }
                     VerticalLayout {
                         horizontal-stretch: 1;
-                        spacing: 2px;
+                        spacing: 3px;
                         alignment: center;
                         Text {
                             width: 100%;
@@ -7325,21 +7571,83 @@ export component ManifoldWindow inherits Window {
                             font-weight: 700;
                             wrap: word-wrap;
                         }
+                        if root.input-modal-mode == "compress" && root.compress-items-summary != "" : Text {
+                            width: 100%;
+                            text: root.compress-items-summary;
+                            color: root.theme-text-secondary;
+                            font-family: root.resolved-font-family;
+                            font-size: 11.5px + root.font-size-delta * 0.5;
+                            font-weight: 500;
+                            wrap: word-wrap;
+                        }
                     }
                 }
 
-                CleanLineEdit {
-                    height: 32px + Math.max(0px, root.font-size-delta * 1.5);
-                    text <=> root.input-modal-value;
-                    font-size: 13px + root.font-size-delta;
-                    accepted(val) => {
-                        root.show-input-modal = false;
-                        key-router.focus();
-                        root.confirm-input-modal(val);
+                VerticalLayout {
+                    spacing: 6px;
+                    if root.input-modal-mode == "compress" : Text {
+                        text: "Archive Base Name:";
+                        color: root.theme-text-secondary;
+                        font-family: root.resolved-font-family;
+                        font-size: 11.5px + root.font-size-delta * 0.5;
+                        font-weight: 600;
                     }
-                    escape-pressed => {
-                        root.show-input-modal = false;
-                        key-router.focus();
+                    input-modal-edit := CleanLineEdit {
+                        height: 32px + Math.max(0px, root.font-size-delta * 1.5);
+                        text <=> root.input-modal-value;
+                        font-size: 13px + root.font-size-delta;
+                        accepted(val) => {
+                            root.show-input-modal = false;
+                            key-router.focus();
+                            root.confirm-input-modal(val);
+                        }
+                        escape-pressed => {
+                            root.show-input-modal = false;
+                            key-router.focus();
+                        }
+                    }
+                }
+
+                if root.input-modal-mode == "compress" : VerticalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: "Compression Algorithm / Format:";
+                        color: root.theme-text-secondary;
+                        font-family: root.resolved-font-family;
+                        font-size: 11.5px + root.font-size-delta * 0.5;
+                        font-weight: 600;
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        SegmentControlButton {
+                            label: "TAR.GZ (.tar.gz)";
+                            btn-width: 162px;
+                            active: root.compress-format == "tar.gz";
+                            accent-bg: root.theme-accent;
+                            font-family: root.resolved-font-family;
+                            font-delta: root.font-size-delta;
+                            clicked => {
+                                root.compress-format = "tar.gz";
+                            }
+                        }
+                        SegmentControlButton {
+                            label: "ZIP (.zip)";
+                            btn-width: 138px;
+                            active: root.compress-format == "zip";
+                            accent-bg: root.theme-accent;
+                            font-family: root.resolved-font-family;
+                            font-delta: root.font-size-delta;
+                            clicked => {
+                                root.compress-format = "zip";
+                            }
+                        }
+                    }
+                    Text {
+                        text: "Output file: " + root.input-modal-value + "." + root.compress-format;
+                        color: root.theme-text-secondary;
+                        font-family: "monospace";
+                        font-size: 11px + root.font-size-delta * 0.5;
+                        overflow: elide;
                     }
                 }
 
@@ -7359,7 +7667,7 @@ export component ManifoldWindow inherits Window {
                         }
                     }
                     ToolbarButton {
-                        label: "Confirm";
+                        label: root.input-modal-mode == "compress" ? "Compress" : "Confirm";
                         active: true;
                         font-family: root.resolved-font-family;
                         font-delta: root.font-size-delta;

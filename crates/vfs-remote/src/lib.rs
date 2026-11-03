@@ -164,6 +164,11 @@ impl RemoteVfsBackend {
         Ok(backend)
     }
 
+    /// Returns the optional secret (password or passphrase) held for this remote session.
+    pub fn secret(&self) -> Option<&str> {
+        self.secret.as_deref()
+    }
+
     fn ssh_base_args(&self, is_scp: bool) -> Result<(Vec<String>, String), VfsError> {
         let missing_host = || VfsError::InvalidPath("Missing SFTP host".to_string());
         let host = self.profile.host.as_deref().ok_or_else(missing_host)?;
@@ -357,6 +362,72 @@ impl RemoteVfsBackend {
 
     pub fn disconnect(&self) {
         *self.connected.write().unwrap() = false;
+    }
+
+    /// Recursively searches `base_dir` and its downstream subdirectories for entries matching `query`.
+    pub fn search_recursive(
+        &self,
+        base_dir: &str,
+        query: &str,
+        show_hidden: bool,
+        max_results: usize,
+    ) -> Result<Vec<FileMetadata>, VfsError> {
+        self.ensure_connected()?;
+        let norm = Self::normalize_remote_path(base_dir)?;
+        let q_low = query.trim().to_lowercase();
+        if q_low.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cap = max_results.clamp(1, 2500);
+
+        if self.live_ssh {
+            let esc_dir = norm.replace('\'', "'\\''");
+            let glob_raw = if q_low.contains('*') || q_low.contains('?') {
+                q_low.clone()
+            } else {
+                format!("*{q_low}*")
+            };
+            let esc_glob = glob_raw.replace('\'', "'\\''");
+            let prune_hidden = if show_hidden {
+                ""
+            } else {
+                "\\( -name '.*' -prune \\) -o "
+            };
+            let find_cmd =
+                format!("find '{esc_dir}' -maxdepth 8 {prune_hidden}-iname '{esc_glob}'");
+            let sh = format!("{find_cmd} -exec ls -ldn -- {{}} + 2>/dev/null | head -n {cap}");
+            let out = self.run_remote_shell(&sh)?;
+            let mut list =
+                parse_ls_ldn_find_output(&norm, &out, &self.profile.username, show_hidden);
+            list.truncate(cap);
+            return Ok(list);
+        }
+
+        let prefix = if norm == "/" {
+            "/".to_string()
+        } else {
+            format!("{norm}/")
+        };
+        let nodes = self.nodes.read().unwrap();
+        let mut results = Vec::new();
+        for (path, node) in nodes.iter() {
+            if path == &norm || !path.starts_with(&prefix) {
+                continue;
+            }
+            if !show_hidden {
+                let rel = path.strip_prefix(&prefix).unwrap_or(path);
+                if rel.split('/').any(|seg| seg.starts_with('.')) {
+                    continue;
+                }
+            }
+            if remote_name_matches_query(&node.metadata.name, &q_low) {
+                results.push(node.metadata.clone());
+                if results.len() >= cap {
+                    break;
+                }
+            }
+        }
+        Ok(results)
     }
 
     fn ensure_connected(&self) -> Result<(), VfsError> {
@@ -809,6 +880,139 @@ fn parse_ls_aln_output(dir_norm: &str, raw: &str, default_owner: &str) -> Vec<Fi
         let full_path = format!("{trimmed_dir}/{name}");
         entries.push(FileMetadata {
             is_hidden: name.starts_with('.'),
+            name,
+            path: full_path,
+            extension,
+            kind,
+            size: if is_dir { None } else { size_val },
+            is_dir,
+            is_symlink,
+            is_locked: false,
+            hide_extension: false,
+            color_label: ColorLabel::None,
+            modified: Some(SystemTime::now()),
+            created: Some(SystemTime::now()),
+            added: Some(SystemTime::now()),
+            permissions: parse_symbolic_permissions(mode_str),
+            owner: Some(default_owner.to_string()),
+            group: Some(tokens[3].to_string()),
+        });
+    }
+    entries
+}
+
+fn remote_wildcard_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star_pi, mut star_ti) = (None::<usize>, 0usize);
+
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star_pi = Some(pi);
+            star_ti = ti;
+            pi += 1;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+fn remote_name_matches_query(name: &str, q_low: &str) -> bool {
+    if q_low.is_empty() {
+        return true;
+    }
+    let name_low = name.to_lowercase();
+    if q_low.contains('*') || q_low.contains('?') {
+        let anchored = format!("*{q_low}*");
+        remote_wildcard_match(q_low, &name_low) || remote_wildcard_match(&anchored, &name_low)
+    } else if q_low.contains(' ') {
+        q_low.split_whitespace().all(|tok| name_low.contains(tok))
+    } else {
+        name_low.contains(q_low)
+    }
+}
+
+fn parse_ls_ldn_find_output(
+    base_norm: &str,
+    raw: &str,
+    default_owner: &str,
+    show_hidden: bool,
+) -> Vec<FileMetadata> {
+    let mut entries = Vec::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("total ") {
+            continue;
+        }
+        let mut idx = 0usize;
+        let bytes = line.as_bytes();
+        let len = bytes.len();
+        let mut tokens = Vec::with_capacity(8);
+        while tokens.len() < 8 && idx < len {
+            while idx < len && bytes[idx].is_ascii_whitespace() {
+                idx += 1;
+            }
+            let start = idx;
+            while idx < len && !bytes[idx].is_ascii_whitespace() {
+                idx += 1;
+            }
+            if start < idx {
+                tokens.push(&line[start..idx]);
+            }
+        }
+        if tokens.len() < 8 {
+            continue;
+        }
+        while idx < len && bytes[idx] == b' ' {
+            idx += 1;
+        }
+        let raw_path = &line[idx..];
+        let mode_str = tokens[0];
+        let first_ch = mode_str.chars().next().unwrap_or('-');
+        if !matches!(first_ch, '-' | 'd' | 'l' | 'b' | 'c' | 'p' | 's') {
+            continue;
+        }
+        let is_symlink = first_ch == 'l';
+        let full_path_raw = if is_symlink {
+            raw_path
+                .split_once(" -> ")
+                .map(|(n, _)| n)
+                .unwrap_or(raw_path)
+                .trim()
+        } else {
+            raw_path.trim()
+        };
+        let Ok(full_path) = RemoteVfsBackend::normalize_remote_path(full_path_raw) else {
+            continue;
+        };
+        if full_path == base_norm {
+            continue;
+        }
+        let name = full_path.rsplit('/').next().unwrap_or("").to_string();
+        if name.is_empty() || name == "." || name == ".." {
+            continue;
+        }
+        let is_hidden = name.starts_with('.');
+        if is_hidden && !show_hidden {
+            continue;
+        }
+        let is_dir = first_ch == 'd';
+        let size_val = tokens[4].parse::<u64>().ok();
+        let (extension, kind) = manifold_vfs::infer_file_kind(&name, is_dir);
+        entries.push(FileMetadata {
+            is_hidden,
             name,
             path: full_path,
             extension,
