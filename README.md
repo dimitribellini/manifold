@@ -52,16 +52,25 @@ Expand-Archive -Path manifold-windows-x86_64.zip -DestinationPath .
 
 ## Features
 
-- **Single & Dual-Pane Workspace**: Switch between Single Pane and Dual Pane via the 2-icon toolbar pill switcher (`Cmd/Ctrl + Alt + T`) with resizable splitters, live external directory change detection, and automatic session restore (`session.toml`) for open tabs, view modes, sort order, and panel dimensions.
-- **Tabs, Favorites & Breadcrumbs**: Multiple tabs per pane, animated drag-and-drop reordering for tabs and sidebar `Favorites`, clickable breadcrumb navigation with sibling folder dropdowns, and `Cmd/Ctrl + L` path editing with `Tab` completion.
-- **View Modes (`Icons`, `List`, `Columns`, `Tree`)**: Responsive 4-icon toolbar pill switcher (`Cmd/Ctrl + 1..4`) supporting a 3-column icon grid with cached image thumbnails, a flat sortable details table (`Name | Size | Date Modified` with directories grouped above files), Miller columns with inline media metadata, and a hierarchical expandable directory tree (`Tree` view with disclosure chevrons, tree guide lines, and `Left`/`Right` arrow expansion/collapse).
-- **Recursive Search**: Non-blocking Breadth-First Search across downstream subdirectories (local and remote SFTP) with wildcard (`*`, `?`) and multi-token matching, relative parent path display in `List` view, clickable `Search: "<query>"` header pill to clear the filter, and `Show in Enclosing Folder` in the context menu when a search match is located in a subfolder.
-- **Inspector & Previews**: Right-hand Inspector drawer (`Cmd/Ctrl + I`) for file metadata, photo/audio/video details, persistent 8-color tags, and `R/W/X` (`Octal`) permissions, plus Quick Look (`Space`) and hover previews for images, text, code, and documents.
-- **Background Transfers & Conflict Resolution**: Non-blocking local and remote file operations with progress tracking, bandwidth limiting, and pre-flight conflict resolution (`Replace`, `Replace Older`, `Keep Both`, `Skip`, `Stop`, with `Apply to all`).
-- **Integrated Terminal (Local & Remote SSH)**: Built-in VT100/Xterm terminal emulator (`>_`) with cell-aligned monospace rendering (`Menlo`, `Consolas`, `DejaVu Sans Mono`), 256/TrueColor SGR support, DEC box-drawing, 1,000-line scrollback, and alternate screen buffer (`top`, `htop`, `less`, `vim`). Runs a native POSIX PTY shell (`zsh`/`bash`) on macOS/Linux and ConPTY PowerShell (`pwsh`/`powershell`) on Windows, and automatically opens an interactive remote `ssh` PTY session when browsing a remote SFTP connection.
-- **Drag-and-Drop & Clipboard**: Drag-and-drop across panes, folder rows, tabs, breadcrumbs, sidebar items, and external OS applications (native `NSDraggingSession` on macOS and OS file clipboard integration).
-- **Archives, macOS Bundles, Open With, Sync & Batch Rename**: Create `.tar.gz` or `.zip` archives from single or multiple items, inspect archive contents directly via `Show Archive Contents`, extract `.zip`, `.tar.gz`, `.tar.bz2`, `.tar.xz`, `.tar`, `.7z`, `.rar`, `.gz`, `.bz2`, and `.xz` archives in place (unwrapping single `.app` bundles on macOS, preserving bundle signatures and stripping download quarantine attributes when extracting or copying `.app` bundles to `/Applications`, and treating `.app` directories as native Application packages with `Show Package Contents`), open files with external applications (`Open With…`), compare/sync directories, and batch-rename files.
-- **Themes & Typography**: Configurable font family, size, weight, and 6 color themes (`Cmd/Ctrl + ,`) persisted in `preferences.toml`.
+- **Single & Dual-Pane Layout**: Switch between single and dual panes (`Cmd/Ctrl + Alt + T`) with multiple tabs per pane and automatic session restore.
+- **Four View Modes**: Browse files as **Icons**, **List**, **Columns** (Miller view), or **Tree** (`Cmd/Ctrl + 1..4`).
+- **Recursive Search**: Filter the current folder and subfolders using wildcards (`*`, `?`), and jump to any result's parent folder with **Show in Enclosing Folder**.
+- **Inspector & Quick Look**: Inspect file metadata, media details, color tags, and `R/W/X` permissions (`Cmd/Ctrl + I`), or preview files with `Space`.
+- **Built-in Terminal**: Integrated terminal drawer (`>_`) running your local shell (`zsh`, `bash`, `PowerShell`) or an interactive remote `ssh` session when browsing SFTP servers.
+- **Archives & Packages**: Create `.zip` and `.tar.gz` archives, browse archive contents in place, or extract `.zip`, `.tar.*`, `.7z`, and `.rar` files.
+- **File Transfers & Sync**: Background copy/move with conflict resolution (`Replace`, `Replace Older`, `Keep Both`, `Skip`), directory comparison/sync, and batch rename.
+- **Themes & Fonts**: Six built-in color themes and adjustable UI font family, size, and weight (`Cmd/Ctrl + ,`).
+
+### Folder View Options (`Cmd/Ctrl + J`)
+
+<div align="center">
+  <img src="screenshots/manifold_fig3.png" alt="Manifold Folder View Options" width="100%" />
+</div>
+
+- **Scope & Inheritance**: Apply view settings to **All Folders**, **This Folder**, or **This Folder and Subfolders**, and save any layout with **Use as Defaults**.
+- **Sorting & Sizing**: Choose the default sort field (`Name`, `Modified`, `Created`, `Added`, `Size`, `Kind`), row icon size (`16px` / `20px` / `24px`), and text size (`11px`–`16px`).
+- **Customizable Columns**: Show or hide `Size`, `Kind`, `Date Modified`, `Date Added`, `Date Created`, `Owner`, `Group`, `Permissions`, and `Tags`.
+- **Display Preferences**: Toggle **Bold Folders**, **Show Hidden Files**, **Show Icon Preview**, **Treat Packages as Folders**, **Show Folders on Top**, **Use Relative Dates**, **Calculate All Sizes**, and **Use Alternating Background**.
 
 ---
 
@@ -71,11 +80,10 @@ Expand-Archive -Path manifold-windows-x86_64.zip -DestinationPath .
   <img src="screenshots/manifold_fig2.png" alt="Manifold Remote Connection Modal" width="100%" />
 </div>
 
-- **Protocols**: `SFTP / SSH` (password or private key), `Amazon S3` (and S3-compatible storage), `SMB`, `FTP / FTPS`, and `WebDAV`.
-- **Interactive Remote Shell**: Selecting a remote SFTP connection synchronizes the bottom terminal drawer to an authenticated `ssh` PTY session in the active remote directory.
-- **Linux Network Mounts**: Active `NFS`, `CIFS / SMB`, and `SSHFS` mounts from `/proc/mounts` are automatically listed in the `Connections` sidebar with unmount/eject support.
-- **Streaming I/O**: Remote file transfers stream directly between disk and `scp`/remote storage without buffering full files in memory.
-- **OS Keychain Storage**: Connection profiles are stored in `connections.toml`, while passwords and keys are stored in the native OS keyring (`macOS Keychain`, Linux `libsecret`, or Windows Credential Manager).
+- **Supported Protocols**: `SFTP / SSH` (password or SSH key), `Amazon S3` (and S3-compatible endpoints), `SMB`, `FTP / FTPS`, and `WebDAV`.
+- **Automatic Terminal Sync**: Opening an SFTP connection switches the bottom terminal to a live `ssh` session in the active remote folder.
+- **Mounted Shares**: Active Linux `NFS`, `SMB / CIFS`, and `SSHFS` mounts appear automatically in the `Connections` sidebar.
+- **Keychain Integration**: Passwords and key passphrases are stored in the OS keyring (`macOS Keychain`, Linux `libsecret`, or `Windows Credential Manager`).
 
 ---
 
@@ -99,6 +107,7 @@ Expand-Archive -Path manifold-windows-x86_64.zip -DestinationPath .
 | `Cmd/Ctrl + R`, `F2`, or click selected name | Rename selected item |
 | `Cmd/Ctrl + Shift + C` | Copy full path or URI to clipboard |
 | `Cmd/Ctrl + I` | Toggle Inspector drawer (`Info` / `Tasks`) |
+| `Cmd/Ctrl + J` | Toggle File & Directory View Options (`Show View Options`) |
 | `Cmd/Ctrl + ,` | Open Preferences modal |
 | `Delete` | Move selected items to Trash |
 | `Shift + Delete` | Permanently delete selected items |

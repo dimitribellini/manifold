@@ -16,8 +16,9 @@ use std::time::{Duration, Instant};
 
 use manifold_config::{
     AppPreferences, AuthType, ConnectionProfile, ConnectionsConfig, CredentialStore,
-    FavoriteFolderEntry, PaneSessionConfig, PaneViewMode, ProtocolType, SessionState, SortColumn,
-    SortDirection, SplitDirection, TabSessionConfig, WindowSessionConfig,
+    FavoriteFolderEntry, FolderViewOptions, PaneSessionConfig, PaneViewMode, ProtocolType,
+    SessionState, SortColumn, SortDirection, SplitDirection, TabSessionConfig, ViewOptionsScope,
+    WindowSessionConfig,
 };
 use manifold_preview::FileInspectorViewModel;
 use manifold_sync::{ComparisonMode, SyncExecutionPlan, SyncStrategy};
@@ -178,6 +179,7 @@ struct GuiRuntime {
     term_last_size: (u16, u16),
     thumbnail_cache: HashMap<String, Option<Image>>,
     dir_cache: RefCell<HashMap<String, Vec<FileMetadata>>>,
+    dir_size_cache: RefCell<HashMap<String, u64>>,
     dir_fingerprints: RefCell<HashMap<String, u64>>,
     fs_poll_tick: u32,
     session_save_tick: u32,
@@ -362,6 +364,7 @@ impl GuiRuntime {
             term_last_size: (14, 110),
             thumbnail_cache: HashMap::new(),
             dir_cache: RefCell::new(HashMap::new()),
+            dir_size_cache: RefCell::new(HashMap::new()),
             dir_fingerprints: RefCell::new(HashMap::new()),
             fs_poll_tick: 0,
             session_save_tick: 0,
@@ -1327,8 +1330,13 @@ impl GuiRuntime {
 
     fn invalidate_dir_cache(&self) {
         self.dir_cache.borrow_mut().clear();
+        self.dir_size_cache.borrow_mut().clear();
         *self.left_search_key.borrow_mut() = (String::new(), String::new(), false);
         *self.right_search_key.borrow_mut() = (String::new(), String::new(), false);
+    }
+
+    fn effective_view_options_for_dir(&self, dir_path: &str) -> FolderViewOptions {
+        self.prefs.effective_view_options(dir_path)
     }
 
     fn vfs_metadata(&self, path: &str) -> Option<FileMetadata> {
@@ -2505,6 +2513,22 @@ impl GuiRuntime {
         sort_col: SortColumn,
         sort_dir: SortDirection,
     ) -> Vec<FileMetadata> {
+        let mut vo = self.effective_view_options_for_dir(dir_path);
+        if show_hidden {
+            vo.show_hidden_files = true;
+        }
+        self.list_sorted_dir_for_view(dir_path, query, sort_col, sort_dir, &vo)
+    }
+
+    fn list_sorted_dir_for_view(
+        &self,
+        dir_path: &str,
+        query: &str,
+        sort_col: SortColumn,
+        sort_dir: SortDirection,
+        vo: &FolderViewOptions,
+    ) -> Vec<FileMetadata> {
+        let show_hidden = self.app_state.toolbar.show_hidden_files || vo.show_hidden_files;
         let raw_items = self.list_raw_dir_cached(dir_path);
         let q_low = query.trim().to_lowercase();
         let mut filtered: Vec<FileMetadata> = raw_items
@@ -2513,7 +2537,33 @@ impl GuiRuntime {
             .filter(|m| matches_search_query_lower(m, &q_low))
             .collect();
 
-        sort_metadata_slice(&mut filtered, sort_col, sort_dir);
+        if vo.calculate_all_sizes {
+            for item in &mut filtered {
+                if item.is_dir && item.size.is_none() {
+                    let cached_sz = self.dir_size_cache.borrow().get(&item.path).copied();
+                    if let Some(sz) = cached_sz {
+                        item.size = Some(sz);
+                    } else if split_remote_uri(&item.path).is_none() {
+                        let vfs = self.backend_for_path(&item.path);
+                        if let Ok(sz) = vfs.calculate_dir_size(&item.path) {
+                            self.dir_size_cache
+                                .borrow_mut()
+                                .insert(item.path.clone(), sz);
+                            item.size = Some(sz);
+                        }
+                    }
+                }
+            }
+        }
+
+        sort_metadata_slice_with_options(
+            &mut filtered,
+            sort_col,
+            sort_dir,
+            vo.show_folders_on_top,
+            vo.folders_always_alpha,
+            vo.treat_packages_as_folders,
+        );
         filtered
     }
 
@@ -2525,11 +2575,12 @@ impl GuiRuntime {
         opts: (&str, SortColumn, SortDirection),
         out: &mut Vec<FlattenedRowEntry>,
     ) {
-        let show_hidden = self.app_state.toolbar.show_hidden_files;
+        let vo = self.effective_view_options_for_dir(dir_path);
         let query = if depth == 0 { opts.0 } else { "" };
-        let items = self.list_sorted_dir(dir_path, show_hidden, query, opts.1, opts.2);
+        let items = self.list_sorted_dir_for_view(dir_path, query, opts.1, opts.2, &vo);
         for meta in items {
-            let is_exp = is_browsable_folder(&meta) && expanded_set.contains(&meta.path);
+            let is_browsable = is_browsable_folder_with_opts(&meta, vo.treat_packages_as_folders);
+            let is_exp = is_browsable && expanded_set.contains(&meta.path);
             let child_path = meta.path.clone();
             out.push(FlattenedRowEntry {
                 meta,
@@ -2749,12 +2800,21 @@ impl GuiRuntime {
                 .collect()
         };
 
+        let pane_path = self.current_pane_path(is_right);
+        let vo = self.effective_view_options_for_dir(&pane_path);
         let mut sorted = if is_right {
             self.right_search_results.clone()
         } else {
             self.left_search_results.clone()
         };
-        sort_metadata_slice(&mut sorted, sort_col, sort_dir);
+        sort_metadata_slice_with_options(
+            &mut sorted,
+            sort_col,
+            sort_dir,
+            vo.show_folders_on_top,
+            vo.folders_always_alpha,
+            vo.treat_packages_as_folders,
+        );
         let flattened: Vec<FlattenedRowEntry> = sorted
             .into_iter()
             .map(|meta| FlattenedRowEntry {
@@ -2818,7 +2878,8 @@ impl GuiRuntime {
         if let Some((prefix, _)) = split_remote_uri(&path) {
             self.ensure_remote_connected(&prefix);
         }
-        let show_hidden = self.app_state.toolbar.show_hidden_files;
+        let vo = self.effective_view_options_for_dir(&path);
+        let show_hidden = self.app_state.toolbar.show_hidden_files || vo.show_hidden_files;
 
         let active_tab = if is_right {
             self.app_state
@@ -2861,7 +2922,14 @@ impl GuiRuntime {
             } else {
                 self.left_search_results.clone()
             };
-            sort_metadata_slice(&mut results, sort_col, sort_dir);
+            sort_metadata_slice_with_options(
+                &mut results,
+                sort_col,
+                sort_dir,
+                vo.show_folders_on_top,
+                vo.folders_always_alpha,
+                vo.treat_packages_as_folders,
+            );
             for meta in results {
                 flattened.push(FlattenedRowEntry {
                     meta,
@@ -3105,7 +3173,9 @@ impl GuiRuntime {
             return;
         };
 
-        if is_browsable_folder(&meta) {
+        let pane_path = self.current_pane_path(is_right);
+        let vo = self.effective_view_options_for_dir(&pane_path);
+        if is_browsable_folder_with_opts(&meta, vo.treat_packages_as_folders) {
             self.last_nav_instant = Some(Instant::now());
             let msg = format!("[OPEN] Directory -> {}", meta.path);
             self.logs.push(msg);
@@ -3960,60 +4030,130 @@ fn is_macos_app_bundle(meta: &FileMetadata) -> bool {
 }
 
 fn is_browsable_folder(meta: &FileMetadata) -> bool {
-    meta.is_dir && !is_macos_app_bundle(meta)
+    is_browsable_folder_with_opts(meta, false)
 }
 
-#[allow(clippy::too_many_arguments)]
+fn is_browsable_folder_with_opts(meta: &FileMetadata, treat_packages_as_folders: bool) -> bool {
+    meta.is_dir && (treat_packages_as_folders || !is_macos_app_bundle(meta))
+}
+
+#[cfg(test)]
 fn sort_metadata_slice(items: &mut [FileMetadata], column: SortColumn, direction: SortDirection) {
+    sort_metadata_slice_with_options(items, column, direction, true, false, false);
+}
+
+fn sort_metadata_slice_with_options(
+    items: &mut [FileMetadata],
+    column: SortColumn,
+    direction: SortDirection,
+    show_folders_on_top: bool,
+    folders_always_alpha: bool,
+    treat_packages_as_folders: bool,
+) {
     let desc = direction == SortDirection::Descending;
+    let folder_group = |a: &FileMetadata| -> bool {
+        if show_folders_on_top {
+            !is_browsable_folder_with_opts(a, treat_packages_as_folders)
+        } else {
+            false
+        }
+    };
     match (column, desc) {
         (SortColumn::Size, false) => {
             items.sort_by_key(|a| {
                 let sz = a.size.unwrap_or(0);
-                (!is_browsable_folder(a), sz, a.name.to_lowercase())
+                (folder_group(a), sz, a.name.to_lowercase())
             });
         }
         (SortColumn::Size, true) => {
             items.sort_by_key(|a| {
                 let rev_sz = std::cmp::Reverse(a.size.unwrap_or(0));
                 let rev_name = std::cmp::Reverse(a.name.to_lowercase());
-                (!is_browsable_folder(a), rev_sz, rev_name)
+                (folder_group(a), rev_sz, rev_name)
             });
         }
-        (SortColumn::Modified | SortColumn::Created, false) => {
+        (SortColumn::Modified, false) => {
             items.sort_by_key(|a| {
                 let name = a.name.to_lowercase();
-                (!is_browsable_folder(a), a.modified, name)
+                (folder_group(a), a.modified, name)
             });
         }
-        (SortColumn::Modified | SortColumn::Created, true) => {
+        (SortColumn::Modified, true) => {
             items.sort_by_key(|a| {
                 let rev_mod = std::cmp::Reverse(a.modified);
                 let rev_name = std::cmp::Reverse(a.name.to_lowercase());
-                (!is_browsable_folder(a), rev_mod, rev_name)
+                (folder_group(a), rev_mod, rev_name)
+            });
+        }
+        (SortColumn::Created, false) => {
+            items.sort_by_key(|a| {
+                let ts = a.created.or(a.modified);
+                let name = a.name.to_lowercase();
+                (folder_group(a), ts, name)
+            });
+        }
+        (SortColumn::Created, true) => {
+            items.sort_by_key(|a| {
+                let rev_ts = std::cmp::Reverse(a.created.or(a.modified));
+                let rev_name = std::cmp::Reverse(a.name.to_lowercase());
+                (folder_group(a), rev_ts, rev_name)
+            });
+        }
+        (SortColumn::Added, false) => {
+            items.sort_by_key(|a| {
+                let ts = a.added.or(a.created).or(a.modified);
+                let name = a.name.to_lowercase();
+                (folder_group(a), ts, name)
+            });
+        }
+        (SortColumn::Added, true) => {
+            items.sort_by_key(|a| {
+                let rev_ts = std::cmp::Reverse(a.added.or(a.created).or(a.modified));
+                let rev_name = std::cmp::Reverse(a.name.to_lowercase());
+                (folder_group(a), rev_ts, rev_name)
             });
         }
         (SortColumn::Kind, false) => {
             items.sort_by_key(|a| {
                 let kind = a.kind.to_lowercase();
-                (!is_browsable_folder(a), kind, a.name.to_lowercase())
+                (folder_group(a), kind, a.name.to_lowercase())
             });
         }
         (SortColumn::Kind, true) => {
             items.sort_by_key(|a| {
                 let rev_kind = std::cmp::Reverse(a.kind.to_lowercase());
                 let rev_name = std::cmp::Reverse(a.name.to_lowercase());
-                (!is_browsable_folder(a), rev_kind, rev_name)
+                (folder_group(a), rev_kind, rev_name)
+            });
+        }
+        (SortColumn::Permissions, false) => {
+            items.sort_by_key(|a| (folder_group(a), a.permissions, a.name.to_lowercase()));
+        }
+        (SortColumn::Permissions, true) => {
+            items.sort_by_key(|a| {
+                let rev_perm = std::cmp::Reverse(a.permissions);
+                let rev_name = std::cmp::Reverse(a.name.to_lowercase());
+                (folder_group(a), rev_perm, rev_name)
             });
         }
         (_, false) => {
-            items.sort_by_key(|a| (!is_browsable_folder(a), a.name.to_lowercase()));
+            items.sort_by_key(|a| (folder_group(a), a.name.to_lowercase()));
         }
         (_, true) => {
             items.sort_by_key(|a| {
                 let rev_name = std::cmp::Reverse(a.name.to_lowercase());
-                (!is_browsable_folder(a), rev_name)
+                (folder_group(a), rev_name)
             });
+        }
+    }
+
+    if show_folders_on_top && folders_always_alpha {
+        let dir_count = items
+            .iter()
+            .take_while(|m| is_browsable_folder_with_opts(m, treat_packages_as_folders))
+            .count();
+        if dir_count > 1 {
+            items[..dir_count].sort_by_key(|a| a.name.to_lowercase());
         }
     }
 }
@@ -4197,8 +4337,32 @@ fn split_name_stem_ext(name: &str) -> (String, String) {
 fn sort_col_to_str(col: SortColumn) -> &'static str {
     match col {
         SortColumn::Size => "size",
-        SortColumn::Modified | SortColumn::Created => "modified",
+        SortColumn::Modified => "modified",
+        SortColumn::Created => "created",
+        SortColumn::Added => "added",
+        SortColumn::Kind => "kind",
+        SortColumn::Permissions => "permissions",
         _ => "name",
+    }
+}
+
+fn str_to_sort_col(s: &str) -> SortColumn {
+    match s {
+        "size" => SortColumn::Size,
+        "modified" => SortColumn::Modified,
+        "created" => SortColumn::Created,
+        "added" => SortColumn::Added,
+        "kind" => SortColumn::Kind,
+        "permissions" => SortColumn::Permissions,
+        _ => SortColumn::Name,
+    }
+}
+
+fn scope_to_str(scope: ViewOptionsScope) -> &'static str {
+    match scope {
+        ViewOptionsScope::AllFolders => "all_folders",
+        ViewOptionsScope::ThisFolder => "this_folder",
+        ViewOptionsScope::ThisFolderAndSubfolders => "this_folder_and_subfolders",
     }
 }
 
@@ -4471,6 +4635,14 @@ fn apply_preferences_to_window(w: &ManifoldWindow, prefs: &AppPreferences) {
                 Color::from_rgb_u8(0x88, 0x88, 0x92),
             ),
         };
+    let row_alt = match norm_theme {
+        "midnight_ocean" => Color::from_rgb_u8(0x1A, 0x26, 0x3E),
+        "dracula_pro" => Color::from_rgb_u8(0x2D, 0x30, 0x3E),
+        "nordic_slate" => Color::from_rgb_u8(0x33, 0x3A, 0x47),
+        "solarized_dark" => Color::from_rgb_u8(0x0A, 0x3D, 0x4A),
+        "high_contrast" => Color::from_rgb_u8(0x14, 0x14, 0x19),
+        _ => Color::from_rgb_u8(0x1E, 0x1E, 0x24),
+    };
     w.set_theme_bg_canvas(canvas.into());
     w.set_theme_bg_toolbar(toolbar.into());
     w.set_theme_bg_sidebar(sidebar.into());
@@ -4478,6 +4650,7 @@ fn apply_preferences_to_window(w: &ManifoldWindow, prefs: &AppPreferences) {
     w.set_theme_border(border.into());
     w.set_theme_accent(accent.into());
     w.set_theme_row_hover(hover.into());
+    w.set_theme_row_alt(row_alt.into());
     w.set_theme_text_primary(text_pri.into());
     w.set_theme_text_secondary(text_sec.into());
 }
@@ -4830,13 +5003,81 @@ fn sync_window_from_runtime(window: &ManifoldWindow, rt: &mut GuiRuntime) {
         .collect();
     window.set_right_tabs(ModelRc::new(VecModel::from(r_tabs)));
 
+    // Left & Right effective FolderViewOptions + active View Options popover state
+    let l_vo = rt.effective_view_options_for_dir(&l_cur_path);
+    let r_vo = rt.effective_view_options_for_dir(&r_cur_path);
+    window.set_left_col_size(l_vo.col_size);
+    window.set_left_col_kind(l_vo.col_kind);
+    window.set_left_col_modified(l_vo.col_date_modified);
+    window.set_left_col_created(l_vo.col_date_created);
+    window.set_left_col_added(l_vo.col_date_added);
+    window.set_left_col_owner(l_vo.col_owner);
+    window.set_left_col_group(l_vo.col_group);
+    window.set_left_col_permissions(l_vo.col_permissions);
+    window.set_left_col_tags(l_vo.col_tags);
+    window.set_left_icon_size(l_vo.icon_size as i32);
+    window.set_left_bold_folders(l_vo.bold_folders);
+    window.set_left_alt_bg(l_vo.use_alternating_row_bg);
+
+    window.set_right_col_size(r_vo.col_size);
+    window.set_right_col_kind(r_vo.col_kind);
+    window.set_right_col_modified(r_vo.col_date_modified);
+    window.set_right_col_created(r_vo.col_date_created);
+    window.set_right_col_added(r_vo.col_date_added);
+    window.set_right_col_owner(r_vo.col_owner);
+    window.set_right_col_group(r_vo.col_group);
+    window.set_right_col_permissions(r_vo.col_permissions);
+    window.set_right_col_tags(r_vo.col_tags);
+    window.set_right_icon_size(r_vo.icon_size as i32);
+    window.set_right_bold_folders(r_vo.bold_folders);
+    window.set_right_alt_bg(r_vo.use_alternating_row_bg);
+
+    let active_vo = if is_right_active { &r_vo } else { &l_vo };
+    let active_sort_enum = if is_right_active {
+        rt.app_state
+            .right_tabs
+            .get(rt.app_state.right_active_tab)
+            .map(|t| t.sort_column)
+            .unwrap_or(active_vo.sort_column)
+    } else {
+        rt.app_state
+            .left_tabs
+            .get(rt.app_state.left_active_tab)
+            .map(|t| t.sort_column)
+            .unwrap_or(active_vo.sort_column)
+    };
+    let scope_str = scope_to_str(active_vo.scope);
+    let sort_str = sort_col_to_str(active_sort_enum);
+    window.set_vo_scope(scope_str.into());
+    window.set_vo_sort_by(sort_str.into());
+    window.set_vo_icon_size(active_vo.icon_size as i32);
+    window.set_vo_col_size(active_vo.col_size);
+    window.set_vo_col_kind(active_vo.col_kind);
+    window.set_vo_col_modified(active_vo.col_date_modified);
+    window.set_vo_col_added(active_vo.col_date_added);
+    window.set_vo_col_created(active_vo.col_date_created);
+    window.set_vo_col_owner(active_vo.col_owner);
+    window.set_vo_col_group(active_vo.col_group);
+    window.set_vo_col_permissions(active_vo.col_permissions);
+    window.set_vo_col_tags(active_vo.col_tags);
+    window.set_vo_bold_folders(active_vo.bold_folders);
+    window.set_vo_show_hidden(show_hidden || active_vo.show_hidden_files);
+    window.set_vo_show_icon_preview(active_vo.show_icon_preview);
+    window.set_vo_treat_packages_as_folders(active_vo.treat_packages_as_folders);
+    window.set_vo_show_folders_on_top(active_vo.show_folders_on_top);
+    window.set_vo_folders_always_alpha(active_vo.folders_always_alpha);
+    window.set_vo_use_relative_dates(active_vo.use_relative_dates);
+    window.set_vo_calculate_all_sizes(active_vo.calculate_all_sizes);
+    window.set_vo_use_alternating_bg(active_vo.use_alternating_row_bg);
+    window.set_show_hidden_files(show_hidden || active_vo.show_hidden_files);
+
     // Rows, 3-Column Polaroid Icon Triples, and Miller Parent Columns
     let l_base_opt = (!l_filter.is_empty()).then_some(l_cur_path.as_str());
     let l_rows = build_slint_rows_from_flattened(
         &rt.left_entries,
         &rt.left_selected_indices,
         &mut rt.thumbnail_cache,
-        true,
+        &l_vo,
         l_base_opt,
     );
     let l_triples = if l_mode == 1 {
@@ -4853,6 +5094,7 @@ fn sync_window_from_runtime(window: &ManifoldWindow, rt: &mut GuiRuntime) {
             &rt.left_parent_entries,
             l_parent_sel,
             &mut rt.thumbnail_cache,
+            &l_vo,
         )
     } else {
         Vec::new()
@@ -4867,7 +5109,7 @@ fn sync_window_from_runtime(window: &ManifoldWindow, rt: &mut GuiRuntime) {
             &rt.right_entries,
             &rt.right_selected_indices,
             &mut rt.thumbnail_cache,
-            true,
+            &r_vo,
             r_base_opt,
         );
         let r_triples = if r_mode == 1 {
@@ -4884,6 +5126,7 @@ fn sync_window_from_runtime(window: &ManifoldWindow, rt: &mut GuiRuntime) {
                 &rt.right_parent_entries,
                 r_parent_sel,
                 &mut rt.thumbnail_cache,
+                &r_vo,
             )
         } else {
             Vec::new()
@@ -5557,11 +5800,37 @@ fn relative_parent_subpath(item_path: &str, base_dir: &str) -> Option<String> {
     }
 }
 
+/// Formats a [`SystemTime`](std::time::SystemTime) for List/Tree View columns, optionally using
+/// `"Today, HH:mm"` and `"Yesterday, HH:mm"` when `use_relative` is enabled.
+pub fn format_datetime_for_view(ts: Option<std::time::SystemTime>, use_relative: bool) -> String {
+    let Some(t) = ts else {
+        return "--".to_string();
+    };
+    let (y, m, d, hh, mm) = manifold_vfs::system_time_to_civil(t);
+    if use_relative {
+        let item_days = t
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|dur| (dur.as_secs() as i64).div_euclid(86_400))
+            .unwrap_or(-1);
+        let now_days = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|dur| (dur.as_secs() as i64).div_euclid(86_400))
+            .unwrap_or(-99);
+        if item_days == now_days {
+            return format!("Today, {hh:02}:{mm:02}");
+        }
+        if item_days + 1 == now_days {
+            return format!("Yesterday, {hh:02}:{mm:02}");
+        }
+    }
+    format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}")
+}
+
 fn build_slint_rows_from_flattened(
     entries: &[FlattenedRowEntry],
     selected_indices: &HashSet<usize>,
     thumb_cache: &mut HashMap<String, Option<Image>>,
-    load_thumbs: bool,
+    vo: &FolderViewOptions,
     search_base_dir: Option<&str>,
 ) -> Vec<FileRowSlint> {
     entries
@@ -5575,7 +5844,7 @@ fn build_slint_rows_from_flattened(
                 entry.is_expanded,
                 selected_indices.contains(&idx),
                 thumb_cache,
-                load_thumbs,
+                vo,
             );
             if let Some(base) = search_base_dir {
                 if let Some(sub) = relative_parent_subpath(&entry.meta.path, base) {
@@ -5592,6 +5861,7 @@ fn build_slint_rows_from_meta(
     entries: &[FileMetadata],
     selected_idx: Option<usize>,
     thumb_cache: &mut HashMap<String, Option<Image>>,
+    vo: &FolderViewOptions,
 ) -> Vec<FileRowSlint> {
     entries
         .iter()
@@ -5599,7 +5869,7 @@ fn build_slint_rows_from_meta(
         .take(320)
         .map(|(idx, meta)| {
             let is_sel = selected_idx == Some(idx);
-            meta_to_slint_row(meta, 0, false, is_sel, thumb_cache, true)
+            meta_to_slint_row(meta, 0, false, is_sel, thumb_cache, vo)
         })
         .collect()
 }
@@ -5685,15 +5955,16 @@ fn meta_to_slint_row(
     is_expanded: bool,
     is_selected: bool,
     thumb_cache: &mut HashMap<String, Option<Image>>,
-    load_thumbs: bool,
+    vo: &FolderViewOptions,
 ) -> FileRowSlint {
+    let load_thumbs = vo.show_icon_preview;
     let hex = meta.color_label.hex_color().unwrap_or("");
     let tag_name = color_label_to_name(meta.color_label);
     let brush = color_label_to_slint_color(meta.color_label);
     let tint = color_label_to_tint_color(meta.color_label);
     let ext_ref = meta.extension.as_deref();
     let is_app = is_macos_app_bundle(meta);
-    let is_browsable = is_browsable_folder(meta);
+    let is_browsable = is_browsable_folder_with_opts(meta, vo.treat_packages_as_folders);
     let is_img = is_image_extension(ext_ref);
     let is_exec = is_executable_file(meta);
     let is_local = split_remote_uri(&meta.path).is_none();
@@ -5729,12 +6000,38 @@ fn meta_to_slint_row(
         format_ext_badge(ext_ref)
     };
     let kind_str = if is_app { "Application" } else { &meta.kind };
+    let rel_dates = vo.use_relative_dates;
+    let modified_str = format_datetime_for_view(meta.modified, rel_dates);
+    let created_str = format_datetime_for_view(meta.created.or(meta.modified), rel_dates);
+    let added_str =
+        format_datetime_for_view(meta.added.or(meta.created).or(meta.modified), rel_dates);
+    let owner_str = meta
+        .owner
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("--");
+    let group_str = meta
+        .group
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("--");
+    let p_mat = meta.permissions_matrix();
+    let perms_str = format!(
+        "{} ({})",
+        p_mat.to_symbolic_string(),
+        p_mat.to_octal_string()
+    );
     FileRowSlint {
         name: SharedString::from(meta.display_name()),
         path: SharedString::from(&meta.path),
         ext_badge: SharedString::from(badge_str),
         size_text: SharedString::from(meta.formatted_size()),
-        modified_text: SharedString::from(meta.formatted_iso_datetime()),
+        modified_text: SharedString::from(modified_str),
+        created_text: SharedString::from(created_str),
+        added_text: SharedString::from(added_str),
+        owner_text: SharedString::from(owner_str),
+        group_text: SharedString::from(group_str),
+        permissions_text: SharedString::from(perms_str),
         kind_text: SharedString::from(kind_str),
         color_tag_hex: SharedString::from(hex),
         color_tag_name: SharedString::from(tag_name),
@@ -5759,6 +6056,11 @@ fn empty_slint_row() -> FileRowSlint {
         ext_badge: SharedString::default(),
         size_text: SharedString::default(),
         modified_text: SharedString::default(),
+        created_text: SharedString::default(),
+        added_text: SharedString::default(),
+        owner_text: SharedString::default(),
+        group_text: SharedString::default(),
+        permissions_text: SharedString::default(),
         kind_text: SharedString::default(),
         color_tag_hex: SharedString::default(),
         color_tag_name: SharedString::default(),
@@ -7291,6 +7593,18 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                     guard.unpin_folder_from_favorites("", &target_path);
                     guard.sync_selected_sidebar_to_active_dir();
                 }
+                "show_view_options" => {
+                    if let Some(w) = win_weak.upgrade() {
+                        w.set_view_options_scope_menu_open(false);
+                        w.set_view_options_sort_menu_open(false);
+                        w.set_view_options_icon_menu_open(false);
+                        w.set_view_options_font_menu_open(false);
+                        w.set_view_options_text_menu_open(false);
+                        w.set_show_view_options_popover(true);
+                        sync_window_from_runtime(&w, &mut guard);
+                        return;
+                    }
+                }
                 "compress" if !sel_list.is_empty() => {
                     if let Some(w) = win_weak.upgrade() {
                         let count = sel_list.len();
@@ -7987,17 +8301,13 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
         });
     }
 
-    // Column sorting (Name | Size | Date Modified)
+    // Column sorting (Name | Size | Kind | Date Modified | Date Added | Date Created | Permissions)
     {
         let rt = Rc::clone(&rt);
         let win_weak = window.as_weak();
         window.on_sort_by_column(move |is_right, col_str| {
             let mut guard = rt.borrow_mut();
-            let target_col = match col_str.as_str() {
-                "size" => SortColumn::Size,
-                "modified" => SortColumn::Modified,
-                _ => SortColumn::Name,
-            };
+            let target_col = str_to_sort_col(col_str.as_str());
             let tab_opt = if is_right {
                 let idx = guard.app_state.right_active_tab;
                 guard.app_state.right_tabs.get_mut(idx)
@@ -8539,6 +8849,151 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
             };
             let toast = format!("Font style set to \"{weight_lbl}\"");
             guard.show_toast("info", toast);
+            if let Some(w) = win_weak.upgrade() {
+                sync_window_from_runtime(&w, &mut guard);
+            }
+        });
+    }
+
+    // View Options Popover Callbacks (persisted to ~/.config/manifold/preferences.toml)
+    {
+        let rt = Rc::clone(&rt);
+        let win_weak = window.as_weak();
+        window.on_set_view_options_scope(move |scope_str| {
+            let mut guard = rt.borrow_mut();
+            let is_right = guard.is_right_effective();
+            let cur_dir = guard.current_pane_path(is_right);
+            let target_scope = match scope_str.as_str() {
+                "this_folder" => ViewOptionsScope::ThisFolder,
+                "this_folder_and_subfolders" | "this_and_subfolders" => {
+                    ViewOptionsScope::ThisFolderAndSubfolders
+                }
+                _ => ViewOptionsScope::AllFolders,
+            };
+            let mut vo = guard.prefs.effective_view_options(&cur_dir);
+            vo.scope = target_scope;
+            guard.prefs.save_view_options_for_path(&cur_dir, vo);
+            let _ = guard.prefs.save_default();
+            guard.reload_pane_entries(false);
+            guard.reload_pane_entries(true);
+            if let Some(w) = win_weak.upgrade() {
+                sync_window_from_runtime(&w, &mut guard);
+            }
+        });
+    }
+    {
+        let rt = Rc::clone(&rt);
+        let win_weak = window.as_weak();
+        window.on_set_view_options_sort(move |sort_str| {
+            let mut guard = rt.borrow_mut();
+            let is_right = guard.is_right_effective();
+            let cur_dir = guard.current_pane_path(is_right);
+            let mut vo = guard.prefs.effective_view_options(&cur_dir);
+            let target_col = str_to_sort_col(sort_str.as_str());
+            vo.sort_column = target_col;
+            if is_right {
+                let idx = guard.app_state.right_active_tab;
+                if let Some(tab) = guard.app_state.right_tabs.get_mut(idx) {
+                    tab.sort_column = target_col;
+                }
+            } else {
+                let idx = guard.app_state.left_active_tab;
+                if let Some(tab) = guard.app_state.left_tabs.get_mut(idx) {
+                    tab.sort_column = target_col;
+                }
+            }
+            guard.prefs.save_view_options_for_path(&cur_dir, vo);
+            let _ = guard.prefs.save_default();
+            guard.reload_pane_entries(false);
+            guard.reload_pane_entries(true);
+            if let Some(w) = win_weak.upgrade() {
+                sync_window_from_runtime(&w, &mut guard);
+            }
+        });
+    }
+    {
+        let rt = Rc::clone(&rt);
+        let win_weak = window.as_weak();
+        window.on_set_view_options_icon_size(move |size_px| {
+            let mut guard = rt.borrow_mut();
+            let is_right = guard.is_right_effective();
+            let cur_dir = guard.current_pane_path(is_right);
+            let mut vo = guard.prefs.effective_view_options(&cur_dir);
+            vo.icon_size = (size_px.clamp(16, 32)) as u16;
+            guard.prefs.save_view_options_for_path(&cur_dir, vo);
+            let _ = guard.prefs.save_default();
+            if let Some(w) = win_weak.upgrade() {
+                sync_window_from_runtime(&w, &mut guard);
+            }
+        });
+    }
+    {
+        let rt = Rc::clone(&rt);
+        let win_weak = window.as_weak();
+        window.on_toggle_view_options_option(move |opt_key| {
+            let mut guard = rt.borrow_mut();
+            let is_right = guard.is_right_effective();
+            let cur_dir = guard.current_pane_path(is_right);
+            let mut vo = guard.prefs.effective_view_options(&cur_dir);
+            match opt_key.as_str() {
+                "col_size" => vo.col_size = !vo.col_size,
+                "col_kind" => vo.col_kind = !vo.col_kind,
+                "col_modified" => vo.col_date_modified = !vo.col_date_modified,
+                "col_added" => vo.col_date_added = !vo.col_date_added,
+                "col_created" => vo.col_date_created = !vo.col_date_created,
+                "col_owner" => vo.col_owner = !vo.col_owner,
+                "col_group" => vo.col_group = !vo.col_group,
+                "col_permissions" => vo.col_permissions = !vo.col_permissions,
+                "col_tags" => vo.col_tags = !vo.col_tags,
+                "bold_folders" => vo.bold_folders = !vo.bold_folders,
+                "show_hidden" => {
+                    vo.show_hidden_files = !vo.show_hidden_files;
+                    guard.app_state.toolbar.show_hidden_files = vo.show_hidden_files;
+                }
+                "show_icon_preview" | "icon_preview" => {
+                    vo.show_icon_preview = !vo.show_icon_preview;
+                }
+                "treat_packages_as_folders" | "packages_as_folders" => {
+                    vo.treat_packages_as_folders = !vo.treat_packages_as_folders;
+                }
+                "show_folders_on_top" | "folders_on_top" => {
+                    vo.show_folders_on_top = !vo.show_folders_on_top;
+                }
+                "folders_always_alpha" | "folders_alpha" => {
+                    vo.folders_always_alpha = !vo.folders_always_alpha;
+                }
+                "use_relative_dates" | "relative_dates" => {
+                    vo.use_relative_dates = !vo.use_relative_dates;
+                }
+                "calculate_all_sizes" | "calc_all_sizes" => {
+                    vo.calculate_all_sizes = !vo.calculate_all_sizes;
+                }
+                "use_alternating_bg" | "alt_bg" => {
+                    vo.use_alternating_row_bg = !vo.use_alternating_row_bg;
+                }
+                _ => {}
+            }
+            guard.prefs.save_view_options_for_path(&cur_dir, vo);
+            let _ = guard.prefs.save_default();
+            guard.reload_pane_entries(false);
+            guard.reload_pane_entries(true);
+            if let Some(w) = win_weak.upgrade() {
+                sync_window_from_runtime(&w, &mut guard);
+            }
+        });
+    }
+    {
+        let rt = Rc::clone(&rt);
+        let win_weak = window.as_weak();
+        window.on_use_view_options_as_defaults(move || {
+            let mut guard = rt.borrow_mut();
+            let is_right = guard.is_right_effective();
+            let cur_dir = guard.current_pane_path(is_right);
+            let vo = guard.prefs.effective_view_options(&cur_dir);
+            guard.prefs.use_view_options_as_defaults(&cur_dir, vo);
+            let _ = guard.prefs.save_default();
+            guard.reload_pane_entries(false);
+            guard.reload_pane_entries(true);
             if let Some(w) = win_weak.upgrade() {
                 sync_window_from_runtime(&w, &mut guard);
             }
@@ -9407,6 +9862,7 @@ fn handle_keyboard_shortcut(
             || w.get_show_about_modal()
             || w.get_show_context_menu()
             || w.get_show_sidebar_context_menu()
+            || w.get_show_view_options_popover()
             || w.get_show_open_with_modal()
             || w.get_show_sibling_dropdown()
             || w.get_show_tasks_popover()
@@ -9423,6 +9879,12 @@ fn handle_keyboard_shortcut(
         w.set_show_about_modal(false);
         w.set_show_context_menu(false);
         w.set_show_sidebar_context_menu(false);
+        w.set_show_view_options_popover(false);
+        w.set_view_options_scope_menu_open(false);
+        w.set_view_options_sort_menu_open(false);
+        w.set_view_options_icon_menu_open(false);
+        w.set_view_options_font_menu_open(false);
+        w.set_view_options_text_menu_open(false);
         w.set_show_open_with_modal(false);
         w.set_show_sibling_dropdown(false);
         w.set_show_tasks_popover(false);
@@ -9564,6 +10026,16 @@ fn handle_keyboard_shortcut(
     }
     if cmd && !alt && !shift && k_low == "i" {
         w.invoke_execute_context_action("get_info".into());
+        return true;
+    }
+    if cmd && !alt && !shift && k_low == "j" {
+        let next = !w.get_show_view_options_popover();
+        w.set_view_options_scope_menu_open(false);
+        w.set_view_options_sort_menu_open(false);
+        w.set_view_options_icon_menu_open(false);
+        w.set_view_options_font_menu_open(false);
+        w.set_view_options_text_menu_open(false);
+        w.set_show_view_options_popover(next);
         return true;
     }
 
@@ -11458,5 +11930,54 @@ mod tests {
         assert_eq!(rt.app_state.toolbar.active_view_mode, PaneViewMode::Tree);
 
         let _ = std::fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn test_view_options_sorting_and_relative_dates() {
+        let ep = std::time::UNIX_EPOCH;
+        let mut dir_z = sample_meta("Zulu");
+        dir_z.is_dir = true;
+        dir_z.modified = Some(ep + Duration::from_secs(100));
+        let mut dir_a = sample_meta("Alpha");
+        dir_a.is_dir = true;
+        dir_a.modified = Some(ep + Duration::from_secs(900));
+        let mut file_m = sample_meta("middle.txt");
+        file_m.is_dir = false;
+        file_m.modified = Some(ep + Duration::from_secs(500));
+
+        let mut list = [dir_z.clone(), file_m.clone(), dir_a.clone()];
+        // 1. Folders on top + always sort folders alphabetically even when sorting by Modified Desc
+        sort_metadata_slice_with_options(
+            &mut list,
+            SortColumn::Modified,
+            SortDirection::Descending,
+            true,
+            true,
+            false,
+        );
+        assert_eq!(list[0].name, "Alpha");
+        assert_eq!(list[1].name, "Zulu");
+        assert_eq!(list[2].name, "middle.txt");
+
+        // 2. When folders_on_top is false, items are sorted purely by Modified Descending
+        let mut mixed = [dir_z, file_m, dir_a];
+        sort_metadata_slice_with_options(
+            &mut mixed,
+            SortColumn::Modified,
+            SortDirection::Descending,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(mixed[0].name, "Alpha");
+        assert_eq!(mixed[1].name, "middle.txt");
+        assert_eq!(mixed[2].name, "Zulu");
+
+        // 3. Relative date formatting produces "Today, HH:mm" for current time
+        let now_st = std::time::SystemTime::now();
+        let rel = format_datetime_for_view(Some(now_st), true);
+        assert!(rel.starts_with("Today, "), "Unexpected rel date: {rel}");
+        let abs = format_datetime_for_view(Some(now_st), false);
+        assert!(abs.contains('-'), "Unexpected abs date: {abs}");
     }
 }

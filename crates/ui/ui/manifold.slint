@@ -51,7 +51,12 @@ export struct FileRowSlint {
     ext-badge: string,
     size-text: string,
     modified-text: string,
+    created-text: string,
+    added-text: string,
     kind-text: string,
+    owner-text: string,
+    group-text: string,
+    permissions-text: string,
     color-tag-hex: string,
     color-tag-name: string,
     color-tag-brush: brush,
@@ -285,6 +290,8 @@ component LucideIcon inherits Rectangle {
             ? "M 4 4 L 20 4 A 2 2 0 0 1 22 6 L 22 18 A 2 2 0 0 1 20 20 L 4 20 A 2 2 0 0 1 2 18 L 2 6 A 2 2 0 0 1 4 4 Z"
             : root.kind == "pane-dual"
             ? "M 4 4 L 20 4 A 2 2 0 0 1 22 6 L 22 18 A 2 2 0 0 1 20 20 L 4 20 A 2 2 0 0 1 2 18 L 2 6 A 2 2 0 0 1 4 4 Z M 12 4 L 12 20"
+            : root.kind == "sliders"
+            ? "M 4 6 L 10 6 M 14 6 L 20 6 M 12 4 A 2 2 0 1 1 12 8 A 2 2 0 1 1 12 4 Z M 4 12 L 14 12 M 18 12 L 20 12 M 16 10 A 2 2 0 1 1 16 14 A 2 2 0 1 1 16 10 Z M 4 18 L 6 18 M 10 18 L 20 18 M 8 16 A 2 2 0 1 1 8 20 A 2 2 0 1 1 8 16 Z"
             : "M 14 2 L 6 2 A 2 2 0 0 0 4 4 L 4 20 A 2 2 0 0 0 6 22 L 18 22 A 2 2 0 0 0 20 20 L 20 8 Z M 14 2 L 14 8 L 20 8 M 8 13 L 16 13 M 8 17 L 13 17";
     }
 }
@@ -360,9 +367,16 @@ component CleanLineEdit inherits Rectangle {
 // - Primary Filename: 13.5px + font_delta (#ffffff selected, #e1e1e6 default)
 // - Tabular Monospace Size & Date Modified: 12.5px + font_delta (#d0d0d8 selected, #888892 default)
 export component FileRow inherits Rectangle {
+    in property <int> row_index: 0;
     in property <string> file_name;
     in property <string> file_size;
     in property <string> file_date;
+    in property <string> file_kind: "";
+    in property <string> file_created: "";
+    in property <string> file_added: "";
+    in property <string> file_owner: "";
+    in property <string> file_group: "";
+    in property <string> file_permissions: "";
     in property <string> ext_badge: "";
     in property <bool> is_dir: false;
     in property <bool> is_image: false;
@@ -380,11 +394,24 @@ export component FileRow inherits Rectangle {
     in property <brush> color_tag_tint: transparent;
     in property <length> size_col_width: 96px;
     in property <length> date_col_width: 145px;
+    in property <bool> show_col_size: true;
+    in property <bool> show_col_kind: false;
+    in property <bool> show_col_modified: true;
+    in property <bool> show_col_created: false;
+    in property <bool> show_col_added: false;
+    in property <bool> show_col_owner: false;
+    in property <bool> show_col_group: false;
+    in property <bool> show_col_permissions: false;
+    in property <bool> show_col_tags: true;
+    in property <bool> bold_folders: false;
+    in property <bool> use_alt_bg: false;
+    in property <length> view_icon_size: 16px;
     in property <bool> drag_drop_highlight: false;
     in property <length> font_delta: 1px;
     in property <bool> font_bold: false;
     in property <string> font_family: "";
     in property <brush> row_bg: #1A1A1E;
+    in property <brush> row_alt_bg: #1E1E24;
     in property <brush> row_hover_bg: #26262B;
     in property <brush> row_accent_bg: #0D52BF;
     in property <brush> text_primary: #e1e1e6;
@@ -405,7 +432,7 @@ export component FileRow inherits Rectangle {
     callback toggle-expand();
     callback wheel-scroll(length);
 
-    height: 28px + Math.max(0px, root.font_delta * 2.0);
+    height: 28px + Math.max(0px, root.font_delta * 2.0) + Math.max(0px, root.view_icon_size - 16px);
     border-radius: 4px;
     border-width: drag_drop_highlight ? 1px : 0px;
     border-color: drag_drop_highlight ? root.row_accent_bg : transparent;
@@ -415,7 +442,11 @@ export component FileRow inherits Rectangle {
             ? (pane_focused ? root.row_accent_bg : #2E323B)
             : (touch.has-hover
                 ? root.row_hover_bg
-                : (has_color_tag ? color_tag_tint : root.row_bg)));
+                : (has_color_tag
+                    ? color_tag_tint
+                    : (root.use_alt_bg && Math.mod(root.row_index, 2) == 1
+                        ? root.row_alt_bg
+                        : root.row_bg))));
 
     // Left vertical color tag accent bar for immediate visual feedback
     if root.has_color_tag : Rectangle {
@@ -535,15 +566,15 @@ export component FileRow inherits Rectangle {
             }
         }
 
-        // Vertically centered 18x18px Thumbnail or Vector File Type Icon (unified with Columns mode)
+        // Vertically centered Thumbnail or Vector File Type Icon (scaled by view_icon_size)
         Rectangle {
-            width: 20px;
+            width: Math.max(20px, root.view_icon_size + 4px);
             background: transparent;
             if !root.is_dir && root.has_thumbnail : Rectangle {
                 x: 0px;
                 y: (parent.height - self.height) / 2;
-                width: 20px;
-                height: 20px;
+                width: Math.max(20px, root.view_icon_size + 4px);
+                height: Math.max(20px, root.view_icon_size + 4px);
                 border-radius: 3px;
                 background: #121215;
                 border-width: 1px;
@@ -552,8 +583,8 @@ export component FileRow inherits Rectangle {
                 Image {
                     x: 1px;
                     y: 1px;
-                    width: 18px;
-                    height: 18px;
+                    width: Math.max(18px, root.view_icon_size + 2px);
+                    height: Math.max(18px, root.view_icon_size + 2px);
                     image-fit: contain;
                     source: root.thumbnail;
                 }
@@ -561,7 +592,7 @@ export component FileRow inherits Rectangle {
             if root.is_dir || !root.has_thumbnail : LucideIcon {
                 x: 2px;
                 y: (parent.height - self.height) / 2;
-                icon-size: 16px;
+                icon-size: root.view_icon_size;
                 kind: root.is_dir
                     ? "folder"
                     : (root.ext_badge == "APP"
@@ -588,20 +619,20 @@ export component FileRow inherits Rectangle {
             }
         }
 
-        // Primary Filename Text (scaled by font_delta, #ffffff selected)
+        // Primary Filename Text (scaled by font_delta, #ffffff selected, bold_folders support)
         Text {
             text: root.file_name;
             color: root.selected ? #ffffff : root.text_primary;
             font-size: 13.5px + root.font_delta;
             font-family: root.font_family;
-            font-weight: root.font_bold ? 700 : (root.has_color_tag ? 600 : 500);
+            font-weight: (root.font_bold || (root.is_dir && root.bold_folders)) ? 700 : (root.has_color_tag ? 600 : 500);
             vertical-alignment: center;
             horizontal-stretch: 1;
             overflow: elide;
         }
 
         // Labeled Color Tag Pill Badge ([ ● Orange ])
-        if root.has_color_tag : Rectangle {
+        if root.has_color_tag && root.show_col_tags : Rectangle {
             width: tag-pill-layout.preferred-width;
             height: 18px + Math.max(0px, root.font_delta * 0.5);
             y: (parent.height - self.height) / 2;
@@ -632,7 +663,7 @@ export component FileRow inherits Rectangle {
         }
 
         // Tabular Monospace Size Column (resizable width, right-aligned)
-        Text {
+        if root.show_col_size : Text {
             text: root.file_size;
             color: root.selected ? #d0d0d8 : root.text_muted;
             font-size: 12.5px + root.font_delta;
@@ -644,8 +675,21 @@ export component FileRow inherits Rectangle {
             overflow: elide;
         }
 
+        // Kind Column
+        if root.show_col_kind : Text {
+            text: root.file_kind;
+            color: root.selected ? #d0d0d8 : root.text_muted;
+            font-size: 12px + root.font_delta;
+            font-weight: root.font_bold ? 700 : 500;
+            font-family: root.font_family;
+            vertical-alignment: center;
+            horizontal-alignment: left;
+            width: 112px;
+            overflow: elide;
+        }
+
         // Tabular Monospace Date Modified Column (resizable width, right-aligned)
-        Text {
+        if root.show_col_modified : Text {
             text: root.file_date;
             color: root.selected ? #d0d0d8 : root.text_muted;
             font-size: 12.5px + root.font_delta;
@@ -654,6 +698,71 @@ export component FileRow inherits Rectangle {
             vertical-alignment: center;
             horizontal-alignment: right;
             width: root.date_col_width;
+            overflow: elide;
+        }
+
+        // Date Added Column
+        if root.show_col_added : Text {
+            text: root.file_added;
+            color: root.selected ? #d0d0d8 : root.text_muted;
+            font-size: 12px + root.font_delta;
+            font-weight: root.font_bold ? 700 : 500;
+            font-family: "monospace";
+            vertical-alignment: center;
+            horizontal-alignment: right;
+            width: 140px;
+            overflow: elide;
+        }
+
+        // Date Created Column
+        if root.show_col_created : Text {
+            text: root.file_created;
+            color: root.selected ? #d0d0d8 : root.text_muted;
+            font-size: 12px + root.font_delta;
+            font-weight: root.font_bold ? 700 : 500;
+            font-family: "monospace";
+            vertical-alignment: center;
+            horizontal-alignment: right;
+            width: 140px;
+            overflow: elide;
+        }
+
+        // Owner Column
+        if root.show_col_owner : Text {
+            text: root.file_owner;
+            color: root.selected ? #d0d0d8 : root.text_muted;
+            font-size: 12px + root.font_delta;
+            font-weight: root.font_bold ? 700 : 500;
+            font-family: "monospace";
+            vertical-alignment: center;
+            horizontal-alignment: left;
+            width: 84px;
+            overflow: elide;
+        }
+
+        // Group Column
+        if root.show_col_group : Text {
+            text: root.file_group;
+            color: root.selected ? #d0d0d8 : root.text_muted;
+            font-size: 12px + root.font_delta;
+            font-weight: root.font_bold ? 700 : 500;
+            font-family: "monospace";
+            vertical-alignment: center;
+            horizontal-alignment: left;
+            width: 84px;
+            overflow: elide;
+        }
+
+        // Permissions Column
+        if root.show_col_permissions : Text {
+            text: root.file_permissions;
+            color: root.selected ? #d0d0d8 : root.text_muted;
+            font-size: 12px + root.font_delta;
+            font-weight: root.font_bold ? 700 : 500;
+            font-family: "monospace";
+            vertical-alignment: center;
+            horizontal-alignment: right;
+            width: 92px;
             overflow: elide;
         }
     }
@@ -860,6 +969,70 @@ component PermCheckbox inherits Rectangle {
 
     TouchArea {
         clicked => { root.toggled(); }
+    }
+}
+
+component ViewOptionCheckboxRow inherits Rectangle {
+    in property <string> label;
+    in property <bool> checked: false;
+    in property <bool> enabled-state: true;
+    in property <length> indent: 0px;
+    in property <bool> small-text: false;
+    in property <brush> accent-bg: #0D52BF;
+    in property <brush> surface-bg: #1A1A1E;
+    in property <brush> border-brush: #28282D;
+    in property <brush> text-brush: #E1E1E6;
+    in property <string> font-family: "";
+    callback toggled();
+
+    height: root.small-text ? 18px : 20px;
+    opacity: root.enabled-state ? 1.0 : 0.42;
+    background: transparent;
+
+    HorizontalLayout {
+        padding-left: root.indent;
+        spacing: 7px;
+        alignment: start;
+
+        Rectangle {
+            width: root.small-text ? 13px : 15px;
+            height: root.small-text ? 13px : 15px;
+            y: (parent.height - self.height) / 2;
+            border-radius: 3.5px;
+            background: root.checked ? root.accent-bg : root.surface-bg;
+            border-width: 1px;
+            border-color: root.checked
+                ? root.accent-bg
+                : (row-touch.has-hover && root.enabled-state ? #52525E : root.border-brush);
+
+            if root.checked : LucideIcon {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                icon-size: root.small-text ? 9px : 11px;
+                kind: "check";
+                icon-color: #FFFFFF;
+            }
+        }
+
+        Text {
+            text: root.label;
+            color: root.text-brush;
+            font-size: root.small-text ? 11px : 12px;
+            font-family: root.font-family;
+            font-weight: 500;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+        }
+    }
+
+    row-touch := TouchArea {
+        mouse-cursor: root.enabled-state ? pointer : default;
+        clicked => {
+            if root.enabled-state {
+                root.toggled();
+            }
+        }
     }
 }
 
@@ -1224,6 +1397,7 @@ export component ManifoldWindow inherits Window {
     in-out property <brush> theme-bg-toolbar: #1E1E22;
     in-out property <brush> theme-bg-sidebar: #161618;
     in-out property <brush> theme-bg-surface: #1A1A1E;
+    in-out property <brush> theme-row-alt: #1E1E24;
     in-out property <brush> theme-bg-popover: #202024;
     in-out property <brush> theme-row-hover: #26262B;
     in-out property <brush> theme-bg-hover: root.theme-row-hover;
@@ -1325,6 +1499,61 @@ export component ManifoldWindow inherits Window {
     in-out property <bool> left-sort-ascending: true;
     in-out property <string> right-sort-column: "name";
     in-out property <bool> right-sort-ascending: true;
+
+    // File & Directory View Options (Show View Options Popover & Per-Pane Effective Options)
+    in-out property <bool> show-view-options-popover: false;
+    in-out property <bool> view-options-scope-menu-open: false;
+    in-out property <bool> view-options-sort-menu-open: false;
+    in-out property <bool> view-options-icon-menu-open: false;
+    in-out property <bool> view-options-font-menu-open: false;
+    in-out property <bool> view-options-text-menu-open: false;
+    in-out property <string> vo-scope: "all_folders";
+    in-out property <string> vo-sort-by: "name";
+    in-out property <int> vo-icon-size: 16;
+    in-out property <bool> vo-col-size: true;
+    in-out property <bool> vo-col-kind: false;
+    in-out property <bool> vo-col-modified: true;
+    in-out property <bool> vo-col-created: false;
+    in-out property <bool> vo-col-added: false;
+    in-out property <bool> vo-col-owner: false;
+    in-out property <bool> vo-col-group: false;
+    in-out property <bool> vo-col-permissions: false;
+    in-out property <bool> vo-col-tags: true;
+    in-out property <bool> vo-bold-folders: false;
+    in-out property <bool> vo-show-hidden: false;
+    in-out property <bool> vo-show-icon-preview: true;
+    in-out property <bool> vo-treat-packages-as-folders: false;
+    in-out property <bool> vo-show-folders-on-top: true;
+    in-out property <bool> vo-folders-always-alpha: false;
+    in-out property <bool> vo-use-relative-dates: false;
+    in-out property <bool> vo-calculate-all-sizes: false;
+    in-out property <bool> vo-use-alternating-bg: false;
+
+    in-out property <bool> left-col-size: true;
+    in-out property <bool> left-col-kind: false;
+    in-out property <bool> left-col-modified: true;
+    in-out property <bool> left-col-created: false;
+    in-out property <bool> left-col-added: false;
+    in-out property <bool> left-col-owner: false;
+    in-out property <bool> left-col-group: false;
+    in-out property <bool> left-col-permissions: false;
+    in-out property <bool> left-col-tags: true;
+    in-out property <int> left-icon-size: 16;
+    in-out property <bool> left-bold-folders: false;
+    in-out property <bool> left-alt-bg: false;
+
+    in-out property <bool> right-col-size: true;
+    in-out property <bool> right-col-kind: false;
+    in-out property <bool> right-col-modified: true;
+    in-out property <bool> right-col-created: false;
+    in-out property <bool> right-col-added: false;
+    in-out property <bool> right-col-owner: false;
+    in-out property <bool> right-col-group: false;
+    in-out property <bool> right-col-permissions: false;
+    in-out property <bool> right-col-tags: true;
+    in-out property <int> right-icon-size: 16;
+    in-out property <bool> right-bold-folders: false;
+    in-out property <bool> right-alt-bg: false;
 
     // Tab & Sidebar Favorite Drag-and-Drop Rearrangement State
     in-out property <bool> dragging-tab-active: false;
@@ -1643,6 +1872,11 @@ export component ManifoldWindow inherits Window {
     callback select-connect-color(int);
     callback resolve-conflict(string);
     callback handle-shortcut(string, bool, bool, bool, bool) -> bool;
+    callback toggle-view-options-option(string);
+    callback set-view-options-scope(string);
+    callback set-view-options-sort(string);
+    callback set-view-options-icon-size(int);
+    callback use-view-options-as-defaults();
 
     public function focus-filter-box() {
         filter-text-input.focus();
@@ -2936,17 +3170,17 @@ export component ManifoldWindow inherits Window {
                             }
                         }
 
-                        // TABLE HEADER ROW (Clean Title-Case "Name | Size | Date Modified" matching original screenshot)
+                        // TABLE HEADER ROW (Dynamic Columns controlled by Show View Options)
                         if root.left-view-mode == 0 || root.left-view-mode == 3 : Rectangle {
                             z: 10;
                             height: 26px + Math.max(0px, root.font-size-delta);
-                            background: #17171B;
+                            background: root.theme-bg-toolbar;
                             border-width: 1px;
-                            border-color: #26262B;
+                            border-color: root.theme-border;
                             HorizontalLayout {
                                 padding-left: 14px;
-                                padding-right: 26px;
-                                spacing: 4px;
+                                padding-right: 12px;
+                                spacing: 8px;
                                 Rectangle {
                                     horizontal-stretch: 1;
                                     background: l-name-hdr.has-hover ? root.theme-bg-hover : transparent;
@@ -2958,9 +3192,9 @@ export component ManifoldWindow inherits Window {
                                         alignment: start;
                                         Text {
                                             text: "Name";
-                                            color: root.left-sort-column == "name" ? #AEAEB8 : root.theme-text-muted;
+                                            color: root.left-sort-column == "name" ? root.theme-text-primary : root.theme-text-muted;
                                             font-size: 12px + root.font-size-delta * 0.75;
-                                            font-weight: 500;
+                                            font-weight: root.left-sort-column == "name" ? 600 : 500;
                                             horizontal-alignment: left;
                                             vertical-alignment: center;
                                         }
@@ -2970,8 +3204,8 @@ export component ManifoldWindow inherits Window {
                                             kind: root.left-sort-column == "name"
                                                 ? (root.left-sort-ascending ? "chevron-up" : "chevron-down")
                                                 : "arrow-up-down";
-                                            icon-color: #8E8E98;
-                                            opacity: l-name-hdr.has-hover ? 0.85 : (root.left-sort-column == "name" ? 0.55 : 0.0);
+                                            icon-color: root.theme-text-secondary;
+                                            opacity: l-name-hdr.has-hover ? 0.85 : (root.left-sort-column == "name" ? 0.75 : 0.0);
                                         }
                                     }
                                     l-name-hdr := TouchArea {
@@ -2981,36 +3215,7 @@ export component ManifoldWindow inherits Window {
                                         }
                                     }
                                 }
-                                Rectangle {
-                                    width: 6px;
-                                    background: transparent;
-                                    Rectangle {
-                                        x: 2px;
-                                        y: 4px;
-                                        width: 1px;
-                                        height: parent.height - 8px;
-                                        background: l-col-resizer-1.has-hover || l-col-resizer-1.pressed ? root.theme-accent : #2E2E36;
-                                    }
-                                    l-col-resizer-1 := TouchArea {
-                                        mouse-cursor: col-resize;
-                                        pointer-event(ev) => {
-                                            if ev.button == PointerEventButton.left && ev.kind == PointerEventKind.down {
-                                                root.col-resize-start-x = self.absolute-position.x + self.mouse-x;
-                                                root.col-resize-start-w = root.size-col-width;
-                                            }
-                                        }
-                                        moved => {
-                                            if self.pressed {
-                                                root.size-col-width = Math.clamp(
-                                                    root.col-resize-start-w - ((self.absolute-position.x + self.mouse-x) - root.col-resize-start-x),
-                                                    68px,
-                                                    260px
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                                Rectangle {
+                                if root.left-col-size : Rectangle {
                                     width: root.size-col-width;
                                     background: l-size-hdr.has-hover ? root.theme-bg-hover : transparent;
                                     border-radius: 3px;
@@ -3021,9 +3226,9 @@ export component ManifoldWindow inherits Window {
                                         alignment: end;
                                         Text {
                                             text: "Size";
-                                            color: root.left-sort-column == "size" ? #AEAEB8 : root.theme-text-muted;
+                                            color: root.left-sort-column == "size" ? root.theme-text-primary : root.theme-text-muted;
                                             font-size: 12px + root.font-size-delta * 0.75;
-                                            font-weight: 500;
+                                            font-weight: root.left-sort-column == "size" ? 600 : 500;
                                             horizontal-alignment: right;
                                             vertical-alignment: center;
                                         }
@@ -3033,7 +3238,7 @@ export component ManifoldWindow inherits Window {
                                             kind: root.left-sort-column == "size"
                                                 ? (root.left-sort-ascending ? "chevron-up" : "chevron-down")
                                                 : "arrow-up-down";
-                                            icon-color: #8E8E98;
+                                            icon-color: root.theme-text-secondary;
                                             opacity: (root.left-sort-column == "size" || l-size-hdr.has-hover) ? 0.75 : 0.0;
                                         }
                                     }
@@ -3044,36 +3249,41 @@ export component ManifoldWindow inherits Window {
                                         }
                                     }
                                 }
-                                Rectangle {
-                                    width: 6px;
-                                    background: transparent;
-                                    Rectangle {
-                                        x: 2px;
-                                        y: 4px;
-                                        width: 1px;
-                                        height: parent.height - 8px;
-                                        background: l-col-resizer-2.has-hover || l-col-resizer-2.pressed ? root.theme-accent : #2E2E36;
-                                    }
-                                    l-col-resizer-2 := TouchArea {
-                                        mouse-cursor: col-resize;
-                                        pointer-event(ev) => {
-                                            if ev.button == PointerEventButton.left && ev.kind == PointerEventKind.down {
-                                                root.col-resize-start-x = self.absolute-position.x + self.mouse-x;
-                                                root.col-resize-start-w = root.date-col-width;
-                                            }
+                                if root.left-col-kind : Rectangle {
+                                    width: 112px;
+                                    background: l-kind-hdr.has-hover ? root.theme-bg-hover : transparent;
+                                    border-radius: 3px;
+                                    HorizontalLayout {
+                                        padding-left: 4px;
+                                        padding-right: 4px;
+                                        spacing: 4px;
+                                        alignment: start;
+                                        Text {
+                                            text: "Kind";
+                                            color: root.left-sort-column == "kind" ? root.theme-text-primary : root.theme-text-muted;
+                                            font-size: 12px + root.font-size-delta * 0.75;
+                                            font-weight: root.left-sort-column == "kind" ? 600 : 500;
+                                            horizontal-alignment: left;
+                                            vertical-alignment: center;
                                         }
-                                        moved => {
-                                            if self.pressed {
-                                                root.date-col-width = Math.clamp(
-                                                    root.col-resize-start-w - ((self.absolute-position.x + self.mouse-x) - root.col-resize-start-x),
-                                                    115px,
-                                                    300px
-                                                );
-                                            }
+                                        LucideIcon {
+                                            y: (parent.height - self.height) / 2;
+                                            icon-size: 10px;
+                                            kind: root.left-sort-column == "kind"
+                                                ? (root.left-sort-ascending ? "chevron-up" : "chevron-down")
+                                                : "arrow-up-down";
+                                            icon-color: root.theme-text-secondary;
+                                            opacity: (root.left-sort-column == "kind" || l-kind-hdr.has-hover) ? 0.75 : 0.0;
+                                        }
+                                    }
+                                    l-kind-hdr := TouchArea {
+                                        clicked => {
+                                            key-router.focus();
+                                            root.sort-by-column(false, "kind");
                                         }
                                     }
                                 }
-                                Rectangle {
+                                if root.left-col-modified : Rectangle {
                                     width: root.date-col-width;
                                     background: l-date-hdr.has-hover ? root.theme-bg-hover : transparent;
                                     border-radius: 3px;
@@ -3084,9 +3294,9 @@ export component ManifoldWindow inherits Window {
                                         alignment: end;
                                         Text {
                                             text: "Date Modified";
-                                            color: root.left-sort-column == "modified" ? #AEAEB8 : root.theme-text-muted;
+                                            color: root.left-sort-column == "modified" ? root.theme-text-primary : root.theme-text-muted;
                                             font-size: 12px + root.font-size-delta * 0.75;
-                                            font-weight: 500;
+                                            font-weight: root.left-sort-column == "modified" ? 600 : 500;
                                             horizontal-alignment: right;
                                             vertical-alignment: center;
                                         }
@@ -3096,7 +3306,7 @@ export component ManifoldWindow inherits Window {
                                             kind: root.left-sort-column == "modified"
                                                 ? (root.left-sort-ascending ? "chevron-up" : "chevron-down")
                                                 : "arrow-up-down";
-                                            icon-color: #8E8E98;
+                                            icon-color: root.theme-text-secondary;
                                             opacity: (root.left-sort-column == "modified" || l-date-hdr.has-hover) ? 0.75 : 0.0;
                                         }
                                     }
@@ -3104,6 +3314,132 @@ export component ManifoldWindow inherits Window {
                                         clicked => {
                                             key-router.focus();
                                             root.sort-by-column(false, "modified");
+                                        }
+                                    }
+                                }
+                                if root.left-col-added : Rectangle {
+                                    width: 140px;
+                                    background: l-added-hdr.has-hover ? root.theme-bg-hover : transparent;
+                                    border-radius: 3px;
+                                    HorizontalLayout {
+                                        padding-left: 4px;
+                                        padding-right: 4px;
+                                        spacing: 4px;
+                                        alignment: end;
+                                        Text {
+                                            text: "Date Added";
+                                            color: root.left-sort-column == "added" ? root.theme-text-primary : root.theme-text-muted;
+                                            font-size: 12px + root.font-size-delta * 0.75;
+                                            font-weight: root.left-sort-column == "added" ? 600 : 500;
+                                            horizontal-alignment: right;
+                                            vertical-alignment: center;
+                                        }
+                                        LucideIcon {
+                                            y: (parent.height - self.height) / 2;
+                                            icon-size: 10px;
+                                            kind: root.left-sort-column == "added"
+                                                ? (root.left-sort-ascending ? "chevron-up" : "chevron-down")
+                                                : "arrow-up-down";
+                                            icon-color: root.theme-text-secondary;
+                                            opacity: (root.left-sort-column == "added" || l-added-hdr.has-hover) ? 0.75 : 0.0;
+                                        }
+                                    }
+                                    l-added-hdr := TouchArea {
+                                        clicked => {
+                                            key-router.focus();
+                                            root.sort-by-column(false, "added");
+                                        }
+                                    }
+                                }
+                                if root.left-col-created : Rectangle {
+                                    width: 140px;
+                                    background: l-created-hdr.has-hover ? root.theme-bg-hover : transparent;
+                                    border-radius: 3px;
+                                    HorizontalLayout {
+                                        padding-left: 4px;
+                                        padding-right: 4px;
+                                        spacing: 4px;
+                                        alignment: end;
+                                        Text {
+                                            text: "Date Created";
+                                            color: root.left-sort-column == "created" ? root.theme-text-primary : root.theme-text-muted;
+                                            font-size: 12px + root.font-size-delta * 0.75;
+                                            font-weight: root.left-sort-column == "created" ? 600 : 500;
+                                            horizontal-alignment: right;
+                                            vertical-alignment: center;
+                                        }
+                                        LucideIcon {
+                                            y: (parent.height - self.height) / 2;
+                                            icon-size: 10px;
+                                            kind: root.left-sort-column == "created"
+                                                ? (root.left-sort-ascending ? "chevron-up" : "chevron-down")
+                                                : "arrow-up-down";
+                                            icon-color: root.theme-text-secondary;
+                                            opacity: (root.left-sort-column == "created" || l-created-hdr.has-hover) ? 0.75 : 0.0;
+                                        }
+                                    }
+                                    l-created-hdr := TouchArea {
+                                        clicked => {
+                                            key-router.focus();
+                                            root.sort-by-column(false, "created");
+                                        }
+                                    }
+                                }
+                                if root.left-col-owner : Rectangle {
+                                    width: 84px;
+                                    background: transparent;
+                                    Text {
+                                        text: "Owner";
+                                        color: root.theme-text-muted;
+                                        font-size: 12px + root.font-size-delta * 0.75;
+                                        font-weight: 500;
+                                        horizontal-alignment: left;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                if root.left-col-group : Rectangle {
+                                    width: 84px;
+                                    background: transparent;
+                                    Text {
+                                        text: "Group";
+                                        color: root.theme-text-muted;
+                                        font-size: 12px + root.font-size-delta * 0.75;
+                                        font-weight: 500;
+                                        horizontal-alignment: left;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                if root.left-col-permissions : Rectangle {
+                                    width: 92px;
+                                    background: l-perm-hdr.has-hover ? root.theme-bg-hover : transparent;
+                                    border-radius: 3px;
+                                    HorizontalLayout {
+                                        padding-left: 4px;
+                                        padding-right: 4px;
+                                        spacing: 4px;
+                                        alignment: end;
+                                        Text {
+                                            text: "Permissions";
+                                            color: root.left-sort-column == "permissions" ? root.theme-text-primary : root.theme-text-muted;
+                                            font-size: 12px + root.font-size-delta * 0.75;
+                                            font-weight: root.left-sort-column == "permissions" ? 600 : 500;
+                                            horizontal-alignment: right;
+                                            vertical-alignment: center;
+                                        }
+                                        LucideIcon {
+                                            y: (parent.height - self.height) / 2;
+                                            icon-size: 10px;
+                                            kind: root.left-sort-column == "permissions"
+                                                ? (root.left-sort-ascending ? "chevron-up" : "chevron-down")
+                                                : "arrow-up-down";
+                                            icon-color: root.theme-text-secondary;
+                                            opacity: (root.left-sort-column == "permissions" || l-perm-hdr.has-hover) ? 0.75 : 0.0;
+                                        }
+                                    }
+                                    l-perm-hdr := TouchArea {
+                                        clicked => {
+                                            key-router.focus();
+                                            root.sort-by-column(false, "permissions");
                                         }
                                     }
                                 }
@@ -3154,7 +3490,18 @@ export component ManifoldWindow inherits Window {
                                 height: parent.height;
                                 interactive: false;
                                 viewport-width: (root.left-view-mode == 0 || root.left-view-mode == 3)
-                                    ? Math.max(self.width, 320px + root.size-col-width + root.date-col-width)
+                                    ? Math.max(
+                                        self.width,
+                                        260px
+                                            + (root.left-col-size ? root.size-col-width : 0px)
+                                            + (root.left-col-kind ? 120px : 0px)
+                                            + (root.left-col-modified ? root.date-col-width : 0px)
+                                            + (root.left-col-added ? 140px : 0px)
+                                            + (root.left-col-created ? 140px : 0px)
+                                            + (root.left-col-owner ? 96px : 0px)
+                                            + (root.left-col-group ? 96px : 0px)
+                                            + (root.left-col-permissions ? 116px : 0px)
+                                    )
                                     : (root.left-view-mode == 2
                                         ? Math.max(self.width, 460px)
                                         : Math.max(self.width, 360px));
@@ -3261,9 +3608,16 @@ export component ManifoldWindow inherits Window {
                                         padding-top: 4px;
                                         spacing: 1px;
                                         for row[r-idx] in root.left-rows : FileRow {
+                                            row_index: r-idx;
                                             file_name: row.name;
                                             file_size: row.size-text;
                                             file_date: row.modified-text;
+                                            file_kind: row.kind-text;
+                                            file_created: row.created-text;
+                                            file_added: row.added-text;
+                                            file_owner: row.owner-text;
+                                            file_group: row.group-text;
+                                            file_permissions: row.permissions-text;
                                             ext_badge: row.ext-badge;
                                             is_dir: row.is-dir;
                                             is_image: row.is-image;
@@ -3281,10 +3635,23 @@ export component ManifoldWindow inherits Window {
                                             color_tag_tint: row.color-tag-tint;
                                             size_col_width: root.size-col-width;
                                             date_col_width: root.date-col-width;
+                                            show_col_size: root.left-col-size;
+                                            show_col_kind: root.left-col-kind;
+                                            show_col_modified: root.left-col-modified;
+                                            show_col_created: root.left-col-created;
+                                            show_col_added: root.left-col-added;
+                                            show_col_owner: root.left-col-owner;
+                                            show_col_group: root.left-col-group;
+                                            show_col_permissions: root.left-col-permissions;
+                                            show_col_tags: root.left-col-tags;
+                                            bold_folders: root.left-bold-folders;
+                                            use_alt_bg: root.left-alt-bg;
+                                            view_icon_size: root.left-icon-size * 1px;
                                             font_delta: root.font-size-delta;
                                             font_bold: root.ui-font-bold;
                                             font_family: root.resolved-font-family;
                                             row_bg: root.theme-bg-surface;
+                                            row_alt_bg: root.theme-row-alt;
                                             row_hover_bg: root.theme-bg-hover;
                                             row_accent_bg: root.theme-accent;
                                             text_primary: root.theme-text-primary;
@@ -4502,17 +4869,17 @@ export component ManifoldWindow inherits Window {
                             }
                         }
 
-                        // Right Pane Table Header Row (Clean Title-Case "Name | Size | Date Modified")
+                        // Right Pane Table Header Row (Dynamic Columns controlled by Show View Options)
                         if root.right-view-mode == 0 || root.right-view-mode == 3 : Rectangle {
                             z: 10;
                             height: 26px + Math.max(0px, root.font-size-delta);
-                            background: #17171B;
+                            background: root.theme-bg-toolbar;
                             border-width: 1px;
-                            border-color: #26262B;
+                            border-color: root.theme-border;
                             HorizontalLayout {
                                 padding-left: 14px;
-                                padding-right: 26px;
-                                spacing: 4px;
+                                padding-right: 12px;
+                                spacing: 8px;
                                 Rectangle {
                                     horizontal-stretch: 1;
                                     background: r-name-hdr.has-hover ? root.theme-bg-hover : transparent;
@@ -4524,9 +4891,9 @@ export component ManifoldWindow inherits Window {
                                         alignment: start;
                                         Text {
                                             text: "Name";
-                                            color: root.right-sort-column == "name" ? #AEAEB8 : root.theme-text-muted;
+                                            color: root.right-sort-column == "name" ? root.theme-text-primary : root.theme-text-muted;
                                             font-size: 12px + root.font-size-delta * 0.75;
-                                            font-weight: 500;
+                                            font-weight: root.right-sort-column == "name" ? 600 : 500;
                                             horizontal-alignment: left;
                                             vertical-alignment: center;
                                         }
@@ -4536,8 +4903,8 @@ export component ManifoldWindow inherits Window {
                                             kind: root.right-sort-column == "name"
                                                 ? (root.right-sort-ascending ? "chevron-up" : "chevron-down")
                                                 : "arrow-up-down";
-                                            icon-color: #8E8E98;
-                                            opacity: r-name-hdr.has-hover ? 0.85 : (root.right-sort-column == "name" ? 0.55 : 0.0);
+                                            icon-color: root.theme-text-secondary;
+                                            opacity: r-name-hdr.has-hover ? 0.85 : (root.right-sort-column == "name" ? 0.75 : 0.0);
                                         }
                                     }
                                     r-name-hdr := TouchArea {
@@ -4547,36 +4914,7 @@ export component ManifoldWindow inherits Window {
                                         }
                                     }
                                 }
-                                Rectangle {
-                                    width: 6px;
-                                    background: transparent;
-                                    Rectangle {
-                                        x: 2px;
-                                        y: 4px;
-                                        width: 1px;
-                                        height: parent.height - 8px;
-                                        background: r-col-resizer-1.has-hover || r-col-resizer-1.pressed ? root.theme-accent : #2E2E36;
-                                    }
-                                    r-col-resizer-1 := TouchArea {
-                                        mouse-cursor: col-resize;
-                                        pointer-event(ev) => {
-                                            if ev.button == PointerEventButton.left && ev.kind == PointerEventKind.down {
-                                                root.col-resize-start-x = self.absolute-position.x + self.mouse-x;
-                                                root.col-resize-start-w = root.size-col-width;
-                                            }
-                                        }
-                                        moved => {
-                                            if self.pressed {
-                                                root.size-col-width = Math.clamp(
-                                                    root.col-resize-start-w - ((self.absolute-position.x + self.mouse-x) - root.col-resize-start-x),
-                                                    68px,
-                                                    260px
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                                Rectangle {
+                                if root.right-col-size : Rectangle {
                                     width: root.size-col-width;
                                     background: r-size-hdr.has-hover ? root.theme-bg-hover : transparent;
                                     border-radius: 3px;
@@ -4587,9 +4925,9 @@ export component ManifoldWindow inherits Window {
                                         alignment: end;
                                         Text {
                                             text: "Size";
-                                            color: root.right-sort-column == "size" ? #AEAEB8 : root.theme-text-muted;
+                                            color: root.right-sort-column == "size" ? root.theme-text-primary : root.theme-text-muted;
                                             font-size: 12px + root.font-size-delta * 0.75;
-                                            font-weight: 500;
+                                            font-weight: root.right-sort-column == "size" ? 600 : 500;
                                             horizontal-alignment: right;
                                             vertical-alignment: center;
                                         }
@@ -4599,7 +4937,7 @@ export component ManifoldWindow inherits Window {
                                             kind: root.right-sort-column == "size"
                                                 ? (root.right-sort-ascending ? "chevron-up" : "chevron-down")
                                                 : "arrow-up-down";
-                                            icon-color: #8E8E98;
+                                            icon-color: root.theme-text-secondary;
                                             opacity: (root.right-sort-column == "size" || r-size-hdr.has-hover) ? 0.75 : 0.0;
                                         }
                                     }
@@ -4610,36 +4948,41 @@ export component ManifoldWindow inherits Window {
                                         }
                                     }
                                 }
-                                Rectangle {
-                                    width: 6px;
-                                    background: transparent;
-                                    Rectangle {
-                                        x: 2px;
-                                        y: 4px;
-                                        width: 1px;
-                                        height: parent.height - 8px;
-                                        background: r-col-resizer-2.has-hover || r-col-resizer-2.pressed ? root.theme-accent : #2E2E36;
-                                    }
-                                    r-col-resizer-2 := TouchArea {
-                                        mouse-cursor: col-resize;
-                                        pointer-event(ev) => {
-                                            if ev.button == PointerEventButton.left && ev.kind == PointerEventKind.down {
-                                                root.col-resize-start-x = self.absolute-position.x + self.mouse-x;
-                                                root.col-resize-start-w = root.date-col-width;
-                                            }
+                                if root.right-col-kind : Rectangle {
+                                    width: 112px;
+                                    background: r-kind-hdr.has-hover ? root.theme-bg-hover : transparent;
+                                    border-radius: 3px;
+                                    HorizontalLayout {
+                                        padding-left: 4px;
+                                        padding-right: 4px;
+                                        spacing: 4px;
+                                        alignment: start;
+                                        Text {
+                                            text: "Kind";
+                                            color: root.right-sort-column == "kind" ? root.theme-text-primary : root.theme-text-muted;
+                                            font-size: 12px + root.font-size-delta * 0.75;
+                                            font-weight: root.right-sort-column == "kind" ? 600 : 500;
+                                            horizontal-alignment: left;
+                                            vertical-alignment: center;
                                         }
-                                        moved => {
-                                            if self.pressed {
-                                                root.date-col-width = Math.clamp(
-                                                    root.col-resize-start-w - ((self.absolute-position.x + self.mouse-x) - root.col-resize-start-x),
-                                                    115px,
-                                                    300px
-                                                );
-                                            }
+                                        LucideIcon {
+                                            y: (parent.height - self.height) / 2;
+                                            icon-size: 10px;
+                                            kind: root.right-sort-column == "kind"
+                                                ? (root.right-sort-ascending ? "chevron-up" : "chevron-down")
+                                                : "arrow-up-down";
+                                            icon-color: root.theme-text-secondary;
+                                            opacity: (root.right-sort-column == "kind" || r-kind-hdr.has-hover) ? 0.75 : 0.0;
+                                        }
+                                    }
+                                    r-kind-hdr := TouchArea {
+                                        clicked => {
+                                            key-router.focus();
+                                            root.sort-by-column(true, "kind");
                                         }
                                     }
                                 }
-                                Rectangle {
+                                if root.right-col-modified : Rectangle {
                                     width: root.date-col-width;
                                     background: r-date-hdr.has-hover ? root.theme-bg-hover : transparent;
                                     border-radius: 3px;
@@ -4650,9 +4993,9 @@ export component ManifoldWindow inherits Window {
                                         alignment: end;
                                         Text {
                                             text: "Date Modified";
-                                            color: root.right-sort-column == "modified" ? #AEAEB8 : root.theme-text-muted;
+                                            color: root.right-sort-column == "modified" ? root.theme-text-primary : root.theme-text-muted;
                                             font-size: 12px + root.font-size-delta * 0.75;
-                                            font-weight: 500;
+                                            font-weight: root.right-sort-column == "modified" ? 600 : 500;
                                             horizontal-alignment: right;
                                             vertical-alignment: center;
                                         }
@@ -4662,7 +5005,7 @@ export component ManifoldWindow inherits Window {
                                             kind: root.right-sort-column == "modified"
                                                 ? (root.right-sort-ascending ? "chevron-up" : "chevron-down")
                                                 : "arrow-up-down";
-                                            icon-color: #8E8E98;
+                                            icon-color: root.theme-text-secondary;
                                             opacity: (root.right-sort-column == "modified" || r-date-hdr.has-hover) ? 0.75 : 0.0;
                                         }
                                     }
@@ -4670,6 +5013,132 @@ export component ManifoldWindow inherits Window {
                                         clicked => {
                                             key-router.focus();
                                             root.sort-by-column(true, "modified");
+                                        }
+                                    }
+                                }
+                                if root.right-col-added : Rectangle {
+                                    width: 140px;
+                                    background: r-added-hdr.has-hover ? root.theme-bg-hover : transparent;
+                                    border-radius: 3px;
+                                    HorizontalLayout {
+                                        padding-left: 4px;
+                                        padding-right: 4px;
+                                        spacing: 4px;
+                                        alignment: end;
+                                        Text {
+                                            text: "Date Added";
+                                            color: root.right-sort-column == "added" ? root.theme-text-primary : root.theme-text-muted;
+                                            font-size: 12px + root.font-size-delta * 0.75;
+                                            font-weight: root.right-sort-column == "added" ? 600 : 500;
+                                            horizontal-alignment: right;
+                                            vertical-alignment: center;
+                                        }
+                                        LucideIcon {
+                                            y: (parent.height - self.height) / 2;
+                                            icon-size: 10px;
+                                            kind: root.right-sort-column == "added"
+                                                ? (root.right-sort-ascending ? "chevron-up" : "chevron-down")
+                                                : "arrow-up-down";
+                                            icon-color: root.theme-text-secondary;
+                                            opacity: (root.right-sort-column == "added" || r-added-hdr.has-hover) ? 0.75 : 0.0;
+                                        }
+                                    }
+                                    r-added-hdr := TouchArea {
+                                        clicked => {
+                                            key-router.focus();
+                                            root.sort-by-column(true, "added");
+                                        }
+                                    }
+                                }
+                                if root.right-col-created : Rectangle {
+                                    width: 140px;
+                                    background: r-created-hdr.has-hover ? root.theme-bg-hover : transparent;
+                                    border-radius: 3px;
+                                    HorizontalLayout {
+                                        padding-left: 4px;
+                                        padding-right: 4px;
+                                        spacing: 4px;
+                                        alignment: end;
+                                        Text {
+                                            text: "Date Created";
+                                            color: root.right-sort-column == "created" ? root.theme-text-primary : root.theme-text-muted;
+                                            font-size: 12px + root.font-size-delta * 0.75;
+                                            font-weight: root.right-sort-column == "created" ? 600 : 500;
+                                            horizontal-alignment: right;
+                                            vertical-alignment: center;
+                                        }
+                                        LucideIcon {
+                                            y: (parent.height - self.height) / 2;
+                                            icon-size: 10px;
+                                            kind: root.right-sort-column == "created"
+                                                ? (root.right-sort-ascending ? "chevron-up" : "chevron-down")
+                                                : "arrow-up-down";
+                                            icon-color: root.theme-text-secondary;
+                                            opacity: (root.right-sort-column == "created" || r-created-hdr.has-hover) ? 0.75 : 0.0;
+                                        }
+                                    }
+                                    r-created-hdr := TouchArea {
+                                        clicked => {
+                                            key-router.focus();
+                                            root.sort-by-column(true, "created");
+                                        }
+                                    }
+                                }
+                                if root.right-col-owner : Rectangle {
+                                    width: 84px;
+                                    background: transparent;
+                                    Text {
+                                        text: "Owner";
+                                        color: root.theme-text-muted;
+                                        font-size: 12px + root.font-size-delta * 0.75;
+                                        font-weight: 500;
+                                        horizontal-alignment: left;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                if root.right-col-group : Rectangle {
+                                    width: 84px;
+                                    background: transparent;
+                                    Text {
+                                        text: "Group";
+                                        color: root.theme-text-muted;
+                                        font-size: 12px + root.font-size-delta * 0.75;
+                                        font-weight: 500;
+                                        horizontal-alignment: left;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                if root.right-col-permissions : Rectangle {
+                                    width: 92px;
+                                    background: r-perm-hdr.has-hover ? root.theme-bg-hover : transparent;
+                                    border-radius: 3px;
+                                    HorizontalLayout {
+                                        padding-left: 4px;
+                                        padding-right: 4px;
+                                        spacing: 4px;
+                                        alignment: end;
+                                        Text {
+                                            text: "Permissions";
+                                            color: root.right-sort-column == "permissions" ? root.theme-text-primary : root.theme-text-muted;
+                                            font-size: 12px + root.font-size-delta * 0.75;
+                                            font-weight: root.right-sort-column == "permissions" ? 600 : 500;
+                                            horizontal-alignment: right;
+                                            vertical-alignment: center;
+                                        }
+                                        LucideIcon {
+                                            y: (parent.height - self.height) / 2;
+                                            icon-size: 10px;
+                                            kind: root.right-sort-column == "permissions"
+                                                ? (root.right-sort-ascending ? "chevron-up" : "chevron-down")
+                                                : "arrow-up-down";
+                                            icon-color: root.theme-text-secondary;
+                                            opacity: (root.right-sort-column == "permissions" || r-perm-hdr.has-hover) ? 0.75 : 0.0;
+                                        }
+                                    }
+                                    r-perm-hdr := TouchArea {
+                                        clicked => {
+                                            key-router.focus();
+                                            root.sort-by-column(true, "permissions");
                                         }
                                     }
                                 }
@@ -4812,7 +5281,18 @@ export component ManifoldWindow inherits Window {
                                 interactive: false;
                                 viewport-y <=> root.right-scroll-y;
                                 viewport-width: (root.right-view-mode == 0 || root.right-view-mode == 3)
-                                    ? Math.max(self.width, 320px + root.size-col-width + root.date-col-width)
+                                    ? Math.max(
+                                        self.width,
+                                        260px
+                                            + (root.right-col-size ? root.size-col-width : 0px)
+                                            + (root.right-col-kind ? 120px : 0px)
+                                            + (root.right-col-modified ? root.date-col-width : 0px)
+                                            + (root.right-col-added ? 140px : 0px)
+                                            + (root.right-col-created ? 140px : 0px)
+                                            + (root.right-col-owner ? 96px : 0px)
+                                            + (root.right-col-group ? 96px : 0px)
+                                            + (root.right-col-permissions ? 116px : 0px)
+                                    )
                                     : (root.right-view-mode == 2
                                         ? Math.max(self.width, root.miller-col-width * 2 + 280px)
                                         : Math.max(self.width, 360px));
@@ -4834,9 +5314,16 @@ export component ManifoldWindow inherits Window {
                                         padding-top: 4px;
                                         spacing: 1px;
                                         for row[r-idx] in root.right-rows : FileRow {
+                                            row_index: r-idx;
                                             file_name: row.name;
                                             file_size: row.size-text;
                                             file_date: row.modified-text;
+                                            file_kind: row.kind-text;
+                                            file_created: row.created-text;
+                                            file_added: row.added-text;
+                                            file_owner: row.owner-text;
+                                            file_group: row.group-text;
+                                            file_permissions: row.permissions-text;
                                             ext_badge: row.ext-badge;
                                             is_dir: row.is-dir;
                                             is_image: row.is-image;
@@ -4854,10 +5341,23 @@ export component ManifoldWindow inherits Window {
                                             color_tag_tint: row.color-tag-tint;
                                             size_col_width: root.size-col-width;
                                             date_col_width: root.date-col-width;
+                                            show_col_size: root.right-col-size;
+                                            show_col_kind: root.right-col-kind;
+                                            show_col_modified: root.right-col-modified;
+                                            show_col_created: root.right-col-created;
+                                            show_col_added: root.right-col-added;
+                                            show_col_owner: root.right-col-owner;
+                                            show_col_group: root.right-col-group;
+                                            show_col_permissions: root.right-col-permissions;
+                                            show_col_tags: root.right-col-tags;
+                                            bold_folders: root.right-bold-folders;
+                                            use_alt_bg: root.right-alt-bg;
+                                            view_icon_size: root.right-icon-size * 1px;
                                             font_delta: root.font-size-delta;
                                             font_bold: root.ui-font-bold;
                                             font_family: root.resolved-font-family;
                                             row_bg: root.theme-bg-surface;
+                                            row_alt_bg: root.theme-row-alt;
                                             row_hover_bg: root.theme-bg-hover;
                                             row_accent_bg: root.theme-accent;
                                             text_primary: root.theme-text-primary;
@@ -7284,6 +7784,18 @@ export component ManifoldWindow inherits Window {
                     }
                 }
 
+                Rectangle { height: 1px; background: #323238; }
+
+                ContextMenuItem {
+                    icon-kind: "sliders";
+                    label: "Show View Options";
+                    shortcut-hint: "Ctrl+J";
+                    triggered => {
+                        root.show-context-menu = false;
+                        root.execute-context-action("show_view_options");
+                    }
+                }
+
                 if !root.context-is-blank : Rectangle { height: 1px; background: #323238; }
 
                 if !root.context-is-blank : HorizontalLayout {
@@ -9237,7 +9749,7 @@ export component ManifoldWindow inherits Window {
             x: 10px;
             y: 44px;
             width: 256px;
-            height: 294px;
+            height: app-menu-col.preferred-height + 4px;
             border-radius: 10px;
             background: #00000073;
         }
@@ -9246,7 +9758,7 @@ export component ManifoldWindow inherits Window {
             x: 12px;
             y: 40px;
             width: 252px;
-            height: 290px;
+            height: app-menu-col.preferred-height;
             border-radius: 8px;
             background: root.theme-bg-popover;
             border-width: 1px;
@@ -9257,7 +9769,7 @@ export component ManifoldWindow inherits Window {
 
             TouchArea {}
 
-            VerticalLayout {
+            app-menu-col := VerticalLayout {
                 padding: 6px;
                 spacing: 2px;
 
@@ -9277,6 +9789,15 @@ export component ManifoldWindow inherits Window {
                     triggered => {
                         root.show-app-menu = false;
                         root.show-preferences-modal = true;
+                    }
+                }
+                ContextMenuItem {
+                    icon-kind: "sliders";
+                    label: root.show-view-options-popover ? "Hide View Options" : "Show View Options";
+                    shortcut-hint: "Ctrl+J";
+                    triggered => {
+                        root.show-app-menu = false;
+                        root.execute-context-action("show_view_options");
                     }
                 }
 
@@ -9347,6 +9868,900 @@ export component ManifoldWindow inherits Window {
                     triggered => {
                         root.show-app-menu = false;
                         root.open-connect-dialog();
+                    }
+                }
+            }
+        }
+    }
+
+    // LAYER 3.75 (z: 1700): FLOATING FILE & DIRECTORY VIEW OPTIONS POPOVER (Show View Options, Ctrl/Cmd+J)
+    if root.show-view-options-popover : Rectangle {
+        z: 1700;
+        width: 100%;
+        height: 100%;
+        background: transparent;
+
+        property <length> vo-card-x: (root.dual-pane-mode && !root.right-pane-active)
+            ? Math.clamp(root.sidebar-width + root.left-pane-width - 252px, 16px, Math.max(16px, root.width - 260px))
+            : Math.clamp(root.width - (root.show-inspector ? (root.inspector-width + 8px) : 0px) - 258px, 16px, Math.max(16px, root.width - 260px));
+        property <length> vo-card-y: Math.clamp(124px, 46px, Math.max(46px, root.height - vo-card.height - 12px));
+
+        TouchArea {
+            clicked => {
+                root.view-options-scope-menu-open = false;
+                root.view-options-sort-menu-open = false;
+                root.view-options-icon-menu-open = false;
+                root.view-options-font-menu-open = false;
+                root.view-options-text-menu-open = false;
+                root.show-view-options-popover = false;
+                key-router.focus();
+            }
+        }
+
+        // Top Pointer Notch (matching media_1794056042968_bf466895.jpg & media_1794056116244_eb10f6d2.png)
+        Path {
+            x: parent.vo-card-x + 114px;
+            y: parent.vo-card-y - 9px;
+            width: 20px;
+            height: 10px;
+            viewbox-width: 20;
+            viewbox-height: 10;
+            fill: root.theme-bg-popover;
+            stroke: root.theme-border;
+            stroke-width: 1px;
+            commands: "M 0 10 L 10 1 L 20 10 Z";
+        }
+
+        // Software-renderer ambient drop shadow
+        Rectangle {
+            x: parent.vo-card-x - 3px;
+            y: parent.vo-card-y + 5px;
+            width: 254px;
+            height: vo-card.height + 4px;
+            border-radius: 14px;
+            background: #00000088;
+        }
+
+        vo-card := Rectangle {
+            x: parent.vo-card-x;
+            y: parent.vo-card-y;
+            width: 248px;
+            height: vo-main-col.preferred-height;
+            border-radius: 12px;
+            background: root.theme-bg-popover;
+            border-width: 1px;
+            border-color: root.theme-border;
+            drop-shadow-offset-y: 12px;
+            drop-shadow-blur: 28px;
+            drop-shadow-color: #00000099;
+
+            TouchArea {
+                clicked => {
+                    root.view-options-scope-menu-open = false;
+                    root.view-options-sort-menu-open = false;
+                    root.view-options-icon-menu-open = false;
+                    root.view-options-font-menu-open = false;
+                    root.view-options-text-menu-open = false;
+                }
+            }
+
+            vo-main-col := VerticalLayout {
+                padding: 12px;
+                spacing: 6px;
+
+                // 1. Scope Selector Pill Button (All Folders / This Folder / This Folder and Subfolders)
+                HorizontalLayout {
+                    alignment: center;
+                    Rectangle {
+                        height: 24px;
+                        width: Math.min(220px, scope-btn-layout.preferred-width + 4px);
+                        border-radius: 6px;
+                        background: scope-btn-touch.has-hover ? root.theme-row-hover : root.theme-bg-surface;
+                        border-width: 1px;
+                        border-color: root.view-options-scope-menu-open ? root.theme-accent : root.theme-border;
+                        scope-btn-layout := HorizontalLayout {
+                            padding-left: 10px;
+                            padding-right: 8px;
+                            spacing: 6px;
+                            alignment: center;
+                            Text {
+                                text: root.vo-scope == "this_folder"
+                                    ? "This Folder"
+                                    : (root.vo-scope == "this_folder_and_subfolders"
+                                        ? "This Folder and Subfolders"
+                                        : "All Folders");
+                                color: root.theme-text-primary;
+                                font-size: 12px;
+                                font-family: root.resolved-font-family;
+                                font-weight: 600;
+                                vertical-alignment: center;
+                            }
+                            LucideIcon {
+                                y: (parent.height - self.height) / 2;
+                                icon-size: 11px;
+                                kind: "arrow-up-down";
+                                icon-color: root.theme-text-secondary;
+                            }
+                        }
+                        scope-btn-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                root.view-options-sort-menu-open = false;
+                                root.view-options-icon-menu-open = false;
+                                root.view-options-font-menu-open = false;
+                                root.view-options-text-menu-open = false;
+                                root.view-options-scope-menu-open = !root.view-options-scope-menu-open;
+                            }
+                        }
+                    }
+                }
+
+                Rectangle { height: 1px; background: root.theme-border; }
+
+                // 2. Sort by Row
+                HorizontalLayout {
+                    height: 24px;
+                    alignment: space-between;
+                    Text {
+                        text: "Sort by:";
+                        color: root.theme-text-primary;
+                        font-size: 12px;
+                        font-family: root.resolved-font-family;
+                        font-weight: 500;
+                        vertical-alignment: center;
+                    }
+                    Rectangle {
+                        height: 22px;
+                        width: 114px;
+                        border-radius: 5px;
+                        background: sort-btn-touch.has-hover ? root.theme-row-hover : root.theme-bg-surface;
+                        border-width: 1px;
+                        border-color: root.view-options-sort-menu-open ? root.theme-accent : root.theme-border;
+                        HorizontalLayout {
+                            padding-left: 8px;
+                            padding-right: 6px;
+                            spacing: 4px;
+                            alignment: space-between;
+                            Text {
+                                text: root.vo-sort-by == "modified"
+                                    ? "Modified"
+                                    : (root.vo-sort-by == "created"
+                                        ? "Created"
+                                        : (root.vo-sort-by == "added"
+                                            ? "Added"
+                                            : (root.vo-sort-by == "size"
+                                                ? "Size"
+                                                : (root.vo-sort-by == "kind"
+                                                    ? "Kind"
+                                                    : (root.vo-sort-by == "permissions" ? "Permissions" : "Name")))));
+                                color: root.theme-text-primary;
+                                font-size: 11.5px;
+                                font-family: root.resolved-font-family;
+                                font-weight: 500;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                            LucideIcon {
+                                y: (parent.height - self.height) / 2;
+                                icon-size: 10px;
+                                kind: "arrow-up-down";
+                                icon-color: root.theme-text-secondary;
+                            }
+                        }
+                        sort-btn-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                root.view-options-scope-menu-open = false;
+                                root.view-options-icon-menu-open = false;
+                                root.view-options-font-menu-open = false;
+                                root.view-options-text-menu-open = false;
+                                root.view-options-sort-menu-open = !root.view-options-sort-menu-open;
+                            }
+                        }
+                    }
+                }
+
+                Rectangle { height: 1px; background: root.theme-border; }
+
+                // 3. Icon size, Font & Text size (Synced with Themes & Typography Manager)
+                HorizontalLayout {
+                    height: 24px;
+                    alignment: space-between;
+                    Text {
+                        text: "Icon size:";
+                        color: root.theme-text-primary;
+                        font-size: 12px;
+                        font-family: root.resolved-font-family;
+                        font-weight: 500;
+                        vertical-alignment: center;
+                    }
+                    Rectangle {
+                        height: 22px;
+                        width: 62px;
+                        border-radius: 5px;
+                        background: icon-btn-touch.has-hover ? root.theme-row-hover : root.theme-bg-surface;
+                        border-width: 1px;
+                        border-color: root.view-options-icon-menu-open ? root.theme-accent : root.theme-border;
+                        HorizontalLayout {
+                            padding-left: 8px;
+                            padding-right: 6px;
+                            spacing: 4px;
+                            alignment: space-between;
+                            Text {
+                                text: root.vo-icon-size + "";
+                                color: root.theme-text-primary;
+                                font-size: 11.5px;
+                                font-family: "monospace";
+                                font-weight: 600;
+                                vertical-alignment: center;
+                            }
+                            LucideIcon {
+                                y: (parent.height - self.height) / 2;
+                                icon-size: 10px;
+                                kind: "arrow-up-down";
+                                icon-color: root.theme-text-secondary;
+                            }
+                        }
+                        icon-btn-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                root.view-options-scope-menu-open = false;
+                                root.view-options-sort-menu-open = false;
+                                root.view-options-font-menu-open = false;
+                                root.view-options-text-menu-open = false;
+                                root.view-options-icon-menu-open = !root.view-options-icon-menu-open;
+                            }
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    height: 24px;
+                    alignment: space-between;
+                    Text {
+                        text: "Font:";
+                        color: root.theme-text-primary;
+                        font-size: 12px;
+                        font-family: root.resolved-font-family;
+                        font-weight: 500;
+                        vertical-alignment: center;
+                    }
+                    Rectangle {
+                        height: 22px;
+                        width: 158px;
+                        border-radius: 5px;
+                        background: font-btn-touch.has-hover ? root.theme-row-hover : root.theme-bg-surface;
+                        border-width: 1px;
+                        border-color: root.view-options-font-menu-open ? root.theme-accent : root.theme-border;
+                        HorizontalLayout {
+                            padding-left: 8px;
+                            padding-right: 6px;
+                            spacing: 4px;
+                            alignment: space-between;
+                            Text {
+                                text: root.ui-font-family == "Inter"
+                                    ? "Inter / UI"
+                                    : (root.ui-font-family == "monospace"
+                                        ? "Monospace"
+                                        : (root.ui-font-family == "serif" ? "Serif" : "System Font Regular"));
+                                color: root.theme-text-primary;
+                                font-size: 11px;
+                                font-family: root.resolved-font-family;
+                                font-weight: 500;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                            Rectangle {
+                                width: 14px;
+                                height: 14px;
+                                y: (parent.height - self.height) / 2;
+                                border-radius: 3px;
+                                background: root.theme-border;
+                                Text {
+                                    text: "T";
+                                    color: root.theme-text-primary;
+                                    font-size: 9.5px;
+                                    font-weight: 700;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                        font-btn-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                root.view-options-scope-menu-open = false;
+                                root.view-options-sort-menu-open = false;
+                                root.view-options-icon-menu-open = false;
+                                root.view-options-text-menu-open = false;
+                                root.view-options-font-menu-open = !root.view-options-font-menu-open;
+                            }
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    height: 24px;
+                    alignment: space-between;
+                    Text {
+                        text: "Text size:";
+                        color: root.theme-text-primary;
+                        font-size: 12px;
+                        font-family: root.resolved-font-family;
+                        font-weight: 500;
+                        vertical-alignment: center;
+                    }
+                    Rectangle {
+                        height: 22px;
+                        width: 62px;
+                        border-radius: 5px;
+                        background: txt-btn-touch.has-hover ? root.theme-row-hover : root.theme-bg-surface;
+                        border-width: 1px;
+                        border-color: root.view-options-text-menu-open ? root.theme-accent : root.theme-border;
+                        HorizontalLayout {
+                            padding-left: 8px;
+                            padding-right: 6px;
+                            spacing: 4px;
+                            alignment: space-between;
+                            Text {
+                                text: root.ui-font-size-delta <= -1
+                                    ? "11"
+                                    : (root.ui-font-size-delta == 0
+                                        ? "12"
+                                        : (root.ui-font-size-delta == 1
+                                            ? "13"
+                                            : (root.ui-font-size-delta == 2 ? "14" : "16")));
+                                color: root.theme-text-primary;
+                                font-size: 11.5px;
+                                font-family: "monospace";
+                                font-weight: 600;
+                                vertical-alignment: center;
+                            }
+                            LucideIcon {
+                                y: (parent.height - self.height) / 2;
+                                icon-size: 10px;
+                                kind: "arrow-up-down";
+                                icon-color: root.theme-text-secondary;
+                            }
+                        }
+                        txt-btn-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                root.view-options-scope-menu-open = false;
+                                root.view-options-sort-menu-open = false;
+                                root.view-options-icon-menu-open = false;
+                                root.view-options-font-menu-open = false;
+                                root.view-options-text-menu-open = !root.view-options-text-menu-open;
+                            }
+                        }
+                    }
+                }
+
+                Rectangle { height: 1px; background: root.theme-border; }
+
+                // 4. Show Columns Section
+                Text {
+                    text: "Show Columns:";
+                    color: root.theme-text-primary;
+                    font-size: 12px;
+                    font-family: root.resolved-font-family;
+                    font-weight: 600;
+                }
+
+                VerticalLayout {
+                    spacing: 3px;
+                    ViewOptionCheckboxRow {
+                        label: "Size";
+                        checked: root.vo-col-size;
+                        accent-bg: root.theme-accent;
+                        surface-bg: root.theme-bg-surface;
+                        border-brush: root.theme-border;
+                        text-brush: root.theme-text-primary;
+                        font-family: root.resolved-font-family;
+                        toggled => { root.toggle-view-options-option("col_size"); }
+                    }
+                    ViewOptionCheckboxRow {
+                        label: "Kind";
+                        checked: root.vo-col-kind;
+                        accent-bg: root.theme-accent;
+                        surface-bg: root.theme-bg-surface;
+                        border-brush: root.theme-border;
+                        text-brush: root.theme-text-primary;
+                        font-family: root.resolved-font-family;
+                        toggled => { root.toggle-view-options-option("col_kind"); }
+                    }
+                    ViewOptionCheckboxRow {
+                        label: "Date modified";
+                        checked: root.vo-col-modified;
+                        accent-bg: root.theme-accent;
+                        surface-bg: root.theme-bg-surface;
+                        border-brush: root.theme-border;
+                        text-brush: root.theme-text-primary;
+                        font-family: root.resolved-font-family;
+                        toggled => { root.toggle-view-options-option("col_modified"); }
+                    }
+                    ViewOptionCheckboxRow {
+                        label: "Date added";
+                        checked: root.vo-col-added;
+                        accent-bg: root.theme-accent;
+                        surface-bg: root.theme-bg-surface;
+                        border-brush: root.theme-border;
+                        text-brush: root.theme-text-primary;
+                        font-family: root.resolved-font-family;
+                        toggled => { root.toggle-view-options-option("col_added"); }
+                    }
+                    ViewOptionCheckboxRow {
+                        label: "Date created";
+                        checked: root.vo-col-created;
+                        accent-bg: root.theme-accent;
+                        surface-bg: root.theme-bg-surface;
+                        border-brush: root.theme-border;
+                        text-brush: root.theme-text-primary;
+                        font-family: root.resolved-font-family;
+                        toggled => { root.toggle-view-options-option("col_created"); }
+                    }
+                    ViewOptionCheckboxRow {
+                        label: "Owner";
+                        checked: root.vo-col-owner;
+                        accent-bg: root.theme-accent;
+                        surface-bg: root.theme-bg-surface;
+                        border-brush: root.theme-border;
+                        text-brush: root.theme-text-primary;
+                        font-family: root.resolved-font-family;
+                        toggled => { root.toggle-view-options-option("col_owner"); }
+                    }
+                    ViewOptionCheckboxRow {
+                        label: "Group";
+                        checked: root.vo-col-group;
+                        accent-bg: root.theme-accent;
+                        surface-bg: root.theme-bg-surface;
+                        border-brush: root.theme-border;
+                        text-brush: root.theme-text-primary;
+                        font-family: root.resolved-font-family;
+                        toggled => { root.toggle-view-options-option("col_group"); }
+                    }
+                    ViewOptionCheckboxRow {
+                        label: "Permissions";
+                        checked: root.vo-col-permissions;
+                        accent-bg: root.theme-accent;
+                        surface-bg: root.theme-bg-surface;
+                        border-brush: root.theme-border;
+                        text-brush: root.theme-text-primary;
+                        font-family: root.resolved-font-family;
+                        toggled => { root.toggle-view-options-option("col_permissions"); }
+                    }
+                    ViewOptionCheckboxRow {
+                        label: "Tags";
+                        checked: root.vo-col-tags;
+                        accent-bg: root.theme-accent;
+                        surface-bg: root.theme-bg-surface;
+                        border-brush: root.theme-border;
+                        text-brush: root.theme-text-primary;
+                        font-family: root.resolved-font-family;
+                        toggled => { root.toggle-view-options-option("col_tags"); }
+                    }
+                }
+
+                Rectangle { height: 1px; background: root.theme-border; }
+
+                // 5. Folder & View Behavior Options
+                VerticalLayout {
+                    spacing: 3px;
+                    ViewOptionCheckboxRow {
+                        label: "Bold Folders";
+                        checked: root.vo-bold-folders;
+                        accent-bg: root.theme-accent;
+                        surface-bg: root.theme-bg-surface;
+                        border-brush: root.theme-border;
+                        text-brush: root.theme-text-primary;
+                        font-family: root.resolved-font-family;
+                        toggled => { root.toggle-view-options-option("bold_folders"); }
+                    }
+                    ViewOptionCheckboxRow {
+                        label: "Show Hidden files";
+                        checked: root.vo-show-hidden;
+                        accent-bg: root.theme-accent;
+                        surface-bg: root.theme-bg-surface;
+                        border-brush: root.theme-border;
+                        text-brush: root.theme-text-primary;
+                        font-family: root.resolved-font-family;
+                        toggled => { root.toggle-view-options-option("show_hidden"); }
+                    }
+                    ViewOptionCheckboxRow {
+                        label: "Show icon preview";
+                        checked: root.vo-show-icon-preview;
+                        accent-bg: root.theme-accent;
+                        surface-bg: root.theme-bg-surface;
+                        border-brush: root.theme-border;
+                        text-brush: root.theme-text-primary;
+                        font-family: root.resolved-font-family;
+                        toggled => { root.toggle-view-options-option("show_icon_preview"); }
+                    }
+                    ViewOptionCheckboxRow {
+                        label: "Treat packages as folders";
+                        checked: root.vo-treat-packages-as-folders;
+                        accent-bg: root.theme-accent;
+                        surface-bg: root.theme-bg-surface;
+                        border-brush: root.theme-border;
+                        text-brush: root.theme-text-primary;
+                        font-family: root.resolved-font-family;
+                        toggled => { root.toggle-view-options-option("treat_packages_as_folders"); }
+                    }
+                    ViewOptionCheckboxRow {
+                        label: "Show folders on top";
+                        checked: root.vo-show-folders-on-top;
+                        accent-bg: root.theme-accent;
+                        surface-bg: root.theme-bg-surface;
+                        border-brush: root.theme-border;
+                        text-brush: root.theme-text-primary;
+                        font-family: root.resolved-font-family;
+                        toggled => { root.toggle-view-options-option("show_folders_on_top"); }
+                    }
+                    ViewOptionCheckboxRow {
+                        label: "Always sort alphabetically";
+                        indent: 14px;
+                        small-text: true;
+                        enabled-state: root.vo-show-folders-on-top;
+                        checked: root.vo-folders-always-alpha;
+                        accent-bg: root.theme-accent;
+                        surface-bg: root.theme-bg-surface;
+                        border-brush: root.theme-border;
+                        text-brush: root.theme-text-secondary;
+                        font-family: root.resolved-font-family;
+                        toggled => { root.toggle-view-options-option("folders_always_alpha"); }
+                    }
+                    ViewOptionCheckboxRow {
+                        label: "Use relative dates";
+                        checked: root.vo-use-relative-dates;
+                        accent-bg: root.theme-accent;
+                        surface-bg: root.theme-bg-surface;
+                        border-brush: root.theme-border;
+                        text-brush: root.theme-text-primary;
+                        font-family: root.resolved-font-family;
+                        toggled => { root.toggle-view-options-option("use_relative_dates"); }
+                    }
+                    ViewOptionCheckboxRow {
+                        label: "Calculate all sizes";
+                        checked: root.vo-calculate-all-sizes;
+                        accent-bg: root.theme-accent;
+                        surface-bg: root.theme-bg-surface;
+                        border-brush: root.theme-border;
+                        text-brush: root.theme-text-primary;
+                        font-family: root.resolved-font-family;
+                        toggled => { root.toggle-view-options-option("calculate_all_sizes"); }
+                    }
+                    ViewOptionCheckboxRow {
+                        label: "Use alternating background";
+                        checked: root.vo-use-alternating-bg;
+                        accent-bg: root.theme-accent;
+                        surface-bg: root.theme-bg-surface;
+                        border-brush: root.theme-border;
+                        text-brush: root.theme-text-primary;
+                        font-family: root.resolved-font-family;
+                        toggled => { root.toggle-view-options-option("use_alternating_bg"); }
+                    }
+                }
+
+                Rectangle { height: 2px; background: transparent; }
+
+                // 6. Bottom "Use as Defaults" Button
+                HorizontalLayout {
+                    alignment: center;
+                    Rectangle {
+                        height: 24px;
+                        width: 124px;
+                        border-radius: 5px;
+                        background: defaults-btn-touch.has-hover ? root.theme-row-hover : root.theme-bg-surface;
+                        border-width: 1px;
+                        border-color: root.theme-border;
+                        Text {
+                            text: "Use as Defaults";
+                            color: root.theme-text-primary;
+                            font-size: 11.5px;
+                            font-family: root.resolved-font-family;
+                            font-weight: 600;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        defaults-btn-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                root.use-view-options-as-defaults();
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Floating Scope Selector Menu Overlay (media_1794056116244_eb10f6d2.png)
+            if root.view-options-scope-menu-open : Rectangle {
+                z: 50;
+                x: 24px;
+                y: 36px;
+                width: 214px;
+                height: 86px;
+                border-radius: 8px;
+                background: root.theme-bg-popover;
+                border-width: 1px;
+                border-color: root.theme-border;
+                drop-shadow-offset-y: 8px;
+                drop-shadow-blur: 18px;
+                drop-shadow-color: #000000AA;
+                VerticalLayout {
+                    padding: 4px;
+                    spacing: 2px;
+                    for sc in [
+                        { id: "all_folders", label: "All Folders" },
+                        { id: "this_folder", label: "This Folder" },
+                        { id: "this_folder_and_subfolders", label: "This Folder and Subfolders" }
+                    ] : Rectangle {
+                        height: 24px;
+                        border-radius: 5px;
+                        background: sc-touch.has-hover ? root.theme-accent : transparent;
+                        HorizontalLayout {
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            spacing: 6px;
+                            Text {
+                                width: 12px;
+                                text: root.vo-scope == sc.id ? "✓" : "";
+                                color: sc-touch.has-hover ? #FFFFFF : root.theme-text-primary;
+                                font-size: 12px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                text: sc.label;
+                                color: sc-touch.has-hover ? #FFFFFF : root.theme-text-primary;
+                                font-size: 12px;
+                                font-family: root.resolved-font-family;
+                                font-weight: 500;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+                        }
+                        sc-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                root.view-options-scope-menu-open = false;
+                                root.set-view-options-scope(sc.id);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Floating Sort By Menu Overlay
+            if root.view-options-sort-menu-open : Rectangle {
+                z: 50;
+                x: 112px;
+                y: 66px;
+                width: 126px;
+                height: 182px;
+                border-radius: 8px;
+                background: root.theme-bg-popover;
+                border-width: 1px;
+                border-color: root.theme-border;
+                drop-shadow-offset-y: 8px;
+                drop-shadow-blur: 18px;
+                drop-shadow-color: #000000AA;
+                VerticalLayout {
+                    padding: 4px;
+                    spacing: 2px;
+                    for srt in [
+                        { id: "name", label: "Name" },
+                        { id: "modified", label: "Modified" },
+                        { id: "created", label: "Created" },
+                        { id: "added", label: "Added" },
+                        { id: "size", label: "Size" },
+                        { id: "kind", label: "Kind" },
+                        { id: "permissions", label: "Permissions" }
+                    ] : Rectangle {
+                        height: 24px;
+                        border-radius: 5px;
+                        background: srt-touch.has-hover ? root.theme-accent : transparent;
+                        HorizontalLayout {
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            spacing: 6px;
+                            Text {
+                                width: 12px;
+                                text: root.vo-sort-by == srt.id ? "✓" : "";
+                                color: srt-touch.has-hover ? #FFFFFF : root.theme-text-primary;
+                                font-size: 12px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                text: srt.label;
+                                color: srt-touch.has-hover ? #FFFFFF : root.theme-text-primary;
+                                font-size: 12px;
+                                font-family: root.resolved-font-family;
+                                font-weight: 500;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+                        }
+                        srt-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                root.view-options-sort-menu-open = false;
+                                root.set-view-options-sort(srt.id);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Floating Icon Size Menu Overlay
+            if root.view-options-icon-menu-open : Rectangle {
+                z: 50;
+                x: 156px;
+                y: 98px;
+                width: 82px;
+                height: 110px;
+                border-radius: 8px;
+                background: root.theme-bg-popover;
+                border-width: 1px;
+                border-color: root.theme-border;
+                drop-shadow-offset-y: 8px;
+                drop-shadow-blur: 18px;
+                drop-shadow-color: #000000AA;
+                VerticalLayout {
+                    padding: 4px;
+                    spacing: 2px;
+                    for isz in [16, 20, 24, 32] : Rectangle {
+                        height: 24px;
+                        border-radius: 5px;
+                        background: isz-touch.has-hover ? root.theme-accent : transparent;
+                        HorizontalLayout {
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            spacing: 6px;
+                            Text {
+                                width: 12px;
+                                text: root.vo-icon-size == isz ? "✓" : "";
+                                color: isz-touch.has-hover ? #FFFFFF : root.theme-text-primary;
+                                font-size: 12px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                text: isz + " px";
+                                color: isz-touch.has-hover ? #FFFFFF : root.theme-text-primary;
+                                font-size: 12px;
+                                font-family: "monospace";
+                                font-weight: 500;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+                        }
+                        isz-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                root.view-options-icon-menu-open = false;
+                                root.set-view-options-icon-size(isz);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Floating Font Family Menu Overlay (Synced with AppPreferences)
+            if root.view-options-font-menu-open : Rectangle {
+                z: 50;
+                x: 68px;
+                y: 128px;
+                width: 170px;
+                height: 110px;
+                border-radius: 8px;
+                background: root.theme-bg-popover;
+                border-width: 1px;
+                border-color: root.theme-border;
+                drop-shadow-offset-y: 8px;
+                drop-shadow-blur: 18px;
+                drop-shadow-color: #000000AA;
+                VerticalLayout {
+                    padding: 4px;
+                    spacing: 2px;
+                    for fnt in [
+                        { id: "sans-serif", label: "System Font Regular" },
+                        { id: "Inter", label: "Inter / UI" },
+                        { id: "monospace", label: "Monospace" },
+                        { id: "serif", label: "Serif" }
+                    ] : Rectangle {
+                        height: 24px;
+                        border-radius: 5px;
+                        background: fnt-touch.has-hover ? root.theme-accent : transparent;
+                        HorizontalLayout {
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            spacing: 6px;
+                            Text {
+                                width: 12px;
+                                text: (root.ui-font-family == fnt.id || (fnt.id == "sans-serif" && root.ui-font-family == "")) ? "✓" : "";
+                                color: fnt-touch.has-hover ? #FFFFFF : root.theme-text-primary;
+                                font-size: 12px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                text: fnt.label;
+                                color: fnt-touch.has-hover ? #FFFFFF : root.theme-text-primary;
+                                font-size: 12px;
+                                font-family: root.resolved-font-family;
+                                font-weight: 500;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+                        }
+                        fnt-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                root.view-options-font-menu-open = false;
+                                root.select-font-family(fnt.id);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Floating Text Size Menu Overlay (Synced with AppPreferences.font_size_delta)
+            if root.view-options-text-menu-open : Rectangle {
+                z: 50;
+                x: 152px;
+                y: 158px;
+                width: 86px;
+                height: 134px;
+                border-radius: 8px;
+                background: root.theme-bg-popover;
+                border-width: 1px;
+                border-color: root.theme-border;
+                drop-shadow-offset-y: 8px;
+                drop-shadow-blur: 18px;
+                drop-shadow-color: #000000AA;
+                VerticalLayout {
+                    padding: 4px;
+                    spacing: 2px;
+                    for tsz in [
+                        { delta: -1, label: "11 pt" },
+                        { delta: 0, label: "12 pt" },
+                        { delta: 1, label: "13 pt" },
+                        { delta: 2, label: "14 pt" },
+                        { delta: 4, label: "16 pt" }
+                    ] : Rectangle {
+                        height: 24px;
+                        border-radius: 5px;
+                        background: tsz-touch.has-hover ? root.theme-accent : transparent;
+                        HorizontalLayout {
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            spacing: 6px;
+                            Text {
+                                width: 12px;
+                                text: root.ui-font-size-delta == tsz.delta ? "✓" : "";
+                                color: tsz-touch.has-hover ? #FFFFFF : root.theme-text-primary;
+                                font-size: 12px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                text: tsz.label;
+                                color: tsz-touch.has-hover ? #FFFFFF : root.theme-text-primary;
+                                font-size: 12px;
+                                font-family: "monospace";
+                                font-weight: 500;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+                        }
+                        tsz-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                root.view-options-text-menu-open = false;
+                                root.select-font-size-delta(tsz.delta);
+                            }
+                        }
                     }
                 }
             }

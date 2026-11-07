@@ -438,6 +438,7 @@ pub enum SortColumn {
     Extension,
     Modified,
     Created,
+    Added,
     Size,
     Kind,
     Permissions,
@@ -655,7 +656,118 @@ fn default_font_family() -> String {
     "sans-serif".to_string()
 }
 
-/// Persistent UI Preferences (`preferences.toml`) for Typography, Themes, and Favorites.
+const fn default_icon_size() -> u16 {
+    16
+}
+
+/// Scope for File & Directory View Options (`All Folders`, `This Folder`, `This Folder and Subfolders`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewOptionsScope {
+    #[default]
+    AllFolders,
+    ThisFolder,
+    ThisFolderAndSubfolders,
+}
+
+/// Normalizes a local or remote directory path across Windows (`C:\Users\...`),
+/// Linux (`/home/...`), macOS (`/Users/...`), and Remote VFS (`sftp://...`)
+/// for consistent folder-view-options lookup and subtree matching.
+pub fn normalize_view_options_path(raw: &str) -> String {
+    let trimmed = raw.trim().strip_prefix("file://").unwrap_or(raw.trim());
+    let unified = trimmed.replace('\\', "/");
+    if unified.is_empty() || unified == "/" {
+        return "/".to_string();
+    }
+    let clean = unified.trim_end_matches('/');
+    if clean.len() == 2 && clean.as_bytes()[1] == b':' {
+        let drive = (clean.as_bytes()[0] as char).to_ascii_uppercase();
+        return format!("{drive}:/");
+    }
+    if clean.len() > 2 && clean.as_bytes()[1] == b':' && clean.as_bytes()[2] == b'/' {
+        let drive = (clean.as_bytes()[0] as char).to_ascii_uppercase();
+        let rest = &clean[2..];
+        return format!("{drive}:{rest}");
+    }
+    clean.to_string()
+}
+
+/// Per-folder or global File & Directory View Options (`Show View Options` popover).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderViewOptions {
+    #[serde(default)]
+    pub scope: ViewOptionsScope,
+    #[serde(default)]
+    pub sort_column: SortColumn,
+    #[serde(default = "default_true")]
+    pub col_size: bool,
+    #[serde(default)]
+    pub col_kind: bool,
+    #[serde(default = "default_true")]
+    pub col_date_modified: bool,
+    #[serde(default)]
+    pub col_date_created: bool,
+    #[serde(default)]
+    pub col_date_added: bool,
+    #[serde(default)]
+    pub col_owner: bool,
+    #[serde(default)]
+    pub col_group: bool,
+    #[serde(default)]
+    pub col_permissions: bool,
+    #[serde(default = "default_true")]
+    pub col_tags: bool,
+    #[serde(default = "default_icon_size")]
+    pub icon_size: u16,
+    #[serde(default)]
+    pub bold_folders: bool,
+    #[serde(default)]
+    pub show_hidden_files: bool,
+    #[serde(default = "default_true")]
+    pub show_icon_preview: bool,
+    #[serde(default)]
+    pub treat_packages_as_folders: bool,
+    #[serde(default = "default_true")]
+    pub show_folders_on_top: bool,
+    #[serde(default)]
+    pub folders_always_alpha: bool,
+    #[serde(default)]
+    pub use_relative_dates: bool,
+    #[serde(default)]
+    pub calculate_all_sizes: bool,
+    #[serde(default)]
+    pub use_alternating_row_bg: bool,
+}
+
+impl Default for FolderViewOptions {
+    fn default() -> Self {
+        Self {
+            scope: ViewOptionsScope::AllFolders,
+            sort_column: SortColumn::Name,
+            col_size: true,
+            col_kind: false,
+            col_date_modified: true,
+            col_date_created: false,
+            col_date_added: false,
+            col_owner: false,
+            col_group: false,
+            col_permissions: false,
+            col_tags: true,
+            icon_size: default_icon_size(),
+            bold_folders: false,
+            show_hidden_files: false,
+            show_icon_preview: true,
+            treat_packages_as_folders: false,
+            show_folders_on_top: true,
+            folders_always_alpha: false,
+            use_relative_dates: false,
+            calculate_all_sizes: false,
+            use_alternating_row_bg: false,
+        }
+    }
+}
+
+/// Persistent UI Preferences (`preferences.toml`) for Typography, Themes, Favorites, and View Options.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppPreferences {
     #[serde(default = "default_theme_preset")]
@@ -678,6 +790,10 @@ pub struct AppPreferences {
     pub removed_favorites: Vec<String>,
     #[serde(default)]
     pub file_color_labels: HashMap<String, ColorLabel>,
+    #[serde(default)]
+    pub default_view_options: FolderViewOptions,
+    #[serde(default)]
+    pub folder_view_options: HashMap<String, FolderViewOptions>,
 }
 
 impl Default for AppPreferences {
@@ -693,6 +809,8 @@ impl Default for AppPreferences {
             sidebar_labels: HashMap::new(),
             removed_favorites: Vec::new(),
             file_color_labels: HashMap::new(),
+            default_view_options: FolderViewOptions::default(),
+            folder_view_options: HashMap::new(),
         }
     }
 }
@@ -828,6 +946,67 @@ impl AppPreferences {
         } else {
             self.file_color_labels.insert(path.to_string(), color);
         }
+    }
+
+    /// Resolves the effective [`FolderViewOptions`] for `dir_path`:
+    /// 1. Exact directory match in `folder_view_options` (`ThisFolder` or `ThisFolderAndSubfolders`).
+    /// 2. Longest-prefix ancestor match in `folder_view_options` where `scope == ThisFolderAndSubfolders`.
+    /// 3. Global `default_view_options` (`AllFolders`).
+    pub fn effective_view_options(&self, dir_path: &str) -> FolderViewOptions {
+        let norm = normalize_view_options_path(dir_path);
+        if let Some(exact) = self.folder_view_options.get(&norm) {
+            return exact.clone();
+        }
+        let mut best_match: Option<(usize, &FolderViewOptions)> = None;
+        for (rule_path, opts) in &self.folder_view_options {
+            if opts.scope != ViewOptionsScope::ThisFolderAndSubfolders {
+                continue;
+            }
+            let r_norm = normalize_view_options_path(rule_path);
+            let is_ancestor = if r_norm == "/" {
+                norm.starts_with('/') && norm.len() > 1
+            } else if r_norm.ends_with(":/") {
+                norm.starts_with(&r_norm) && norm.len() > r_norm.len()
+            } else {
+                let prefix = format!("{r_norm}/");
+                norm.starts_with(&prefix)
+            };
+            if is_ancestor {
+                let r_len = r_norm.len();
+                let better = best_match.is_none_or(|(best_len, _)| r_len > best_len);
+                if better {
+                    best_match = Some((r_len, opts));
+                }
+            }
+        }
+        if let Some((_, inherited)) = best_match {
+            return inherited.clone();
+        }
+        self.default_view_options.clone()
+    }
+
+    /// Saves `opts` according to its `opts.scope` (`AllFolders` vs `ThisFolder` / `ThisFolderAndSubfolders`).
+    pub fn save_view_options_for_path(&mut self, dir_path: &str, mut opts: FolderViewOptions) {
+        let norm = normalize_view_options_path(dir_path);
+        match opts.scope {
+            ViewOptionsScope::AllFolders => {
+                opts.scope = ViewOptionsScope::AllFolders;
+                self.default_view_options = opts;
+                self.folder_view_options.remove(&norm);
+            }
+            ViewOptionsScope::ThisFolder | ViewOptionsScope::ThisFolderAndSubfolders => {
+                self.folder_view_options.insert(norm, opts);
+            }
+        }
+    }
+
+    /// Copies `opts` into `default_view_options` (`AllFolders`) and clears any redundant per-folder
+    /// override on `dir_path` (`[ Use as Defaults ]` button in `Show View Options`).
+    pub fn use_view_options_as_defaults(&mut self, dir_path: &str, mut opts: FolderViewOptions) {
+        let norm = normalize_view_options_path(dir_path);
+        opts.scope = ViewOptionsScope::AllFolders;
+        self.default_view_options = opts;
+        self.folder_view_options.remove(&norm);
     }
 }
 
@@ -968,5 +1147,60 @@ sort_direction = "ascending"
         assert!(updated.remove_favorite_by_id_or_path("fav-work", "/tmp/workspace"));
         assert!(updated.custom_favorites.is_empty());
         assert!(updated.removed_favorites.iter().any(|r| r == "fav-work"));
+    }
+
+    #[test]
+    fn test_folder_view_options_scope_inheritance_and_cross_platform_paths() {
+        let mut prefs = AppPreferences::default();
+        assert_eq!(
+            normalize_view_options_path(r"c:\Users\dimitri\Downloads\"),
+            "C:/Users/dimitri/Downloads"
+        );
+        assert_eq!(
+            normalize_view_options_path("file:///home/dimitri/Documents/"),
+            "/home/dimitri/Documents"
+        );
+
+        // 1. Subtree override ("This Folder and Subfolders") on /Users/dimitri/Projects
+        let mut subtree_opts = FolderViewOptions {
+            scope: ViewOptionsScope::ThisFolderAndSubfolders,
+            col_owner: true,
+            col_permissions: true,
+            bold_folders: true,
+            ..FolderViewOptions::default()
+        };
+        prefs.save_view_options_for_path("/Users/dimitri/Projects/", subtree_opts.clone());
+
+        // Child directory inherits subtree_opts
+        let child_eff = prefs.effective_view_options("/Users/dimitri/Projects/Manifold/src");
+        assert_eq!(child_eff.scope, ViewOptionsScope::ThisFolderAndSubfolders);
+        assert!(child_eff.col_owner);
+        assert!(child_eff.col_permissions);
+        assert!(child_eff.bold_folders);
+
+        // 2. Specific folder override ("This Folder") on /Users/dimitri/Projects/Manifold
+        let folder_only = FolderViewOptions {
+            scope: ViewOptionsScope::ThisFolder,
+            col_kind: true,
+            use_alternating_row_bg: true,
+            ..FolderViewOptions::default()
+        };
+        prefs.save_view_options_for_path("/Users/dimitri/Projects/Manifold", folder_only);
+        let exact_eff = prefs.effective_view_options("/Users/dimitri/Projects/Manifold");
+        assert_eq!(exact_eff.scope, ViewOptionsScope::ThisFolder);
+        assert!(exact_eff.col_kind);
+        assert!(!exact_eff.col_owner);
+
+        // Deeper subfolder still inherits the ancestor's ThisFolderAndSubfolders rule
+        let deep_eff = prefs.effective_view_options("/Users/dimitri/Projects/Manifold/crates");
+        assert_eq!(deep_eff.scope, ViewOptionsScope::ThisFolderAndSubfolders);
+        assert!(deep_eff.col_owner);
+
+        // 3. Use as Defaults promotes options to AllFolders
+        subtree_opts.use_relative_dates = true;
+        prefs.use_view_options_as_defaults("/Users/dimitri/Projects", subtree_opts);
+        let other_dir = prefs.effective_view_options(r"C:\Users\dimitri\Desktop");
+        assert_eq!(other_dir.scope, ViewOptionsScope::AllFolders);
+        assert!(other_dir.use_relative_dates);
     }
 }
