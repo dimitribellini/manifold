@@ -157,6 +157,7 @@ struct GuiRuntime {
     sidebar_targets: Vec<(String, String)>,
     sidebar_colors: HashMap<String, ColorLabel>,
     sidebar_context_idx: usize,
+    sidebar_scroll_y: f32,
     selected_sidebar_id: Option<String>,
     transfers: Vec<TransferTask>,
     logs: Vec<String>,
@@ -340,6 +341,7 @@ impl GuiRuntime {
             sidebar_targets: Vec::new(),
             sidebar_colors,
             sidebar_context_idx: 0,
+            sidebar_scroll_y: 0.0,
             selected_sidebar_id: None,
             transfers: Vec::new(),
             logs: vec![init_log.to_string(), keyring_log.to_string()],
@@ -1686,11 +1688,9 @@ impl GuiRuntime {
             if split_remote_uri(src_path).is_none()
                 && split_remote_uri(dst_path).is_none()
                 && Path::new(src_path).is_dir()
+                && copy_local_dir_preserving_bundle(src_path, dst_path).is_ok()
             {
-                let status = Command::new("cp").args(["-R", src_path, dst_path]).status();
-                if status.is_ok_and(|s| s.success()) {
-                    return Ok(());
-                }
+                return Ok(());
             }
             let _ = self.vfs_create_dir(dst_path);
             let children = self.list_sorted_dir(
@@ -1733,6 +1733,9 @@ impl GuiRuntime {
             return Err("Cannot move a folder into itself".to_string());
         }
         if self.vfs_rename(src_path, dst_path).is_ok() {
+            if split_remote_uri(dst_path).is_none() {
+                sanitize_macos_app_bundle(Path::new(dst_path), cfg!(target_os = "macos"));
+            }
             return Ok(());
         }
         self.vfs_copy_entry(src_path, dst_path)?;
@@ -1795,14 +1798,19 @@ impl GuiRuntime {
         }
 
         // 1. Sidebar Hit-Testing (Devices, Connections, Favorites)
-        if (6.0..=(sb_w - 4.0)).contains(&abs_x) && abs_y >= 48.0 {
-            let mut cur_y = 50.0f32;
+        // Top Toolbar (42px) + Workspace padding (6px) + Sidebar top padding (8px) = 56px
+        let font_delta = (self.prefs.font_size_delta as f32).max(0.0);
+        let sb_hdr_stride = 24.0 + font_delta + 2.0;
+        let sb_item_h = 28.0 + font_delta * 1.5;
+        let sb_item_stride = sb_item_h + 2.0;
+        if (6.0..=(sb_w + 4.0)).contains(&abs_x) && abs_y >= 48.0 {
+            let mut cur_y = 56.0 + self.sidebar_scroll_y;
             let mut sb_idx = 0usize;
             for section in &self.app_state.sidebar_sections {
-                cur_y += 24.0;
+                cur_y += sb_hdr_stride;
                 sb_idx += 1;
                 for item in &section.items {
-                    if abs_y >= cur_y && abs_y < cur_y + 28.0 {
+                    if abs_y >= cur_y - 1.0 && abs_y < cur_y + sb_item_h + 1.0 {
                         let target = vfs_url_to_target(&item.vfs_url);
                         if !target.is_empty() && target != "connect://dialog" {
                             res.dst_dir = Some(target);
@@ -1811,10 +1819,10 @@ impl GuiRuntime {
                             return res;
                         }
                     }
-                    cur_y += 28.0;
+                    cur_y += sb_item_stride;
                     sb_idx += 1;
                     for child in &item.children {
-                        if abs_y >= cur_y && abs_y < cur_y + 28.0 {
+                        if abs_y >= cur_y - 1.0 && abs_y < cur_y + sb_item_h + 1.0 {
                             let target = vfs_url_to_target(&child.vfs_url);
                             if !target.is_empty() && target != "connect://dialog" {
                                 res.dst_dir = Some(target);
@@ -1823,7 +1831,7 @@ impl GuiRuntime {
                                 return res;
                             }
                         }
-                        cur_y += 28.0;
+                        cur_y += sb_item_stride;
                         sb_idx += 1;
                     }
                 }
@@ -1831,27 +1839,39 @@ impl GuiRuntime {
             return res;
         }
 
-        if abs_x < sb_w - 2.0 {
+        if abs_x < sb_w + 6.0 {
             return res;
         }
 
+        let left_pane_x = sb_w + 10.0;
         let pane_w = left_pane_w.max(260.0);
-        let right_pane_x = sb_w + pane_w + 6.0;
-        let target_is_right = self.app_state.dual_pane_enabled && abs_x >= right_pane_x;
+        let right_pane_x = left_pane_x + pane_w + 12.0;
+        let target_is_right = self.app_state.dual_pane_enabled && abs_x >= right_pane_x - 6.0;
         let rel_x = if target_is_right {
-            abs_x - right_pane_x
+            (abs_x - right_pane_x).max(0.0)
         } else {
-            abs_x - sb_w
+            (abs_x - left_pane_x).max(0.0)
+        };
+        let split = self.app_state.split_ratio.clamp(0.2, 0.8);
+        let target_pane_w = if target_is_right {
+            (pane_w * (1.0 - split) / split).max(260.0)
+        } else {
+            pane_w
         };
 
+        let tab_bar_top = 48.0f32;
+        let tab_bar_bottom = tab_bar_top + 38.0 + font_delta * 1.5;
+        let path_bar_top = tab_bar_bottom + 2.5;
+        let path_bar_bottom = path_bar_top + 50.0 + font_delta * 2.0;
+
         // 2. Tab Bar Hit-Testing (Responsive to Pane Width & Tab Count)
-        if (36.0..=76.0).contains(&abs_y) {
+        if (tab_bar_top..=tab_bar_bottom).contains(&abs_y) {
             let tab_count = if target_is_right {
                 self.app_state.right_tabs.len().max(1) as f32
             } else {
                 self.app_state.left_tabs.len().max(1) as f32
             };
-            let avail_w = pane_w - 48.0 - (tab_count - 1.0).max(0.0) * 6.0;
+            let avail_w = target_pane_w - 48.0 - (tab_count - 1.0).max(0.0) * 6.0;
             let tab_w = (avail_w / tab_count).clamp(56.0, 184.0);
             let tab_idx = ((rel_x - 8.0) / (tab_w + 6.0)).floor() as isize;
             if tab_idx >= 0 {
@@ -1875,7 +1895,7 @@ impl GuiRuntime {
         }
 
         // 3. Breadcrumb / Path Bar Hit-Testing (Drop into Parent or Target Pane Root)
-        if (76.0..=108.0).contains(&abs_y) {
+        if (path_bar_top..=path_bar_bottom).contains(&abs_y) {
             let pane_dir = self.current_pane_path(target_is_right);
             let same_pane = target_is_right == from_right;
             let dst = if same_pane {
@@ -1899,7 +1919,7 @@ impl GuiRuntime {
             return res;
         }
 
-        if abs_y <= 108.0 {
+        if abs_y <= path_bar_bottom {
             return res;
         }
 
@@ -1922,23 +1942,28 @@ impl GuiRuntime {
         } else {
             left_scroll_y
         };
-        let hovered_idx = if view_mode == 0 {
-            if abs_y >= 136.0 {
-                ((abs_y - 140.0 - scroll_y) / 27.0).floor() as isize
+        let hovered_idx = if view_mode == 0 || view_mode == 3 {
+            let table_hdr_h = 26.0 + font_delta;
+            let list_rows_top = path_bar_bottom + table_hdr_h + 4.0;
+            let row_stride = 29.0 + font_delta * 2.0;
+            if abs_y >= path_bar_bottom + table_hdr_h {
+                ((abs_y - list_rows_top - scroll_y) / row_stride).floor() as isize
             } else {
                 -1
             }
         } else if view_mode == 1 {
-            let row_i = ((abs_y - 120.0 - scroll_y) / 134.0).floor() as isize;
-            let cell_w = (pane_w - 24.0).max(180.0) / 3.0;
+            let grid_top = path_bar_bottom + 12.0;
+            let cell_stride = 138.0 + font_delta * 4.0;
+            let row_i = ((abs_y - grid_top - scroll_y) / cell_stride).floor() as isize;
+            let cell_w = (target_pane_w - 24.0).max(180.0) / 3.0;
             let col_i = ((rel_x - 12.0) / cell_w).floor().clamp(0.0, 2.0) as isize;
             if row_i >= 0 {
                 row_i * 3 + col_i
             } else {
                 -1
             }
-        } else if rel_x >= 196.0 {
-            ((abs_y - 108.0 - scroll_y) / 26.0).floor() as isize
+        } else if rel_x >= 195.0 {
+            ((abs_y - path_bar_bottom - scroll_y) / 26.0).floor() as isize
         } else {
             -1
         };
@@ -1950,7 +1975,7 @@ impl GuiRuntime {
             } else {
                 self.left_entries.get(u_idx)
             };
-            if let Some(entry) = entry_opt.filter(|e| e.meta.is_dir) {
+            if let Some(entry) = entry_opt.filter(|e| is_browsable_folder(&e.meta)) {
                 let valid_folder = items.iter().all(|it| {
                     let slash = format!("{}/", it.path.trim_end_matches('/'));
                     entry.meta.path != it.path && !entry.meta.path.starts_with(&slash)
@@ -2206,6 +2231,7 @@ impl GuiRuntime {
         for meta in items {
             if split_remote_uri(&meta.path).is_none() {
                 if Path::new(&meta.path).exists() {
+                    sanitize_macos_app_bundle(Path::new(&meta.path), cfg!(target_os = "macos"));
                     out.push(meta.path.clone());
                 }
                 continue;
@@ -2503,7 +2529,7 @@ impl GuiRuntime {
         let query = if depth == 0 { opts.0 } else { "" };
         let items = self.list_sorted_dir(dir_path, show_hidden, query, opts.1, opts.2);
         for meta in items {
-            let is_exp = meta.is_dir && expanded_set.contains(&meta.path);
+            let is_exp = is_browsable_folder(&meta) && expanded_set.contains(&meta.path);
             let child_path = meta.path.clone();
             out.push(FlattenedRowEntry {
                 meta,
@@ -2845,8 +2871,14 @@ impl GuiRuntime {
             }
         } else {
             self.cancel_pane_search(is_right);
+            let empty_expanded = HashSet::new();
+            let active_expanded = if view_mode == PaneViewMode::Tree {
+                &expanded
+            } else {
+                &empty_expanded
+            };
             let opts = ("", sort_col, sort_dir);
-            self.collect_flattened_rows(&path, 0, &expanded, opts, &mut flattened);
+            self.collect_flattened_rows(&path, 0, active_expanded, opts, &mut flattened);
         }
 
         let parent_items = if view_mode == PaneViewMode::Columns {
@@ -3003,8 +3035,22 @@ impl GuiRuntime {
         } else {
             vfs_display_title(active_path)
         };
+        let active_mode = if is_right_active {
+            self.app_state
+                .right_tabs
+                .get(self.app_state.right_active_tab)
+                .map(|t| t.view_mode)
+                .unwrap_or(PaneViewMode::Icons)
+        } else {
+            self.app_state
+                .left_tabs
+                .get(self.app_state.left_active_tab)
+                .map(|t| t.view_mode)
+                .unwrap_or(PaneViewMode::List)
+        };
         self.app_state.toolbar.active_folder_title = active_title;
         self.app_state.toolbar.search_query = active_filter;
+        self.app_state.toolbar.active_view_mode = active_mode;
 
         let active_sel_count = if is_right_active {
             right_sel.len()
@@ -3059,7 +3105,7 @@ impl GuiRuntime {
             return;
         };
 
-        if meta.is_dir {
+        if is_browsable_folder(&meta) {
             self.last_nav_instant = Some(Instant::now());
             let msg = format!("[OPEN] Directory -> {}", meta.path);
             self.logs.push(msg);
@@ -3076,6 +3122,7 @@ const fn play_system_sound(_kind: &str) {}
 
 fn open_with_system_handler(path: &str) {
     if cfg!(target_os = "macos") {
+        sanitize_macos_app_bundle(Path::new(path), true);
         let _ = Command::new("open").arg(path).spawn();
     } else if cfg!(target_os = "windows") {
         let _ = Command::new("explorer").arg(path).spawn();
@@ -3660,8 +3707,9 @@ fn duplicate_path_on_disk(vfs: &LocalFsBackend, meta: &FileMetadata) -> Result<S
         .parent()
         .and_then(|p| p.to_str())
         .unwrap_or("/");
+    let keep_ext = !meta.is_dir || is_macos_app_bundle(meta);
     let (stem, ext_suffix) = match &meta.extension {
-        Some(ext) if !ext.is_empty() && !meta.is_dir => {
+        Some(ext) if !ext.is_empty() && keep_ext => {
             let sfx = format!(".{ext}");
             let st = meta.name.strip_suffix(&sfx).unwrap_or(&meta.name);
             (st.to_string(), sfx)
@@ -3678,10 +3726,7 @@ fn duplicate_path_on_disk(vfs: &LocalFsBackend, meta: &FileMetadata) -> Result<S
     }
 
     if meta.is_dir {
-        let status = Command::new("cp")
-            .args(["-R", &meta.path, &dst_path])
-            .status();
-        if status.is_err() {
+        if copy_local_dir_preserving_bundle(&meta.path, &dst_path).is_err() {
             vfs.create_dir(&dst_path).map_err(|e| e.to_string())?;
         }
     } else {
@@ -3873,8 +3918,11 @@ fn run_local_recursive_bfs_search(params: LocalBfsSearchParams<'_>) {
                 }
             }
 
+            let is_app_bundle =
+                is_macos_app_bundle_for_os(&name_str, ft.is_dir(), cfg!(target_os = "macos"));
             if ft.is_dir()
                 && !ft.is_symlink()
+                && !is_app_bundle
                 && depth < MAX_SEARCH_DEPTH
                 && record_visited_dir(&entry_path, &mut visited)
             {
@@ -3903,6 +3951,18 @@ fn run_local_recursive_bfs_search(params: LocalBfsSearchParams<'_>) {
     });
 }
 
+fn is_macos_app_bundle_for_os(name: &str, is_dir: bool, is_macos: bool) -> bool {
+    is_macos && is_dir && name.to_ascii_lowercase().ends_with(".app")
+}
+
+fn is_macos_app_bundle(meta: &FileMetadata) -> bool {
+    is_macos_app_bundle_for_os(&meta.name, meta.is_dir, cfg!(target_os = "macos"))
+}
+
+fn is_browsable_folder(meta: &FileMetadata) -> bool {
+    meta.is_dir && !is_macos_app_bundle(meta)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn sort_metadata_slice(items: &mut [FileMetadata], column: SortColumn, direction: SortDirection) {
     let desc = direction == SortDirection::Descending;
@@ -3910,49 +3970,49 @@ fn sort_metadata_slice(items: &mut [FileMetadata], column: SortColumn, direction
         (SortColumn::Size, false) => {
             items.sort_by_key(|a| {
                 let sz = a.size.unwrap_or(0);
-                (!a.is_dir, sz, a.name.to_lowercase())
+                (!is_browsable_folder(a), sz, a.name.to_lowercase())
             });
         }
         (SortColumn::Size, true) => {
             items.sort_by_key(|a| {
                 let rev_sz = std::cmp::Reverse(a.size.unwrap_or(0));
                 let rev_name = std::cmp::Reverse(a.name.to_lowercase());
-                (!a.is_dir, rev_sz, rev_name)
+                (!is_browsable_folder(a), rev_sz, rev_name)
             });
         }
         (SortColumn::Modified | SortColumn::Created, false) => {
             items.sort_by_key(|a| {
                 let name = a.name.to_lowercase();
-                (!a.is_dir, a.modified, name)
+                (!is_browsable_folder(a), a.modified, name)
             });
         }
         (SortColumn::Modified | SortColumn::Created, true) => {
             items.sort_by_key(|a| {
                 let rev_mod = std::cmp::Reverse(a.modified);
                 let rev_name = std::cmp::Reverse(a.name.to_lowercase());
-                (!a.is_dir, rev_mod, rev_name)
+                (!is_browsable_folder(a), rev_mod, rev_name)
             });
         }
         (SortColumn::Kind, false) => {
             items.sort_by_key(|a| {
                 let kind = a.kind.to_lowercase();
-                (!a.is_dir, kind, a.name.to_lowercase())
+                (!is_browsable_folder(a), kind, a.name.to_lowercase())
             });
         }
         (SortColumn::Kind, true) => {
             items.sort_by_key(|a| {
                 let rev_kind = std::cmp::Reverse(a.kind.to_lowercase());
                 let rev_name = std::cmp::Reverse(a.name.to_lowercase());
-                (!a.is_dir, rev_kind, rev_name)
+                (!is_browsable_folder(a), rev_kind, rev_name)
             });
         }
         (_, false) => {
-            items.sort_by_key(|a| (!a.is_dir, a.name.to_lowercase()));
+            items.sort_by_key(|a| (!is_browsable_folder(a), a.name.to_lowercase()));
         }
         (_, true) => {
             items.sort_by_key(|a| {
                 let rev_name = std::cmp::Reverse(a.name.to_lowercase());
-                (!a.is_dir, rev_name)
+                (!is_browsable_folder(a), rev_name)
             });
         }
     }
@@ -4147,6 +4207,7 @@ fn view_mode_to_int(mode: PaneViewMode) -> i32 {
         PaneViewMode::List => 0,
         PaneViewMode::Icons => 1,
         PaneViewMode::Columns => 2,
+        PaneViewMode::Tree => 3,
     }
 }
 
@@ -4154,6 +4215,7 @@ fn int_to_view_mode(v: i32) -> PaneViewMode {
     match v {
         1 => PaneViewMode::Icons,
         2 => PaneViewMode::Columns,
+        3 => PaneViewMode::Tree,
         _ => PaneViewMode::List,
     }
 }
@@ -4247,13 +4309,11 @@ fn perform_bg_single_transfer(
 
     // 4. Local -> Local (4 MB chunked streaming with live progress updates)
     if is_move && local_vfs.rename(src_path, dst_path).is_ok() {
+        sanitize_macos_app_bundle(Path::new(dst_path), cfg!(target_os = "macos"));
         return Ok(());
     }
     if Path::new(src_path).is_dir() {
-        let status = Command::new("cp").args(["-R", src_path, dst_path]).status();
-        if !status.is_ok_and(|s| s.success()) {
-            return Err("Failed to copy directory".to_string());
-        }
+        copy_local_dir_preserving_bundle(src_path, dst_path)?;
         if is_move {
             let _ = local_vfs.remove(src_path, true);
         }
@@ -4843,12 +4903,12 @@ fn sync_window_from_runtime(window: &ManifoldWindow, rt: &mut GuiRuntime) {
         } else {
             "Do you want to replace it with the one you\u{2019}re copying?".to_string()
         };
-        let new_sz = if src_meta.is_dir {
+        let new_sz = if is_browsable_folder(&src_meta) {
             "Folder".to_string()
         } else {
             src_meta.formatted_size()
         };
-        let ex_sz = if ex_meta.is_dir {
+        let ex_sz = if is_browsable_folder(&ex_meta) {
             "Folder".to_string()
         } else {
             ex_meta.formatted_size()
@@ -5020,8 +5080,10 @@ fn sync_inspector_to_window(window: &ManifoldWindow, rt: &mut GuiRuntime) {
     if let Some(sel) = rt.selected_metadata().cloned() {
         let color_idx = color_label_to_index(sel.color_label);
         let is_img = is_image_extension(sel.extension.as_deref());
+        let is_app = is_macos_app_bundle(&sel);
+        let is_browsable = is_browsable_folder(&sel);
         window.set_inspector_color_index(color_idx);
-        window.set_inspector_is_dir(sel.is_dir);
+        window.set_inspector_is_dir(is_browsable);
         window.set_inspector_is_image(is_img);
 
         let l_cols = rt
@@ -5041,7 +5103,12 @@ fn sync_inspector_to_window(window: &ManifoldWindow, rt: &mut GuiRuntime) {
             return;
         }
 
-        let loaded_img = if is_img && !sel.is_dir && split_remote_uri(&sel.path).is_none() {
+        let loaded_img = if is_app && split_remote_uri(&sel.path).is_none() {
+            rt.thumbnail_cache
+                .entry(sel.path.clone())
+                .or_insert_with(|| load_macos_app_bundle_icon(&sel.path))
+                .clone()
+        } else if is_img && !sel.is_dir && split_remote_uri(&sel.path).is_none() {
             rt.thumbnail_cache
                 .entry(sel.path.clone())
                 .or_insert_with(|| Image::load_from_path(Path::new(&sel.path)).ok())
@@ -5368,6 +5435,14 @@ fn is_likely_utf8_text(bytes: &[u8], ext_low: &str) -> bool {
 }
 
 fn build_inspector_preview(rt: &GuiRuntime, sel: &FileMetadata) -> (String, bool) {
+    if is_macos_app_bundle(sel) {
+        let summary = format!(
+            "macOS Application Bundle\nSize: {}\nPath: {}",
+            sel.formatted_size(),
+            sel.path
+        );
+        return (summary, false);
+    }
     if sel.is_dir {
         return (format!("Folder\n{}", sel.path), false);
     }
@@ -5529,6 +5604,81 @@ fn build_slint_rows_from_meta(
         .collect()
 }
 
+fn extract_png_from_icns(icns_bytes: &[u8]) -> Option<&[u8]> {
+    if icns_bytes.len() < 16 || &icns_bytes[0..4] != b"icns" {
+        return None;
+    }
+    let mut pos = 8usize;
+    let mut best_png: Option<&[u8]> = None;
+    while pos + 8 <= icns_bytes.len() {
+        let chunk_len = u32::from_be_bytes([
+            icns_bytes[pos + 4],
+            icns_bytes[pos + 5],
+            icns_bytes[pos + 6],
+            icns_bytes[pos + 7],
+        ]) as usize;
+        if chunk_len < 8 || pos + chunk_len > icns_bytes.len() {
+            break;
+        }
+        let payload = &icns_bytes[pos + 8..pos + chunk_len];
+        if payload.starts_with(b"\x89PNG\r\n\x1a\n") {
+            best_png = Some(payload);
+            if payload.len() >= 1024 {
+                return best_png;
+            }
+        }
+        pos += chunk_len;
+    }
+    best_png
+}
+
+fn load_macos_app_bundle_icon(app_path: &str) -> Option<Image> {
+    let res_dir = Path::new(app_path).join("Contents").join("Resources");
+    let rd = std::fs::read_dir(&res_dir).ok()?;
+    let mut icns_candidates = Vec::new();
+    for entry in rd.flatten().take(32) {
+        let p = entry.path();
+        let ext = p
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if ext == "png" {
+            if let Ok(img) = Image::load_from_path(&p) {
+                return Some(img);
+            }
+        } else if ext == "icns" {
+            icns_candidates.push(p);
+        }
+    }
+    icns_candidates.sort_by_key(|p| {
+        let n = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        !n.eq_ignore_ascii_case("AppIcon.icns")
+    });
+    for icns_path in icns_candidates {
+        let Ok(bytes) = std::fs::read(&icns_path) else {
+            continue;
+        };
+        let Some(png_bytes) = extract_png_from_icns(&bytes) else {
+            continue;
+        };
+        let cache_dir = std::env::temp_dir().join("manifold-app-icons");
+        let _ = std::fs::create_dir_all(&cache_dir);
+        let safe_name: String = app_path
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        let png_path = cache_dir.join(format!("{safe_name}.png"));
+        if std::fs::write(&png_path, png_bytes).is_err() {
+            continue;
+        }
+        if let Ok(img) = Image::load_from_path(&png_path) {
+            return Some(img);
+        }
+    }
+    None
+}
+
 fn meta_to_slint_row(
     meta: &FileMetadata,
     depth: i32,
@@ -5542,14 +5692,25 @@ fn meta_to_slint_row(
     let brush = color_label_to_slint_color(meta.color_label);
     let tint = color_label_to_tint_color(meta.color_label);
     let ext_ref = meta.extension.as_deref();
+    let is_app = is_macos_app_bundle(meta);
+    let is_browsable = is_browsable_folder(meta);
     let is_img = is_image_extension(ext_ref);
     let is_exec = is_executable_file(meta);
+    let is_local = split_remote_uri(&meta.path).is_none();
     let can_thumb = load_thumbs
         && is_img
         && !meta.is_dir
-        && split_remote_uri(&meta.path).is_none()
+        && is_local
         && meta.size.unwrap_or(0) <= 16 * 1024 * 1024;
-    let thumb_opt = if can_thumb {
+    let thumb_opt = if load_thumbs && is_app && is_local {
+        if thumb_cache.len() > 2048 && !thumb_cache.contains_key(&meta.path) {
+            thumb_cache.clear();
+        }
+        thumb_cache
+            .entry(meta.path.clone())
+            .or_insert_with(|| load_macos_app_bundle_icon(&meta.path))
+            .clone()
+    } else if can_thumb {
         if thumb_cache.len() > 2048 && !thumb_cache.contains_key(&meta.path) {
             thumb_cache.clear();
         }
@@ -5562,19 +5723,25 @@ fn meta_to_slint_row(
     };
     let has_thumbnail = thumb_opt.is_some();
     let thumbnail = thumb_opt.unwrap_or_default();
+    let badge_str = if is_app {
+        "APP".to_string()
+    } else {
+        format_ext_badge(ext_ref)
+    };
+    let kind_str = if is_app { "Application" } else { &meta.kind };
     FileRowSlint {
         name: SharedString::from(meta.display_name()),
         path: SharedString::from(&meta.path),
-        ext_badge: SharedString::from(format_ext_badge(ext_ref)),
+        ext_badge: SharedString::from(badge_str),
         size_text: SharedString::from(meta.formatted_size()),
         modified_text: SharedString::from(meta.formatted_iso_datetime()),
-        kind_text: SharedString::from(&meta.kind),
+        kind_text: SharedString::from(kind_str),
         color_tag_hex: SharedString::from(hex),
         color_tag_name: SharedString::from(tag_name),
         color_tag_brush: brush.into(),
         color_tag_tint: tint.into(),
         has_color_tag: meta.color_label != ColorLabel::None,
-        is_dir: meta.is_dir,
+        is_dir: is_browsable,
         is_image: is_img,
         is_executable: is_exec,
         is_expanded,
@@ -6770,13 +6937,13 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 guard
                     .right_entries
                     .get(idx)
-                    .filter(|r| r.meta.is_dir)
+                    .filter(|r| is_browsable_folder(&r.meta))
                     .map(|r| r.meta.path.clone())
             } else {
                 guard
                     .left_entries
                     .get(idx)
-                    .filter(|r| r.meta.is_dir)
+                    .filter(|r| is_browsable_folder(&r.meta))
                     .map(|r| r.meta.path.clone())
             };
             if let Some(folder_path) = path_opt {
@@ -6840,13 +7007,32 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
             } else {
                 sel_list.first().map(|m| m.name.clone()).unwrap_or_default()
             };
-            let target_is_dir = sel_list.len() == 1 && sel_list[0].is_dir;
+            let target_is_dir = sel_list.len() == 1 && is_browsable_folder(&sel_list[0]);
+            let target_is_app = sel_list.len() == 1 && is_macos_app_bundle(&sel_list[0]);
             let target_is_archive = sel_list.len() == 1 && is_extractable_archive(&sel_list[0]);
+            let cur_pane_dir = guard.current_pane_path(use_right);
+            let active_filter = if use_right {
+                guard
+                    .app_state
+                    .right_tabs
+                    .get(guard.app_state.right_active_tab)
+                    .map(|t| t.inline_filter.as_str())
+                    .unwrap_or("")
+            } else {
+                guard
+                    .app_state
+                    .left_tabs
+                    .get(guard.app_state.left_active_tab)
+                    .map(|t| t.inline_filter.as_str())
+                    .unwrap_or("")
+            };
+            let can_show_enclosing =
+                should_show_in_enclosing_folder(active_filter, &cur_pane_dir, &sel_list);
             let fav_check_path = sel_list
                 .first()
-                .filter(|m| m.is_dir)
+                .filter(|m| is_browsable_folder(m))
                 .map(|m| m.path.clone())
-                .unwrap_or_else(|| guard.current_pane_path(use_right));
+                .unwrap_or(cur_pane_dir);
             let target_is_fav = guard.is_path_in_favorites(&fav_check_path);
             if let Some(w) = win_weak.upgrade() {
                 reset_slint_modifiers(&w);
@@ -6855,6 +7041,8 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 w.set_context_is_blank(false);
                 w.set_context_target_is_dir(target_is_dir);
                 w.set_context_target_is_archive(target_is_archive);
+                w.set_context_target_is_app_bundle(target_is_app);
+                w.set_context_can_show_enclosing(can_show_enclosing);
                 w.set_context_target_is_favorite(target_is_fav);
                 w.set_context_target_name(target_name.into());
                 w.set_context_menu_x(x_pos);
@@ -6890,6 +7078,8 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 w.set_context_is_blank(true);
                 w.set_context_target_is_dir(true);
                 w.set_context_target_is_archive(false);
+                w.set_context_target_is_app_bundle(false);
+                w.set_context_can_show_enclosing(false);
                 w.set_context_target_is_favorite(target_is_fav);
                 w.set_context_target_name(folder_label.into());
                 w.set_context_menu_x(x_pos);
@@ -6933,6 +7123,39 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                             }
                         }
                         return;
+                    }
+                }
+                "show_archive_contents" => {
+                    if let Some(meta) = sel_meta {
+                        let is_mac = cfg!(target_os = "macos");
+                        match open_archive_contents_dir(&meta, is_mac) {
+                            Ok(stage_dir) => {
+                                let log_msg = format!("[ARCHIVE-CONTENTS] -> {stage_dir}");
+                                guard.logs.push(log_msg);
+                                guard.invalidate_dir_cache();
+                                guard.navigate_to_path(is_right, stage_dir);
+                            }
+                            Err(err) => {
+                                let log_msg = format!("[ARCHIVE-CONTENTS_ERR] {err}");
+                                guard.logs.push(log_msg);
+                                let toast = format!("Archive error: {err}");
+                                guard.show_toast("error", toast);
+                            }
+                        }
+                    }
+                }
+                "show_package_contents" => {
+                    if let Some(meta) = sel_meta {
+                        let base = meta.path.trim_end_matches('/');
+                        let contents_dir = format!("{base}/Contents");
+                        let target = if Path::new(&contents_dir).is_dir() {
+                            contents_dir
+                        } else {
+                            meta.path
+                        };
+                        let log_msg = format!("[PACKAGE-CONTENTS] -> {target}");
+                        guard.logs.push(log_msg);
+                        guard.navigate_to_path(is_right, target);
                     }
                 }
                 "open_with" => {
@@ -7584,6 +7807,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
             if items.is_empty() {
                 return;
             }
+            guard.sidebar_scroll_y = w.get_drag_sidebar_scroll_y();
             let coords = (
                 abs_x,
                 abs_y,
@@ -7646,6 +7870,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
             if items.is_empty() {
                 return;
             }
+            guard.sidebar_scroll_y = w.get_drag_sidebar_scroll_y();
             let coords = (
                 abs_x,
                 abs_y,
@@ -9352,6 +9577,18 @@ fn handle_keyboard_shortcut(
         return true;
     }
 
+    // Ctrl/Cmd + 1..4: Switch View Mode (1=Icons, 2=List, 3=Columns, 4=Tree)
+    if cmd && !alt && !shift && matches!(key, "1" | "2" | "3" | "4") {
+        let mode_int = match key {
+            "1" => 1,
+            "2" => 0,
+            "3" => 2,
+            _ => 3,
+        };
+        w.invoke_set_view_mode(mode_int);
+        return true;
+    }
+
     // Ctrl+Alt+T / Cmd+Option+T: Toggle Single / Dual-Pane View
     if cmd && alt && k_low == "t" {
         w.invoke_toggle_dual_pane();
@@ -9483,6 +9720,75 @@ fn handle_keyboard_shortcut(
             }
             return true;
         }
+        if view_mode == PaneViewMode::Tree {
+            let cur_opt = if is_right {
+                guard.right_selected_idx
+            } else {
+                guard.left_selected_idx
+            };
+            if let Some(cur) = cur_opt {
+                let row_info = if is_right {
+                    guard
+                        .right_entries
+                        .get(cur)
+                        .map(|r| (is_browsable_folder(&r.meta), r.is_expanded, r.depth))
+                } else {
+                    guard
+                        .left_entries
+                        .get(cur)
+                        .map(|r| (is_browsable_folder(&r.meta), r.is_expanded, r.depth))
+                };
+                if let Some((is_dir, is_expanded, depth)) = row_info {
+                    if key == "\u{f703}" {
+                        if is_dir && !is_expanded {
+                            drop(guard);
+                            w.invoke_toggle_expand_folder(is_right, cur as i32);
+                        } else if is_dir && is_expanded {
+                            let len = if is_right {
+                                guard.right_entries.len()
+                            } else {
+                                guard.left_entries.len()
+                            };
+                            let next = (cur + 1).min(len.saturating_sub(1));
+                            guard.apply_row_selection(is_right, next, shift, false);
+                            guard.refresh_headers_and_inspector();
+                            sync_selection_and_inspector(w, &mut guard);
+                            drop(guard);
+                            w.invoke_ensure_row_visible(is_right, next as i32);
+                        }
+                        return true;
+                    }
+                    if is_dir && is_expanded {
+                        drop(guard);
+                        w.invoke_toggle_expand_folder(is_right, cur as i32);
+                        return true;
+                    }
+                    if depth > 0 {
+                        let parent_idx = if is_right {
+                            (0..cur)
+                                .rev()
+                                .find(|&i| guard.right_entries[i].depth < depth)
+                        } else {
+                            (0..cur)
+                                .rev()
+                                .find(|&i| guard.left_entries[i].depth < depth)
+                        };
+                        if let Some(p_idx) = parent_idx {
+                            guard.apply_row_selection(is_right, p_idx, shift, false);
+                            guard.refresh_headers_and_inspector();
+                            sync_selection_and_inspector(w, &mut guard);
+                            drop(guard);
+                            w.invoke_ensure_row_visible(is_right, p_idx as i32);
+                            return true;
+                        }
+                    }
+                    drop(guard);
+                    w.invoke_navigate_up(is_right);
+                    return true;
+                }
+            }
+            return true;
+        }
         if key == "\u{f702}" {
             drop(guard);
             w.invoke_navigate_up(is_right);
@@ -9495,9 +9801,15 @@ fn handle_keyboard_shortcut(
         };
         if let Some(cur) = cur_opt {
             let is_dir = if is_right {
-                guard.right_entries.get(cur).is_some_and(|r| r.meta.is_dir)
+                guard
+                    .right_entries
+                    .get(cur)
+                    .is_some_and(|r| is_browsable_folder(&r.meta))
             } else {
-                guard.left_entries.get(cur).is_some_and(|r| r.meta.is_dir)
+                guard
+                    .left_entries
+                    .get(cur)
+                    .is_some_and(|r| is_browsable_folder(&r.meta))
             };
             if is_dir {
                 guard.open_entry_at(is_right, Some(cur));
@@ -9804,6 +10116,9 @@ fn launch_file_with_app(target_path: &str, app_spec: &str) -> Result<String, Str
         return Err("No application specified".to_string());
     }
     if trimmed == "__DEFAULT__" {
+        if cfg!(target_os = "macos") {
+            sanitize_macos_app_bundle(Path::new(target_path), true);
+        }
         #[cfg(target_os = "macos")]
         let status = Command::new("/usr/bin/open")
             .arg(target_path)
@@ -9893,7 +10208,371 @@ fn archive_output_stem(file_name: &str) -> String {
     format!("{file_name}_extracted")
 }
 
+fn should_show_in_enclosing_folder(
+    inline_filter: &str,
+    main_folder_path: &str,
+    selected: &[FileMetadata],
+) -> bool {
+    if inline_filter.trim().is_empty() || selected.len() != 1 {
+        return false;
+    }
+    let Some(item_parent) = vfs_parent_dir(&selected[0].path) else {
+        return false;
+    };
+    let norm_main = main_folder_path.trim_end_matches('/');
+    let norm_parent = item_parent.trim_end_matches('/');
+    let main_cmp = if norm_main.is_empty() { "/" } else { norm_main };
+    let parent_cmp = if norm_parent.is_empty() {
+        "/"
+    } else {
+        norm_parent
+    };
+    main_cmp != parent_cmp
+}
+
+fn extract_archive_into_dir(
+    archive_path: &str,
+    archive_name: &str,
+    dest_dir: &str,
+    stem: &str,
+) -> Result<(), String> {
+    let lower = archive_name.to_lowercase();
+    let status = if lower.ends_with(".zip") {
+        Command::new("unzip")
+            .args(["-q", "-o", archive_path, "-d", dest_dir])
+            .status()
+            .or_else(|_| {
+                Command::new("tar")
+                    .args(["-xf", archive_path, "-C", dest_dir])
+                    .status()
+            })
+    } else if lower.ends_with(".tar.gz")
+        || lower.ends_with(".tgz")
+        || lower.ends_with(".tar.bz2")
+        || lower.ends_with(".tbz2")
+        || lower.ends_with(".tar.xz")
+        || lower.ends_with(".txz")
+        || lower.ends_with(".tar")
+    {
+        if cfg!(target_os = "macos") {
+            Command::new("tar")
+                .args(["--no-mac-metadata", "-xf", archive_path, "-C", dest_dir])
+                .status()
+                .or_else(|_| {
+                    Command::new("tar")
+                        .args(["-xf", archive_path, "-C", dest_dir])
+                        .status()
+                })
+        } else {
+            Command::new("tar")
+                .args(["-xf", archive_path, "-C", dest_dir])
+                .status()
+        }
+    } else if lower.ends_with(".7z") {
+        let out_arg = format!("-o{dest_dir}");
+        Command::new("7z")
+            .args(["x", "-y", archive_path, &out_arg])
+            .status()
+    } else if lower.ends_with(".rar") {
+        Command::new("unrar")
+            .args(["x", "-y", archive_path, dest_dir])
+            .status()
+    } else if lower.ends_with(".gz") {
+        let out_file = format!("{dest_dir}/{stem}");
+        let cmd = format!("gzip -dc \"{archive_path}\" > \"{out_file}\"");
+        Command::new("sh").args(["-c", &cmd]).status()
+    } else if lower.ends_with(".bz2") {
+        let out_file = format!("{dest_dir}/{stem}");
+        let cmd = format!("bzip2 -dc \"{archive_path}\" > \"{out_file}\"");
+        Command::new("sh").args(["-c", &cmd]).status()
+    } else if lower.ends_with(".xz") {
+        let out_file = format!("{dest_dir}/{stem}");
+        let cmd = format!("xz -dc \"{archive_path}\" > \"{out_file}\"");
+        Command::new("sh").args(["-c", &cmd]).status()
+    } else {
+        Command::new("tar")
+            .args(["-xf", archive_path, "-C", dest_dir])
+            .status()
+    };
+
+    match status {
+        Ok(s) if s.success() => {
+            sanitize_macos_app_bundle(Path::new(dest_dir), cfg!(target_os = "macos"));
+            Ok(())
+        }
+        Ok(s) => Err(format!("Extractor exited with status {s}")),
+        Err(e) => Err(format!("Failed to run archive extractor: {e}")),
+    }
+}
+
+fn collect_macos_app_bundles(root: &Path) -> Vec<PathBuf> {
+    if !root.is_dir() {
+        return Vec::new();
+    }
+    let root_is_app = root
+        .file_name()
+        .and_then(|s| s.to_str())
+        .is_some_and(|n| n.to_ascii_lowercase().ends_with(".app"));
+    if root_is_app {
+        return vec![root.to_path_buf()];
+    }
+    let mut bundles = Vec::new();
+    for child in significant_dir_children(root) {
+        if !child.is_dir() {
+            continue;
+        }
+        let is_app = child
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|n| n.to_ascii_lowercase().ends_with(".app"));
+        if is_app {
+            bundles.push(child);
+            continue;
+        }
+        for sub in significant_dir_children(&child) {
+            let sub_is_app = sub.is_dir()
+                && sub
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|n| n.to_ascii_lowercase().ends_with(".app"));
+            if sub_is_app {
+                bundles.push(sub);
+            }
+        }
+    }
+    bundles
+}
+
+#[cfg(unix)]
+fn ensure_macos_bundle_executables_chmod(app_dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let macos_bin_dir = app_dir.join("Contents").join("MacOS");
+    let Ok(rd) = std::fs::read_dir(&macos_bin_dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let bin_path = entry.path();
+        if let Ok(meta) = std::fs::symlink_metadata(&bin_path) {
+            if meta.is_file() {
+                let mode = meta.permissions().mode();
+                if mode & 0o111 == 0 {
+                    let perms = std::fs::Permissions::from_mode(mode | 0o755);
+                    let _ = std::fs::set_permissions(&bin_path, perms);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn ensure_macos_bundle_executables_chmod(_app_dir: &Path) {}
+
+fn sanitize_macos_app_bundle(path: &Path, is_macos: bool) {
+    if !path.exists() {
+        return;
+    }
+    let bundles = collect_macos_app_bundles(path);
+    for app_dir in &bundles {
+        ensure_macos_bundle_executables_chmod(app_dir);
+    }
+    if !is_macos || !cfg!(target_os = "macos") {
+        return;
+    }
+    let root_str = path.to_string_lossy().to_string();
+    let _ = Command::new("/usr/bin/xattr")
+        .args(["-dr", "com.apple.quarantine", &root_str])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = Command::new("/usr/bin/xattr")
+        .args(["-dr", "com.apple.provenance", &root_str])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    for app_dir in &bundles {
+        let app_str = app_dir.to_string_lossy().to_string();
+        let _ = Command::new("/usr/bin/xattr")
+            .args(["-dr", "com.apple.quarantine", &app_str])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let verify_ok = Command::new("/usr/bin/codesign")
+            .args(["--verify", "--deep", "--strict", &app_str])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !verify_ok {
+            let _ = Command::new("/usr/bin/xattr")
+                .args(["-cr", &app_str])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            let _ = Command::new("/usr/bin/codesign")
+                .args(["--force", "--deep", "--sign", "-", &app_str])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+}
+
+fn copy_local_dir_preserving_bundle(src_path: &str, dst_path: &str) -> Result<(), String> {
+    let dst_pb = Path::new(dst_path);
+    let parent_dir = dst_pb.parent().unwrap_or_else(|| Path::new("/"));
+    let dst_name = dst_pb
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("bundle");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let stage_wrap_name = format!(".manifold-stage-{}-{nanos}", std::process::id());
+    let stage_wrap = parent_dir.join(stage_wrap_name);
+    if stage_wrap.exists() {
+        let _ = std::fs::remove_dir_all(&stage_wrap);
+    }
+    std::fs::create_dir_all(&stage_wrap)
+        .map_err(|e| format!("Failed to create staging dir: {e}"))?;
+    let stage_dst = stage_wrap.join(dst_name);
+    let stage_dst_str = stage_dst.to_string_lossy().to_string();
+
+    let copied_ok = if cfg!(target_os = "macos") {
+        let ditto_ok = Command::new("/usr/bin/ditto")
+            .args(["--noqtn", src_path, &stage_dst_str])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if ditto_ok {
+            true
+        } else {
+            Command::new("cp")
+                .args(["-RPp", src_path, &stage_dst_str])
+                .status()
+                .is_ok_and(|s| s.success())
+        }
+    } else {
+        let cp_p_ok = Command::new("cp")
+            .args(["-RPp", src_path, &stage_dst_str])
+            .status()
+            .is_ok_and(|s| s.success());
+        if cp_p_ok {
+            true
+        } else {
+            Command::new("cp")
+                .args(["-R", src_path, &stage_dst_str])
+                .status()
+                .is_ok_and(|s| s.success())
+        }
+    };
+
+    if !copied_ok {
+        let _ = std::fs::remove_dir_all(&stage_wrap);
+        return Err("Failed to copy directory".to_string());
+    }
+
+    sanitize_macos_app_bundle(&stage_dst, cfg!(target_os = "macos"));
+
+    if dst_pb.exists() || std::fs::symlink_metadata(dst_pb).is_ok() {
+        let _ = std::fs::remove_dir_all(dst_pb);
+        let _ = std::fs::remove_file(dst_pb);
+    }
+    if let Err(e) = std::fs::rename(&stage_dst, dst_pb) {
+        let _ = std::fs::remove_dir_all(&stage_wrap);
+        return Err(format!("Failed to finalize directory copy: {e}"));
+    }
+    let _ = std::fs::remove_dir_all(&stage_wrap);
+    sanitize_macos_app_bundle(dst_pb, cfg!(target_os = "macos"));
+    Ok(())
+}
+
+fn significant_dir_children(dir: &Path) -> Vec<PathBuf> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    rd.flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            name != ".DS_Store" && name != "__MACOSX"
+        })
+        .collect()
+}
+
+fn find_single_macos_app_in_extracted_dir(extracted_dir: &Path) -> Option<PathBuf> {
+    let top = significant_dir_children(extracted_dir);
+    if top.len() != 1 {
+        return None;
+    }
+    let first = &top[0];
+    if !first.is_dir() {
+        return None;
+    }
+    let first_name = first.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    if first_name.to_ascii_lowercase().ends_with(".app") {
+        return Some(first.clone());
+    }
+    let nested = significant_dir_children(first);
+    if nested.len() != 1 || !nested[0].is_dir() {
+        return None;
+    }
+    let nested_name = nested[0].file_name().and_then(|s| s.to_str()).unwrap_or("");
+    if nested_name.to_ascii_lowercase().ends_with(".app") {
+        return Some(nested[0].clone());
+    }
+    None
+}
+
+fn finalize_extracted_archive_dir(
+    dest_dir: &str,
+    trimmed_parent: &str,
+    is_macos: bool,
+) -> Result<String, String> {
+    if !is_macos {
+        return Ok(dest_dir.to_string());
+    }
+    let Some(app_path) = find_single_macos_app_in_extracted_dir(Path::new(dest_dir)) else {
+        sanitize_macos_app_bundle(Path::new(dest_dir), is_macos);
+        return Ok(dest_dir.to_string());
+    };
+    sanitize_macos_app_bundle(&app_path, is_macos);
+    let app_name = app_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("App.app");
+    let app_stem = app_name
+        .strip_suffix(".app")
+        .or_else(|| app_name.strip_suffix(".APP"))
+        .unwrap_or(app_name);
+    let mut final_app = format!("{trimmed_parent}/{app_name}");
+    let mut counter = 2usize;
+    while Path::new(&final_app).exists() {
+        final_app = format!("{trimmed_parent}/{app_stem} {counter}.app");
+        counter += 1;
+    }
+    if std::fs::rename(&app_path, &final_app).is_ok() {
+        let _ = std::fs::remove_dir_all(dest_dir);
+        sanitize_macos_app_bundle(Path::new(&final_app), is_macos);
+        return Ok(final_app);
+    }
+    sanitize_macos_app_bundle(Path::new(dest_dir), is_macos);
+    Ok(dest_dir.to_string())
+}
+
 fn extract_archive_to_folder(meta: &FileMetadata) -> Result<String, String> {
+    extract_archive_to_folder_for_os(meta, cfg!(target_os = "macos"))
+}
+
+fn extract_archive_to_folder_for_os(meta: &FileMetadata, is_macos: bool) -> Result<String, String> {
     if meta.path.contains("://") {
         return Err("Remote archive extraction requires downloading first".to_string());
     }
@@ -9911,58 +10590,55 @@ fn extract_archive_to_folder(meta: &FileMetadata) -> Result<String, String> {
     }
     std::fs::create_dir_all(&dest_dir).map_err(|e| format!("Failed to create {dest_dir}: {e}"))?;
 
-    let lower = meta.name.to_lowercase();
-    let status = if lower.ends_with(".zip") {
-        Command::new("unzip")
-            .args(["-q", "-o", &meta.path, "-d", &dest_dir])
-            .status()
-            .or_else(|_| {
-                Command::new("tar")
-                    .args(["-xf", &meta.path, "-C", &dest_dir])
-                    .status()
-            })
-    } else if lower.ends_with(".tar.gz")
-        || lower.ends_with(".tgz")
-        || lower.ends_with(".tar.bz2")
-        || lower.ends_with(".tbz2")
-        || lower.ends_with(".tar.xz")
-        || lower.ends_with(".txz")
-        || lower.ends_with(".tar")
-    {
-        Command::new("tar")
-            .args(["-xf", &meta.path, "-C", &dest_dir])
-            .status()
-    } else if lower.ends_with(".7z") {
-        let out_arg = format!("-o{dest_dir}");
-        Command::new("7z")
-            .args(["x", "-y", &meta.path, &out_arg])
-            .status()
-    } else if lower.ends_with(".rar") {
-        Command::new("unrar")
-            .args(["x", "-y", &meta.path, &dest_dir])
-            .status()
-    } else if lower.ends_with(".gz") {
-        let out_file = format!("{dest_dir}/{stem}");
-        let cmd = format!("gzip -dc \"{}\" > \"{out_file}\"", meta.path);
-        Command::new("sh").args(["-c", &cmd]).status()
-    } else if lower.ends_with(".bz2") {
-        let out_file = format!("{dest_dir}/{stem}");
-        let cmd = format!("bzip2 -dc \"{}\" > \"{out_file}\"", meta.path);
-        Command::new("sh").args(["-c", &cmd]).status()
-    } else if lower.ends_with(".xz") {
-        let out_file = format!("{dest_dir}/{stem}");
-        let cmd = format!("xz -dc \"{}\" > \"{out_file}\"", meta.path);
-        Command::new("sh").args(["-c", &cmd]).status()
-    } else {
-        Command::new("tar")
-            .args(["-xf", &meta.path, "-C", &dest_dir])
-            .status()
-    };
+    if let Err(e) = extract_archive_into_dir(&meta.path, &meta.name, &dest_dir, &stem) {
+        let _ = std::fs::remove_dir_all(&dest_dir);
+        return Err(e);
+    }
+    finalize_extracted_archive_dir(&dest_dir, trimmed_parent, is_macos)
+}
 
-    match status {
-        Ok(s) if s.success() => Ok(dest_dir),
-        Ok(s) => Err(format!("Extractor exited with status {s}")),
-        Err(e) => Err(format!("Failed to run archive extractor: {e}")),
+fn open_archive_contents_dir(meta: &FileMetadata, is_macos: bool) -> Result<String, String> {
+    if meta.path.contains("://") {
+        return Err("Remote archive inspection requires downloading first".to_string());
+    }
+    let stem = archive_output_stem(&meta.name);
+    let base_dir = std::env::temp_dir().join("manifold-archive-contents");
+    let stage_dir = base_dir.join(&stem);
+    if stage_dir.exists() {
+        let _ = std::fs::remove_dir_all(&stage_dir);
+    }
+    let stage_str = stage_dir.to_string_lossy().to_string();
+    std::fs::create_dir_all(&stage_dir)
+        .map_err(|e| format!("Failed to create {stage_str}: {e}"))?;
+    extract_archive_into_dir(&meta.path, &meta.name, &stage_str, &stem)?;
+    let _ = std::fs::remove_dir_all(stage_dir.join("__MACOSX"));
+    if is_macos {
+        unwrap_nested_macos_app_in_stage_dir(&stage_dir);
+    }
+    sanitize_macos_app_bundle(&stage_dir, is_macos);
+    Ok(stage_str)
+}
+
+fn unwrap_nested_macos_app_in_stage_dir(stage_dir: &Path) {
+    let top = significant_dir_children(stage_dir);
+    if top.len() != 1 || !top[0].is_dir() {
+        return;
+    }
+    let top_name = top[0].file_name().and_then(|s| s.to_str()).unwrap_or("");
+    if top_name.to_ascii_lowercase().ends_with(".app") {
+        return;
+    }
+    let nested = significant_dir_children(&top[0]);
+    if nested.len() != 1 || !nested[0].is_dir() {
+        return;
+    }
+    let n_name = nested[0].file_name().and_then(|s| s.to_str()).unwrap_or("");
+    if !n_name.to_ascii_lowercase().ends_with(".app") {
+        return;
+    }
+    let target_app = stage_dir.join(n_name);
+    if std::fs::rename(&nested[0], &target_app).is_ok() {
+        let _ = std::fs::remove_dir_all(&top[0]);
     }
 }
 
@@ -10515,5 +11191,272 @@ mod tests {
         assert_eq!(rt.left_entries[0].meta.name, "order_details.txt");
 
         let _ = rt.local_vfs.remove(root_dir, true);
+    }
+
+    #[test]
+    fn test_show_in_enclosing_folder_visibility_rules() {
+        let mut direct_item = sample_meta("manifold_fig3.png");
+        direct_item.path = "/Users/dimitribellini/Downloads/doc_jpg/manifold_fig3.png".to_string();
+
+        let mut nested_item = sample_meta("HPEPO497793.pdf");
+        nested_item.path = "/Volumes/ExtraDisk/Clienti/HPE-2023/Ordine/HPEPO497793.pdf".to_string();
+
+        // 1. Not in search: never show "Show in Enclosing Folder"
+        assert!(!should_show_in_enclosing_folder(
+            "",
+            "/Users/dimitribellini/Downloads/doc_jpg",
+            std::slice::from_ref(&direct_item)
+        ));
+        assert!(!should_show_in_enclosing_folder(
+            "",
+            "/Volumes/ExtraDisk/Clienti",
+            std::slice::from_ref(&nested_item)
+        ));
+
+        // 2. Active search, but item is directly inside the main folder: do not show
+        assert!(!should_show_in_enclosing_folder(
+            "fig3",
+            "/Users/dimitribellini/Downloads/doc_jpg",
+            std::slice::from_ref(&direct_item)
+        ));
+
+        // 3. Active search, and item is in a downstream subfolder: show
+        assert!(should_show_in_enclosing_folder(
+            "HPEPO497793",
+            "/Volumes/ExtraDisk/Clienti",
+            std::slice::from_ref(&nested_item)
+        ));
+    }
+
+    #[test]
+    fn test_macos_app_bundle_extraction_and_show_archive_contents() {
+        assert!(is_macos_app_bundle_for_os("Manifold.app", true, true));
+        assert!(!is_macos_app_bundle_for_os("Manifold.app", true, false));
+        assert!(!is_macos_app_bundle_for_os("Manifold.app", false, true));
+
+        let (_, mac_kind) = manifold_vfs::infer_file_kind_for_os("Manifold.app", true, true);
+        let (_, lin_kind) = manifold_vfs::infer_file_kind_for_os("Manifold.app", true, false);
+        assert_eq!(mac_kind, "Application");
+        assert_eq!(lin_kind, "Folder");
+
+        let work_dir = "/tmp/manifold_macos_app_extract_test";
+        let _ = std::fs::remove_dir_all(work_dir);
+        std::fs::create_dir_all(work_dir).unwrap();
+
+        let build_stage = format!("{work_dir}/build_stage");
+        let app_macos_dir = format!("{build_stage}/Manifold.app/Contents/MacOS");
+        std::fs::create_dir_all(&app_macos_dir).unwrap();
+        std::fs::write(format!("{app_macos_dir}/Manifold"), b"mach-o-bin").unwrap();
+        std::fs::write(
+            format!("{build_stage}/Manifold.app/Contents/Info.plist"),
+            b"<plist/>",
+        )
+        .unwrap();
+
+        let archive_name = "manifold-v0.5.1-macos-arm64.tar.gz";
+        let archive_path = format!("{work_dir}/{archive_name}");
+        let status = Command::new("tar")
+            .args(["-czf", &archive_path, "-C", &build_stage, "Manifold.app"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let _ = std::fs::remove_dir_all(&build_stage);
+
+        let mut archive_meta = sample_meta(archive_name);
+        archive_meta.path = archive_path.clone();
+
+        // 1. On macOS, extracting the archive unwraps the single .app bundle directly into work_dir/Manifold.app
+        let mac_extracted = extract_archive_to_folder_for_os(&archive_meta, true).unwrap();
+        assert_eq!(mac_extracted, format!("{work_dir}/Manifold.app"));
+        assert!(Path::new(&mac_extracted).is_dir());
+        assert!(!Path::new(&format!("{work_dir}/manifold-v0.5.1-macos-arm64")).exists());
+        let _ = std::fs::remove_dir_all(&mac_extracted);
+
+        // 2. On Linux/Windows, extracting the archive keeps the standard wrapper folder
+        let lin_extracted = extract_archive_to_folder_for_os(&archive_meta, false).unwrap();
+        assert_eq!(
+            lin_extracted,
+            format!("{work_dir}/manifold-v0.5.1-macos-arm64")
+        );
+        assert!(Path::new(&format!("{lin_extracted}/Manifold.app")).is_dir());
+
+        // 3. "Show Archive Contents" stages the archive contents for browsing
+        let stage_dir = open_archive_contents_dir(&archive_meta, true).unwrap();
+        assert!(Path::new(&format!("{stage_dir}/Manifold.app")).is_dir());
+
+        let _ = std::fs::remove_dir_all(&stage_dir);
+        let _ = std::fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn test_drag_drop_sidebar_and_list_row_hit_testing_alignment() {
+        let mut rt = GuiRuntime::new(ManifoldAppState::new_reference_workspace());
+        rt.prefs.font_size_delta = 1;
+        rt.sidebar_scroll_y = 0.0;
+
+        let drag_items = [sample_meta("Manifold.app")];
+        let font_delta = (rt.prefs.font_size_delta as f32).max(0.0);
+        let sb_header_stride = 24.0 + font_delta + 2.0;
+        let sb_item_h = 28.0 + font_delta * 1.5;
+        let sb_item_stride = sb_item_h + 2.0;
+
+        // Compute the exact Y midpoint of each sidebar entry and verify resolve_drop_target
+        // returns that exact entry's target directory and hover_sidebar_idx without downward drift.
+        let mut cur_y = 56.0;
+        let mut sb_idx: i32 = 0;
+        for section in &rt.app_state.sidebar_sections {
+            cur_y += sb_header_stride;
+            sb_idx += 1;
+            for item in &section.items {
+                let mid_y = cur_y + sb_item_h * 0.5;
+                let res = rt.resolve_drop_target(
+                    false,
+                    &drag_items,
+                    (100.0, mid_y, 800.0, 0.0, 0.0),
+                    (200.0, 1280.0, 800.0),
+                );
+                let expected = vfs_url_to_target(&item.vfs_url);
+                if !expected.is_empty() && expected != "connect://dialog" {
+                    assert_eq!(
+                        res.dst_dir.as_deref(),
+                        Some(expected.as_str()),
+                        "Sidebar item '{}' at y={mid_y} resolved to wrong target",
+                        item.label
+                    );
+                    assert_eq!(res.hover_sidebar_idx, sb_idx);
+                }
+                cur_y += sb_item_stride;
+                sb_idx += 1;
+                for child in &item.children {
+                    let child_mid_y = cur_y + sb_item_h * 0.5;
+                    let child_res = rt.resolve_drop_target(
+                        false,
+                        &drag_items,
+                        (100.0, child_mid_y, 800.0, 0.0, 0.0),
+                        (200.0, 1280.0, 800.0),
+                    );
+                    let child_expected = vfs_url_to_target(&child.vfs_url);
+                    if !child_expected.is_empty() && child_expected != "connect://dialog" {
+                        assert_eq!(
+                            child_res.dst_dir.as_deref(),
+                            Some(child_expected.as_str()),
+                            "Sidebar child '{}' at y={child_mid_y} resolved to wrong target",
+                            child.label
+                        );
+                        assert_eq!(child_res.hover_sidebar_idx, sb_idx);
+                    }
+                    cur_y += sb_item_stride;
+                    sb_idx += 1;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_copy_local_dir_preserving_bundle_replaces_existing_app_and_chmods_macos_bin() {
+        let work_dir = "/tmp/manifold_app_bundle_copy_test";
+        let _ = std::fs::remove_dir_all(work_dir);
+        let src_app = format!("{work_dir}/Downloads/Manifold.app");
+        let dst_apps = format!("{work_dir}/Applications");
+        let dst_app = format!("{dst_apps}/Manifold.app");
+
+        let src_bin_dir = format!("{src_app}/Contents/MacOS");
+        let src_res_dir = format!("{src_app}/Contents/Resources");
+        std::fs::create_dir_all(&src_bin_dir).unwrap();
+        std::fs::create_dir_all(&src_res_dir).unwrap();
+        std::fs::create_dir_all(&dst_apps).unwrap();
+
+        let src_bin = format!("{src_bin_dir}/Manifold");
+        std::fs::write(&src_bin, b"new-mach-o-binary-v2").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let non_exec = std::fs::Permissions::from_mode(0o644);
+            std::fs::set_permissions(&src_bin, non_exec).unwrap();
+        }
+        std::fs::write(
+            format!("{src_app}/Contents/Info.plist"),
+            b"<plist>v2</plist>",
+        )
+        .unwrap();
+        std::fs::write(format!("{src_res_dir}/AppIcon.icns"), b"icns-v2").unwrap();
+
+        // Pre-populate an existing /Applications/Manifold.app with stale files
+        let old_bin_dir = format!("{dst_app}/Contents/MacOS");
+        std::fs::create_dir_all(&old_bin_dir).unwrap();
+        std::fs::write(format!("{old_bin_dir}/Manifold"), b"old-binary-v1").unwrap();
+        std::fs::write(format!("{dst_app}/Contents/stale.txt"), b"stale").unwrap();
+
+        // Copy src_app over dst_app atomically via copy_local_dir_preserving_bundle
+        copy_local_dir_preserving_bundle(&src_app, &dst_app).unwrap();
+
+        // Must NOT nest Manifold.app/Manifold.app inside dst_app
+        assert!(!Path::new(&format!("{dst_app}/Manifold.app")).exists());
+        // Stale files from the previous bundle must be gone
+        assert!(!Path::new(&format!("{dst_app}/Contents/stale.txt")).exists());
+        // New binary and Info.plist must match v2
+        let copied_bin = format!("{dst_app}/Contents/MacOS/Manifold");
+        let copied_bytes = std::fs::read(&copied_bin).unwrap();
+        assert_eq!(copied_bytes, b"new-mach-o-binary-v2");
+
+        // sanitize_macos_app_bundle must ensure +x (0o111) on Contents/MacOS/Manifold
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&copied_bin).unwrap().permissions().mode();
+            assert_ne!(
+                mode & 0o111,
+                0,
+                "Expected Contents/MacOS/Manifold to be executable"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn test_tree_view_vs_list_view_flattening_and_mode_mapping() {
+        assert_eq!(view_mode_to_int(PaneViewMode::List), 0);
+        assert_eq!(view_mode_to_int(PaneViewMode::Icons), 1);
+        assert_eq!(view_mode_to_int(PaneViewMode::Columns), 2);
+        assert_eq!(view_mode_to_int(PaneViewMode::Tree), 3);
+
+        assert_eq!(int_to_view_mode(0), PaneViewMode::List);
+        assert_eq!(int_to_view_mode(1), PaneViewMode::Icons);
+        assert_eq!(int_to_view_mode(2), PaneViewMode::Columns);
+        assert_eq!(int_to_view_mode(3), PaneViewMode::Tree);
+
+        let work_dir = "/tmp/manifold_tree_vs_list_test";
+        let _ = std::fs::remove_dir_all(work_dir);
+        let sub_dir = format!("{work_dir}/alpha");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        std::fs::write(format!("{sub_dir}/nested.txt"), b"hello").unwrap();
+        std::fs::write(format!("{work_dir}/root.txt"), b"world").unwrap();
+
+        let mut rt = GuiRuntime::new(ManifoldAppState::new_reference_workspace());
+        rt.app_state.active_pane = ActivePane::Left;
+        rt.app_state.left_active_tab = 0;
+        rt.app_state.left_tabs[0].current_path = work_dir.to_string();
+        rt.app_state.left_tabs[0]
+            .expanded_folders
+            .insert(sub_dir.clone());
+
+        // In List mode (0), expanded_folders are ignored so the list stays strictly flat
+        rt.app_state.left_tabs[0].view_mode = PaneViewMode::List;
+        rt.reload_pane_entries(false);
+        assert_eq!(rt.left_entries.len(), 2);
+        assert!(rt.left_entries.iter().all(|e| e.depth == 0));
+
+        // In Tree mode (3), expanded_folders are recursively flattened with depth > 0
+        rt.app_state.left_tabs[0].view_mode = PaneViewMode::Tree;
+        rt.reload_pane_entries(false);
+        assert_eq!(rt.left_entries.len(), 3);
+        assert!(rt
+            .left_entries
+            .iter()
+            .any(|e| e.meta.name == "nested.txt" && e.depth == 1));
+        assert_eq!(rt.app_state.toolbar.active_view_mode, PaneViewMode::Tree);
+
+        let _ = std::fs::remove_dir_all(work_dir);
     }
 }

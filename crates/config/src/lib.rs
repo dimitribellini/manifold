@@ -418,7 +418,7 @@ impl CredentialStore {
     }
 }
 
-/// View mode per tab (`Icon View`, `List View`, `Column View`).
+/// View mode per tab (`Icon View`, `List View`, `Column View`, `Tree View`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum PaneViewMode {
@@ -426,6 +426,7 @@ pub enum PaneViewMode {
     #[default]
     List,
     Columns,
+    Tree,
 }
 
 /// Sort column per tab.
@@ -891,7 +892,7 @@ sort_direction = "ascending"
 
 [[left_pane.tabs]]
 vfs_url = "file:///Users/johnappleseed/Documents/Website Backup"
-view_mode = "list"
+view_mode = "tree"
 sort_column = "name"
 sort_direction = "ascending"
 
@@ -906,7 +907,7 @@ sort_direction = "ascending"
 
 [[right_pane.tabs]]
 vfs_url = "file:///Users/johnappleseed"
-view_mode = "icons"
+view_mode = "columns"
 sort_column = "name"
 sort_direction = "ascending"
 
@@ -919,6 +920,8 @@ sort_direction = "ascending"
         let state = SessionState::from_toml_str(sample).unwrap();
         assert_eq!(state.left_pane.active_tab_index, 2);
         assert_eq!(state.left_pane.tabs.len(), 3);
+        assert_eq!(state.left_pane.tabs[2].view_mode, PaneViewMode::Tree);
+        assert_eq!(state.right_pane.tabs[1].view_mode, PaneViewMode::Columns);
         assert_eq!(state.right_pane.tabs[2].view_mode, PaneViewMode::Icons);
     }
 

@@ -354,9 +354,21 @@ pub fn system_time_to_civil(time: SystemTime) -> (i32, u32, u32, u32, u32) {
 
 /// Classifies a human-readable `Kind` label from file extension and directory flag.
 pub fn infer_file_kind(name: &str, is_dir: bool) -> (Option<String>, String) {
+    infer_file_kind_for_os(name, is_dir, cfg!(target_os = "macos"))
+}
+
+/// Classifies a human-readable `Kind` label with explicit macOS `.app` bundle detection.
+pub fn infer_file_kind_for_os(
+    name: &str,
+    is_dir: bool,
+    is_macos: bool,
+) -> (Option<String>, String) {
     let raw_ext = Path::new(name).extension().and_then(|e| e.to_str());
     let ext = raw_ext.map(str::to_lowercase);
     if is_dir {
+        if is_macos && ext.as_deref() == Some("app") {
+            return (ext, "Application".to_string());
+        }
         return (ext, "Folder".to_string());
     }
 
@@ -577,8 +589,22 @@ impl LocalFsBackend {
         let attrs = self.get_attrs(path).unwrap_or_default();
 
         let size = if is_dir {
-            let guard = self.dir_size_cache.read().ok();
-            guard.and_then(|cache| cache.get(path).copied())
+            let cached = self
+                .dir_size_cache
+                .read()
+                .ok()
+                .and_then(|cache| cache.get(path).copied());
+            if cached.is_some() {
+                cached
+            } else if cfg!(target_os = "macos") && extension.as_deref() == Some("app") {
+                let total = shallow_dir_bundle_size(path, 3);
+                if let Ok(mut guard) = self.dir_size_cache.write() {
+                    guard.insert(path.to_path_buf(), total);
+                }
+                Some(total)
+            } else {
+                None
+            }
         } else {
             Some(target_meta.len())
         };
@@ -654,6 +680,31 @@ fn normalize_lexical(path: &Path) -> PathBuf {
     } else {
         out
     }
+}
+
+fn shallow_dir_bundle_size(dir: &Path, max_depth: usize) -> u64 {
+    if max_depth == 0 {
+        return 0;
+    }
+    let Ok(rd) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for entry in rd.flatten().take(128) {
+        let p = entry.path();
+        let Ok(meta) = fs::symlink_metadata(&p) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.is_dir() {
+            total = total.saturating_add(shallow_dir_bundle_size(&p, max_depth - 1));
+        } else {
+            total = total.saturating_add(meta.len());
+        }
+    }
+    total
 }
 
 impl FileSystemBackend for LocalFsBackend {

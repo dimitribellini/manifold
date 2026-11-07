@@ -52,15 +52,15 @@ Expand-Archive -Path manifold-windows-x86_64.zip -DestinationPath .
 
 ## Features
 
-- **Single & Dual-Pane Workspace**: Switch between Single Pane and Dual Pane with resizable splitters, live external directory change detection, and automatic session restore (`session.toml`) for open tabs, view modes, sort order, and panel dimensions.
+- **Single & Dual-Pane Workspace**: Switch between Single Pane and Dual Pane via the 2-icon toolbar pill switcher (`Cmd/Ctrl + Alt + T`) with resizable splitters, live external directory change detection, and automatic session restore (`session.toml`) for open tabs, view modes, sort order, and panel dimensions.
 - **Tabs, Favorites & Breadcrumbs**: Multiple tabs per pane, animated drag-and-drop reordering for tabs and sidebar `Favorites`, clickable breadcrumb navigation with sibling folder dropdowns, and `Cmd/Ctrl + L` path editing with `Tab` completion.
-- **View Modes (`List`, `Columns`, `Icons`)**: Sortable details table (directories grouped above files), Miller columns with inline media metadata, and icon grid with cached image thumbnails.
-- **Recursive Search**: Non-blocking Breadth-First Search across downstream subdirectories (local and remote SFTP) with wildcard (`*`, `?`) and multi-token matching, relative parent path display in `List` view, clickable `Search: "<query>"` header pill to clear the filter, and `Show in Enclosing Folder` in the context menu to jump to a matched item's parent directory.
+- **View Modes (`Icons`, `List`, `Columns`, `Tree`)**: Responsive 4-icon toolbar pill switcher (`Cmd/Ctrl + 1..4`) supporting a 3-column icon grid with cached image thumbnails, a flat sortable details table (`Name | Size | Date Modified` with directories grouped above files), Miller columns with inline media metadata, and a hierarchical expandable directory tree (`Tree` view with disclosure chevrons, tree guide lines, and `Left`/`Right` arrow expansion/collapse).
+- **Recursive Search**: Non-blocking Breadth-First Search across downstream subdirectories (local and remote SFTP) with wildcard (`*`, `?`) and multi-token matching, relative parent path display in `List` view, clickable `Search: "<query>"` header pill to clear the filter, and `Show in Enclosing Folder` in the context menu when a search match is located in a subfolder.
 - **Inspector & Previews**: Right-hand Inspector drawer (`Cmd/Ctrl + I`) for file metadata, photo/audio/video details, persistent 8-color tags, and `R/W/X` (`Octal`) permissions, plus Quick Look (`Space`) and hover previews for images, text, code, and documents.
 - **Background Transfers & Conflict Resolution**: Non-blocking local and remote file operations with progress tracking, bandwidth limiting, and pre-flight conflict resolution (`Replace`, `Replace Older`, `Keep Both`, `Skip`, `Stop`, with `Apply to all`).
 - **Integrated Terminal (Local & Remote SSH)**: Built-in VT100/Xterm terminal emulator (`>_`) with cell-aligned monospace rendering (`Menlo`, `Consolas`, `DejaVu Sans Mono`), 256/TrueColor SGR support, DEC box-drawing, 1,000-line scrollback, and alternate screen buffer (`top`, `htop`, `less`, `vim`). Runs a native POSIX PTY shell (`zsh`/`bash`) on macOS/Linux and ConPTY PowerShell (`pwsh`/`powershell`) on Windows, and automatically opens an interactive remote `ssh` PTY session when browsing a remote SFTP connection.
 - **Drag-and-Drop & Clipboard**: Drag-and-drop across panes, folder rows, tabs, breadcrumbs, sidebar items, and external OS applications (native `NSDraggingSession` on macOS and OS file clipboard integration).
-- **Archives, Open With, Sync & Batch Rename**: Create `.tar.gz` or `.zip` archives from single or multiple items, extract `.zip`, `.tar.gz`, `.tar.bz2`, `.tar.xz`, `.tar`, `.7z`, `.rar`, `.gz`, `.bz2`, and `.xz` archives in place, open files with external applications (`Open With…`), compare/sync directories, and batch-rename files.
+- **Archives, macOS Bundles, Open With, Sync & Batch Rename**: Create `.tar.gz` or `.zip` archives from single or multiple items, inspect archive contents directly via `Show Archive Contents`, extract `.zip`, `.tar.gz`, `.tar.bz2`, `.tar.xz`, `.tar`, `.7z`, `.rar`, `.gz`, `.bz2`, and `.xz` archives in place (unwrapping single `.app` bundles on macOS, preserving bundle signatures and stripping download quarantine attributes when extracting or copying `.app` bundles to `/Applications`, and treating `.app` directories as native Application packages with `Show Package Contents`), open files with external applications (`Open With…`), compare/sync directories, and batch-rename files.
 - **Themes & Typography**: Configurable font family, size, weight, and 6 color themes (`Cmd/Ctrl + ,`) persisted in `preferences.toml`.
 
 ---
@@ -84,8 +84,9 @@ Expand-Archive -Path manifold-windows-x86_64.zip -DestinationPath .
 | Shortcut | Action |
 | :--- | :--- |
 | `Up` / `Down` / `PageUp` / `PageDown` / `Home` / `End` | Move selection (`Shift` extends selection) |
-| `Right` / `Enter` | Open selected folder or file |
-| `Left` / `Backspace` | Go to parent directory |
+| `Right` / `Enter` | Open selected folder or file (`Right` expands folder in `Tree` view) |
+| `Left` / `Backspace` | Go to parent directory (`Left` collapses folder in `Tree` view) |
+| `Cmd/Ctrl + 1..4` | Switch view mode (`1` Icons, `2` List, `3` Columns, `4` Tree) |
 | `ESC` | Clear active input or close active menu, modal, or terminal drawer |
 | `Space` | Toggle Quick Look preview for selected item |
 | `Cmd/Ctrl + F` | Focus per-tab search/filter box |

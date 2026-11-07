@@ -255,6 +255,8 @@ component LucideIcon inherits Rectangle {
             ? "M 10 8 L 19 8 A 2 2 0 0 1 21 10 L 21 19 A 2 2 0 0 1 19 21 L 10 21 A 2 2 0 0 1 8 19 L 8 10 A 2 2 0 0 1 10 8 Z M 16 8 L 16 5 A 2 2 0 0 0 14 3 L 5 3 A 2 2 0 0 0 3 5 L 3 14 A 2 2 0 0 0 5 16 L 8 16"
             : root.kind == "archive"
             ? "M 21 8 L 21 21 L 3 21 L 3 8 M 1 3 L 23 3 L 23 8 L 1 8 Z M 10 12 L 14 12"
+            : root.kind == "archive-contents"
+            ? "M 9 14 L 4 9 L 9 4 M 20 20 L 20 13 A 4 4 0 0 0 16 9 L 4 9"
             : root.kind == "link"
             ? "M 10 13 A 5 5 0 0 0 17.54 13.54 L 20.54 10.54 A 5 5 0 0 0 13.47 3.47 L 11.75 5.18 M 14 11 A 5 5 0 0 0 6.46 10.46 L 3.46 13.46 A 5 5 0 0 0 10.53 20.53 L 12.24 18.82"
             : root.kind == "eye"
@@ -271,6 +273,18 @@ component LucideIcon inherits Rectangle {
             ? "M 12 2 L 15.09 8.26 L 22 9.27 L 17 14.14 L 18.18 21.02 L 12 17.77 L 5.82 21.02 L 7 14.14 L 2 9.27 L 8.91 8.26 Z"
             : root.kind == "columns"
             ? "M 4 3 L 20 3 A 2 2 0 0 1 22 5 L 22 19 A 2 2 0 0 1 20 21 L 4 21 A 2 2 0 0 1 2 19 L 2 5 A 2 2 0 0 1 4 3 Z M 12 3 L 12 21"
+            : root.kind == "view-icons"
+            ? "M 4 4 L 9.5 4 L 9.5 9.5 L 4 9.5 Z M 14.5 4 L 20 4 L 20 9.5 L 14.5 9.5 Z M 4 14.5 L 9.5 14.5 L 9.5 20 L 4 20 Z M 14.5 14.5 L 20 14.5 L 20 20 L 14.5 20 Z"
+            : root.kind == "view-list"
+            ? "M 3.5 6 L 5.5 6 M 9 6 L 20.5 6 M 3.5 12 L 5.5 12 M 9 12 L 20.5 12 M 3.5 18 L 5.5 18 M 9 18 L 20.5 18"
+            : root.kind == "view-columns"
+            ? "M 4 4 L 20 4 A 1.5 1.5 0 0 1 21.5 5.5 L 21.5 18.5 A 1.5 1.5 0 0 1 20 20 L 4 20 A 1.5 1.5 0 0 1 2.5 18.5 L 2.5 5.5 A 1.5 1.5 0 0 1 4 4 Z M 9 4 L 9 20 M 15 4 L 15 20"
+            : root.kind == "view-tree"
+            ? "M 3 3 L 9 3 L 9 8 L 3 8 Z M 6 8 L 6 19 L 11 19 M 6 13.5 L 11 13.5 M 13 13.5 L 21 13.5 M 13 19 L 21 19"
+            : root.kind == "pane-single"
+            ? "M 4 4 L 20 4 A 2 2 0 0 1 22 6 L 22 18 A 2 2 0 0 1 20 20 L 4 20 A 2 2 0 0 1 2 18 L 2 6 A 2 2 0 0 1 4 4 Z"
+            : root.kind == "pane-dual"
+            ? "M 4 4 L 20 4 A 2 2 0 0 1 22 6 L 22 18 A 2 2 0 0 1 20 20 L 4 20 A 2 2 0 0 1 2 18 L 2 6 A 2 2 0 0 1 4 4 Z M 12 4 L 12 20"
             : "M 14 2 L 6 2 A 2 2 0 0 0 4 4 L 4 20 A 2 2 0 0 0 6 22 L 18 22 A 2 2 0 0 0 20 20 L 20 8 Z M 14 2 L 14 8 L 20 8 M 8 13 L 16 13 M 8 17 L 13 17";
     }
 }
@@ -359,6 +373,7 @@ export component FileRow inherits Rectangle {
     in property <bool> selected: false;
     in property <bool> pane_focused: true;
     in property <int> depth: 0;
+    in property <bool> tree_mode: false;
     in property <bool> has_color_tag: false;
     in property <string> color_tag_name: "";
     in property <brush> color_tag_brush: transparent;
@@ -470,13 +485,36 @@ export component FileRow inherits Rectangle {
         }
     }
 
+    // Subtle vertical/horizontal tree guide connector for nested rows in Tree View
+    if root.tree_mode && root.depth > 0 : Rectangle {
+        x: 8px + (root.depth - 1) * 16px + 6px;
+        y: 0px;
+        width: 10px;
+        height: parent.height;
+        background: transparent;
+        Rectangle {
+            x: 0px;
+            y: 0px;
+            width: 1px;
+            height: parent.height;
+            background: root.selected ? #FFFFFF55 : #383842;
+        }
+        Rectangle {
+            x: 0px;
+            y: parent.height / 2;
+            width: 8px;
+            height: 1px;
+            background: root.selected ? #FFFFFF55 : #383842;
+        }
+    }
+
     HorizontalLayout {
-        padding-left: 8px + root.depth * 16px;
+        padding-left: root.tree_mode ? (8px + root.depth * 16px) : 10px;
         padding-right: 12px;
         spacing: 8px;
 
-        // Expand/collapse chevron for directories
-        Rectangle {
+        // Expand/collapse chevron for directories in Tree View
+        if root.tree_mode : Rectangle {
             width: 14px;
             background: transparent;
             if root.is_dir : LucideIcon {
@@ -526,18 +564,20 @@ export component FileRow inherits Rectangle {
                 icon-size: 16px;
                 kind: root.is_dir
                     ? "folder"
-                    : (root.is_image
-                        ? "image"
-                        : ((root.ext_badge == "ZIP" || root.ext_badge == "TAR" || root.ext_badge == "GZ" || root.ext_badge == "ISO" || root.ext_badge == "7Z" || root.ext_badge == "RAR")
-                            ? "archive"
-                            : ((root.ext_badge == "MP3" || root.ext_badge == "WAV" || root.ext_badge == "FLAC" || root.ext_badge == "M4A" || root.ext_badge == "AAC" || root.ext_badge == "OGG")
-                                ? "music"
-                                : ((root.ext_badge == "MP4" || root.ext_badge == "MOV" || root.ext_badge == "MKV" || root.ext_badge == "WEBM" || root.ext_badge == "AVI")
-                                    ? "movies"
-                                    : (root.is_executable ? "terminal" : "documents")))));
+                    : (root.ext_badge == "APP"
+                        ? "applications"
+                        : (root.is_image
+                            ? "image"
+                            : ((root.ext_badge == "ZIP" || root.ext_badge == "TAR" || root.ext_badge == "GZ" || root.ext_badge == "ISO" || root.ext_badge == "7Z" || root.ext_badge == "RAR")
+                                ? "archive"
+                                : ((root.ext_badge == "MP3" || root.ext_badge == "WAV" || root.ext_badge == "FLAC" || root.ext_badge == "M4A" || root.ext_badge == "AAC" || root.ext_badge == "OGG")
+                                    ? "music"
+                                    : ((root.ext_badge == "MP4" || root.ext_badge == "MOV" || root.ext_badge == "MKV" || root.ext_badge == "WEBM" || root.ext_badge == "AVI")
+                                        ? "movies"
+                                        : (root.is_executable ? "terminal" : "documents"))))));
                 icon-color: root.has_color_tag
                     ? root.color_tag_brush
-                    : (root.is_dir
+                    : ((root.is_dir || root.ext_badge == "APP")
                         ? #38B6FF
                         : (root.ext_badge == "PDF"
                             ? #FF5F56
@@ -651,7 +691,9 @@ component SidebarItemIcon inherits Rectangle {
 
 // Clean Segmented Control Button (Unified Toolbar & Inspector Tabs)
 component SegmentControlButton inherits Rectangle {
-    in property <string> label;
+    in property <string> label: "";
+    in property <string> icon-kind: "";
+    in property <bool> pill-style: false;
     in property <bool> active: false;
     in property <bool> enabled-state: true;
     in property <length> btn-width: 64px;
@@ -663,12 +705,24 @@ component SegmentControlButton inherits Rectangle {
     callback clicked();
 
     width: btn-width;
-    height: 27px;
-    border-radius: 5px;
+    height: root.pill-style ? 24px : 26px;
+    horizontal-stretch: 0;
+    border-radius: root.pill-style ? 12px : 5px;
     opacity: enabled-state ? 1.0 : 0.3;
-    background: active ? root.accent-bg : (touch.has-hover && enabled-state ? #26262B : transparent);
+    background: active
+        ? (root.pill-style ? #3A3A44 : root.accent-bg)
+        : (touch.has-hover && enabled-state ? #282830 : transparent);
+    border-width: 0px;
 
-    Text {
+    if root.icon-kind != "" : LucideIcon {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        icon-size: 16px;
+        kind: root.icon-kind;
+        icon-color: active ? #FFFFFF : (touch.has-hover ? #E5E5EE : #C2C2CC);
+    }
+
+    if root.label != "" : Text {
         text: root.label;
         color: active ? #FFFFFF : #B4B4BE;
         font-size: 12.5px + root.font-delta * 0.5;
@@ -984,20 +1038,22 @@ component PolaroidCell inherits Rectangle {
                     x: (parent.width - self.width) / 2;
                     y: 12px;
                     icon-size: 28px;
-                    kind: item.is-image
-                        ? "image"
-                        : ((item.ext-badge == "ZIP" || item.ext-badge == "TAR" || item.ext-badge == "GZ" || item.ext-badge == "ISO" || item.ext-badge == "7Z" || item.ext-badge == "RAR")
-                            ? "archive"
-                            : ((item.ext-badge == "MP3" || item.ext-badge == "FLAC" || item.ext-badge == "WAV" || item.ext-badge == "M4A" || item.ext-badge == "OGG" || item.ext-badge == "AAC")
-                                ? "music"
-                                : ((item.ext-badge == "MP4" || item.ext-badge == "MKV" || item.ext-badge == "MOV" || item.ext-badge == "AVI" || item.ext-badge == "WEBM")
-                                    ? "movies"
-                                    : (item.is-executable ? "terminal" : "documents"))));
+                    kind: item.ext-badge == "APP"
+                        ? "applications"
+                        : (item.is-image
+                            ? "image"
+                            : ((item.ext-badge == "ZIP" || item.ext-badge == "TAR" || item.ext-badge == "GZ" || item.ext-badge == "ISO" || item.ext-badge == "7Z" || item.ext-badge == "RAR")
+                                ? "archive"
+                                : ((item.ext-badge == "MP3" || item.ext-badge == "FLAC" || item.ext-badge == "WAV" || item.ext-badge == "M4A" || item.ext-badge == "OGG" || item.ext-badge == "AAC")
+                                    ? "music"
+                                    : ((item.ext-badge == "MP4" || item.ext-badge == "MKV" || item.ext-badge == "MOV" || item.ext-badge == "AVI" || item.ext-badge == "WEBM")
+                                        ? "movies"
+                                        : (item.is-executable ? "terminal" : "documents")))));
                     icon-color: item.has-color-tag
                         ? item.color-tag-brush
                         : (item.ext-badge == "PDF"
                             ? #FF5F56
-                            : ((item.ext-badge == "DOC" || item.ext-badge == "DOCX")
+                            : ((item.ext-badge == "DOC" || item.ext-badge == "DOCX" || item.ext-badge == "APP")
                                 ? #4CC2FF
                                 : ((item.ext-badge == "ZIP" || item.ext-badge == "TAR" || item.ext-badge == "GZ" || item.ext-badge == "ISO")
                                     ? #FF9F0A
@@ -1311,6 +1367,7 @@ export component ManifoldWindow inherits Window {
     in-out property <length> drag-left-pane-w: 720px;
     in-out property <length> drag-left-scroll-y: 0px;
     in-out property <length> drag-right-scroll-y: 0px;
+    in-out property <length> drag-sidebar-scroll-y: 0px;
 
     // Sibling Directory Dropdown Popover
     in-out property <bool> show-sibling-dropdown: false;
@@ -1414,6 +1471,8 @@ export component ManifoldWindow inherits Window {
     in-out property <bool> context-target-is-favorite: false;
     in-out property <bool> context-target-is-dir: true;
     in-out property <bool> context-target-is-archive: false;
+    in-out property <bool> context-target-is-app-bundle: false;
+    in-out property <bool> context-can-show-enclosing: false;
     in-out property <bool> context-is-blank: false;
     in-out property <bool> current-folder-is-favorite: false;
 
@@ -1670,28 +1729,29 @@ export component ManifoldWindow inherits Window {
                     padding-left: 12px;
                     padding-right: 12px;
                     spacing: 10px;
-                    alignment: space-between;
 
-                    // Left Section: "Manifold ▾" Main Menu, Back, Forward, Parent Up, and Elided Active Title
+                    // Left Section: "Manifold ▾" Main Menu, Back, Forward, Parent Up, and Responsive Active Title
                     HorizontalLayout {
-                        width: Math.clamp(root.width - 980px, 280px, 440px);
+                        horizontal-stretch: 1;
+                        min-width: 260px;
                         spacing: 6px;
                         alignment: start;
 
-                        // Dedicated "Manifold" Main Application Menu Button
+                        // Dedicated "Manifold" Main Application Menu Button (auto-sized so chevron never clips)
                         Rectangle {
                             height: 30px;
-                            y: 6px;
-                            min-width: 96px;
+                            y: (parent.height - self.height) / 2;
+                            width: app-menu-layout.preferred-width;
+                            horizontal-stretch: 0;
                             border-radius: 6px;
                             background: root.show-app-menu
                                 ? root.theme-accent
                                 : (app-menu-touch.has-hover ? root.theme-bg-hover : root.theme-bg-sidebar);
                             border-width: 1px;
                             border-color: root.show-app-menu ? #388BFD : root.theme-border;
-                            HorizontalLayout {
-                                padding-left: 9px;
-                                padding-right: 8px;
+                            app-menu-layout := HorizontalLayout {
+                                padding-left: 10px;
+                                padding-right: 10px;
                                 spacing: 6px;
                                 alignment: center;
                                 LucideIcon {
@@ -1723,21 +1783,21 @@ export component ManifoldWindow inherits Window {
                         }
 
                         ToolbarButton {
-                            y: 6px;
+                            y: (parent.height - self.height) / 2;
                             icon-kind: "chevron-left";
                             tooltip: "Back (Alt+Left)";
                             enabled-state: root.can-go-back;
                             clicked => { root.go-back(); }
                         }
                         ToolbarButton {
-                            y: 6px;
+                            y: (parent.height - self.height) / 2;
                             icon-kind: "chevron-right";
                             tooltip: "Forward (Alt+Right)";
                             enabled-state: root.can-go-forward;
                             clicked => { root.go-forward(); }
                         }
                         ToolbarButton {
-                            y: 6px;
+                            y: (parent.height - self.height) / 2;
                             icon-kind: "arrow-up";
                             tooltip: "Enclosing Folder (Alt+Up)";
                             clicked => {
@@ -1746,10 +1806,12 @@ export component ManifoldWindow inherits Window {
                         }
                         Rectangle {
                             width: 4px;
+                            horizontal-stretch: 0;
                             background: transparent;
                         }
                         Rectangle {
                             horizontal-stretch: 1;
+                            min-width: 72px;
                             background: transparent;
                             Text {
                                 width: 100%;
@@ -1773,24 +1835,51 @@ export component ManifoldWindow inherits Window {
 
                     // Center Section: Clean Segmented Controls for View Modes & Pane Layout
                     HorizontalLayout {
-                        spacing: 10px;
+                        horizontal-stretch: 0;
+                        spacing: 8px;
                         alignment: center;
 
-                        // View Modes: [ List | Columns | Icons ]
+                        // View Modes Pill Switcher: [ ⊞ Icons | ≔ List | ▥ Columns | 🌿 Tree ]
                         Rectangle {
                             height: 30px;
-                            y: 6px;
-                            border-radius: 6px;
+                            y: (parent.height - self.height) / 2;
+                            horizontal-stretch: 0;
+                            border-radius: 15px;
                             background: root.theme-bg-canvas;
                             border-width: 1px;
                             border-color: root.theme-border;
                             HorizontalLayout {
-                                padding: 2px;
+                                padding-left: 3px;
+                                padding-right: 3px;
                                 spacing: 2px;
+                                alignment: center;
                                 SegmentControlButton {
-                                    label: "List";
-                                    btn-width: 56px;
-                                    tooltip: "List View (Ctrl/Cmd+1)";
+                                    y: (parent.height - self.height) / 2;
+                                    icon-kind: "view-icons";
+                                    pill-style: true;
+                                    btn-width: 34px;
+                                    tooltip: "Icons View (Ctrl/Cmd+1)";
+                                    accent-bg: root.theme-accent;
+                                    font-family: root.resolved-font-family;
+                                    active: (root.right-pane-active && root.dual-pane-mode ? root.right-view-mode : root.left-view-mode) == 1;
+                                    clicked => {
+                                        l-flick.viewport-y = 0px;
+                                        l-flick.viewport-x = 0px;
+                                        root.set-view-mode(1);
+                                    }
+                                }
+                                Rectangle {
+                                    width: 1px;
+                                    height: 14px;
+                                    y: (parent.height - self.height) / 2;
+                                    background: ((root.right-pane-active && root.dual-pane-mode ? root.right-view-mode : root.left-view-mode) == 1 || (root.right-pane-active && root.dual-pane-mode ? root.right-view-mode : root.left-view-mode) == 0) ? transparent : #2E2E36;
+                                }
+                                SegmentControlButton {
+                                    y: (parent.height - self.height) / 2;
+                                    icon-kind: "view-list";
+                                    pill-style: true;
+                                    btn-width: 34px;
+                                    tooltip: "List View (Ctrl/Cmd+2)";
                                     accent-bg: root.theme-accent;
                                     font-family: root.resolved-font-family;
                                     active: (root.right-pane-active && root.dual-pane-mode ? root.right-view-mode : root.left-view-mode) == 0;
@@ -1800,9 +1889,17 @@ export component ManifoldWindow inherits Window {
                                         root.set-view-mode(0);
                                     }
                                 }
+                                Rectangle {
+                                    width: 1px;
+                                    height: 14px;
+                                    y: (parent.height - self.height) / 2;
+                                    background: ((root.right-pane-active && root.dual-pane-mode ? root.right-view-mode : root.left-view-mode) == 0 || (root.right-pane-active && root.dual-pane-mode ? root.right-view-mode : root.left-view-mode) == 2) ? transparent : #2E2E36;
+                                }
                                 SegmentControlButton {
-                                    label: "Columns";
-                                    btn-width: 72px;
+                                    y: (parent.height - self.height) / 2;
+                                    icon-kind: "view-columns";
+                                    pill-style: true;
+                                    btn-width: 34px;
                                     tooltip: "Miller Columns View (Ctrl/Cmd+3)";
                                     accent-bg: root.theme-accent;
                                     font-family: root.resolved-font-family;
@@ -1813,37 +1910,50 @@ export component ManifoldWindow inherits Window {
                                         root.set-view-mode(2);
                                     }
                                 }
+                                Rectangle {
+                                    width: 1px;
+                                    height: 14px;
+                                    y: (parent.height - self.height) / 2;
+                                    background: ((root.right-pane-active && root.dual-pane-mode ? root.right-view-mode : root.left-view-mode) == 2 || (root.right-pane-active && root.dual-pane-mode ? root.right-view-mode : root.left-view-mode) == 3) ? transparent : #2E2E36;
+                                }
                                 SegmentControlButton {
-                                    label: "Icons";
-                                    btn-width: 56px;
-                                    tooltip: "Icon Grid View (Ctrl/Cmd+2)";
+                                    y: (parent.height - self.height) / 2;
+                                    icon-kind: "view-tree";
+                                    pill-style: true;
+                                    btn-width: 34px;
+                                    tooltip: "Tree View (Ctrl/Cmd+4)";
                                     accent-bg: root.theme-accent;
                                     font-family: root.resolved-font-family;
-                                    active: (root.right-pane-active && root.dual-pane-mode ? root.right-view-mode : root.left-view-mode) == 1;
+                                    active: (root.right-pane-active && root.dual-pane-mode ? root.right-view-mode : root.left-view-mode) == 3;
                                     clicked => {
                                         l-flick.viewport-y = 0px;
                                         l-flick.viewport-x = 0px;
-                                        root.set-view-mode(1);
+                                        root.set-view-mode(3);
                                     }
                                 }
                             }
                         }
 
-                        // Layout: [ Single Pane | Dual Pane ]
+                        // Pane Layout Pill Switcher: [ ▢ Single Pane | ◫ Dual Pane ]
                         Rectangle {
                             height: 30px;
-                            y: 6px;
-                            border-radius: 6px;
+                            y: (parent.height - self.height) / 2;
+                            horizontal-stretch: 0;
+                            border-radius: 15px;
                             background: root.theme-bg-canvas;
                             border-width: 1px;
                             border-color: root.theme-border;
                             HorizontalLayout {
-                                padding: 2px;
+                                padding-left: 3px;
+                                padding-right: 3px;
                                 spacing: 2px;
+                                alignment: center;
                                 SegmentControlButton {
-                                    label: "Single Pane";
-                                    btn-width: 90px;
-                                    tooltip: "Single File Browser Pane";
+                                    y: (parent.height - self.height) / 2;
+                                    icon-kind: "pane-single";
+                                    pill-style: true;
+                                    btn-width: 34px;
+                                    tooltip: "Single Pane View (Ctrl/Cmd+Alt+T)";
                                     accent-bg: root.theme-accent;
                                     font-family: root.resolved-font-family;
                                     active: !root.dual-pane-mode;
@@ -1853,10 +1963,18 @@ export component ManifoldWindow inherits Window {
                                         }
                                     }
                                 }
+                                Rectangle {
+                                    width: 1px;
+                                    height: 14px;
+                                    y: (parent.height - self.height) / 2;
+                                    background: transparent;
+                                }
                                 SegmentControlButton {
-                                    label: "Dual Pane";
-                                    btn-width: 82px;
-                                    tooltip: "Dual-Pane Split View";
+                                    y: (parent.height - self.height) / 2;
+                                    icon-kind: "pane-dual";
+                                    pill-style: true;
+                                    btn-width: 34px;
+                                    tooltip: "Dual-Pane Split View (Ctrl/Cmd+Alt+T)";
                                     accent-bg: root.theme-accent;
                                     font-family: root.resolved-font-family;
                                     active: root.dual-pane-mode;
@@ -1870,15 +1988,25 @@ export component ManifoldWindow inherits Window {
                         }
                     }
 
-                    // Right Section: Single-Border Search Input (No nested CleanLineEdit artifact) & Action Icons
+                    // Flexible Right-Center Spacer so Center Section stays balanced on wide monitors while collapsing to 0px on compact windows
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        min-width: 0px;
+                        max-width: Math.max(0px, (root.width - 1060px) * 0.45);
+                        background: transparent;
+                    }
+
+                    // Right Section: Responsive Single-Border Search Input & Action Icons
                     HorizontalLayout {
+                        horizontal-stretch: 0;
                         spacing: 6px;
                         alignment: end;
 
                         Rectangle {
-                            width: 214px;
+                            width: Math.clamp(root.width * 0.19, 152px, 260px);
                             height: 30px;
-                            y: 6px;
+                            y: (parent.height - self.height) / 2;
+                            horizontal-stretch: 0;
                             border-radius: 6px;
                             background: root.theme-bg-canvas;
                             border-width: 1px;
@@ -1942,7 +2070,8 @@ export component ManifoldWindow inherits Window {
                                 if root.search-query != "" : Rectangle {
                                     width: 18px;
                                     height: 18px;
-                                    y: 5px;
+                                    y: (parent.height - self.height) / 2;
+                                    horizontal-stretch: 0;
                                     border-radius: 9px;
                                     background: clear-filter-touch.has-hover ? #383842 : #282830;
                                     LucideIcon {
@@ -1964,7 +2093,7 @@ export component ManifoldWindow inherits Window {
                         }
 
                         ToolbarButton {
-                            y: 6px;
+                            y: (parent.height - self.height) / 2;
                             icon-kind: "globe";
                             tooltip: "New Remote Connection";
                             tooltip-align-right: true;
@@ -1972,7 +2101,7 @@ export component ManifoldWindow inherits Window {
                             clicked => { root.open-connect-dialog(); }
                         }
                         ToolbarButton {
-                            y: 6px;
+                            y: (parent.height - self.height) / 2;
                             icon-kind: "terminal";
                             tooltip: "Toggle Embedded Bottom Terminal";
                             tooltip-align-right: true;
@@ -1984,8 +2113,9 @@ export component ManifoldWindow inherits Window {
                         // Tasks & Sync Button (Spinning Icon + Inline Progress Bar + Popover Trigger)
                         Rectangle {
                             height: 30px;
-                            y: 6px;
-                            min-width: root.task-running ? 136px : (root.transfer-rows.length > 0 ? 48px : 30px);
+                            y: (parent.height - self.height) / 2;
+                            width: root.task-running ? 136px : (root.transfer-rows.length > 0 ? 48px : 30px);
+                            horizontal-stretch: 0;
                             border-radius: 6px;
                             background: root.show-tasks-popover || root.task-running
                                 ? #0D52BF33
@@ -1996,8 +2126,8 @@ export component ManifoldWindow inherits Window {
                                 : (root.show-tasks-popover ? root.theme-accent : root.theme-border);
 
                             HorizontalLayout {
-                                padding-left: 8px;
-                                padding-right: 8px;
+                                padding-left: 7px;
+                                padding-right: 7px;
                                 spacing: 6px;
                                 alignment: center;
 
@@ -2083,7 +2213,7 @@ export component ManifoldWindow inherits Window {
                         }
 
                         ToolbarButton {
-                            y: 6px;
+                            y: (parent.height - self.height) / 2;
                             icon-kind: "inspector";
                             tooltip: "Toggle Inspector Drawer (Ctrl/Cmd+I)";
                             tooltip-align-right: true;
@@ -2112,12 +2242,16 @@ export component ManifoldWindow inherits Window {
                     VerticalLayout {
                         padding-top: 8px;
                         padding-bottom: 8px;
-                        ScrollView {
+                        sb-flick := Flickable {
+                            interactive: false;
+                            viewport-y <=> root.drag-sidebar-scroll-y;
+                            viewport-width: self.width;
                             viewport-height: Math.max(
                                 self.height,
-                                root.sidebar-items.length * (30px + Math.max(0px, root.font-size-delta * 1.5)) + 16px
+                                sb-col.preferred-height + 8px
                             );
-                            VerticalLayout {
+                            sb-col := VerticalLayout {
+                                alignment: start;
                                 spacing: 2px;
                                 padding-left: 8px;
                                 padding-right: 8px;
@@ -2168,6 +2302,14 @@ export component ManifoldWindow inherits Window {
                                                 root.dragging-sidebar-idx = -1;
                                                 root.drag-hover-fav-idx = -1;
                                             }
+                                        }
+                                        scroll-event(ev) => {
+                                            sb-flick.viewport-y = Math.clamp(
+                                                sb-flick.viewport-y + ev.delta-y,
+                                                Math.min(0px, sb-flick.height - sb-flick.viewport-height),
+                                                0px
+                                            );
+                                            return accept;
                                         }
                                     }
 
@@ -2795,7 +2937,7 @@ export component ManifoldWindow inherits Window {
                         }
 
                         // TABLE HEADER ROW (Clean Title-Case "Name | Size | Date Modified" matching original screenshot)
-                        if root.left-view-mode == 0 : Rectangle {
+                        if root.left-view-mode == 0 || root.left-view-mode == 3 : Rectangle {
                             z: 10;
                             height: 26px + Math.max(0px, root.font-size-delta);
                             background: #17171B;
@@ -3011,14 +3153,14 @@ export component ManifoldWindow inherits Window {
                                 width: parent.width;
                                 height: parent.height;
                                 interactive: false;
-                                viewport-width: root.left-view-mode == 0
+                                viewport-width: (root.left-view-mode == 0 || root.left-view-mode == 3)
                                     ? Math.max(self.width, 320px + root.size-col-width + root.date-col-width)
                                     : (root.left-view-mode == 2
                                         ? Math.max(self.width, 460px)
                                         : Math.max(self.width, 360px));
                                 viewport-height: Math.min(
                                     9600px,
-                                    root.left-view-mode == 0
+                                    (root.left-view-mode == 0 || root.left-view-mode == 3)
                                         ? Math.max(self.height, root.left-rows.length * (29px + Math.max(0px, root.font-size-delta * 2.0)) + 20px)
                                         : (root.left-view-mode == 1
                                             ? Math.max(self.height, root.left-icon-triples.length * (138px + Math.max(0px, root.font-size-delta * 4.0)) + 28px)
@@ -3111,8 +3253,8 @@ export component ManifoldWindow inherits Window {
                                         }
                                     }
 
-                                    // Mode 0: Standardized 26px FileRow List View
-                                    if root.left-view-mode == 0 : VerticalLayout {
+                                    // Mode 0 (List View) & Mode 3 (Tree View): Standardized 26px FileRow Table
+                                    if root.left-view-mode == 0 || root.left-view-mode == 3 : VerticalLayout {
                                         alignment: start;
                                         padding-left: 6px;
                                         padding-right: 6px;
@@ -3132,6 +3274,7 @@ export component ManifoldWindow inherits Window {
                                             selected: row.is-selected;
                                             pane_focused: !root.right-pane-active || !root.dual-pane-mode;
                                             depth: row.depth;
+                                            tree_mode: root.left-view-mode == 3;
                                             has_color_tag: row.has-color-tag;
                                             color_tag_name: row.color-tag-name;
                                             color_tag_brush: row.color-tag-brush;
@@ -3162,16 +3305,21 @@ export component ManifoldWindow inherits Window {
                                                 root.hover-file-row(false, r-idx, abs_x, abs_y);
                                             }
                                             row-shift-drag(my) => {
-                                                root.shift-drag-select(false, r-idx + Math.round((my - 13px) / 27px));
+                                                root.shift-drag-select(
+                                                    false,
+                                                    r-idx + Math.round((my - 14px) / (29px + Math.max(0px, root.font-size-delta * 2.0)))
+                                                );
                                             }
                                             row-drag-moved(abs_x, abs_y) => {
                                                 root.drag-left-pane-w = l-flick.width;
                                                 root.drag-left-scroll-y = l-flick.viewport-y;
+                                                root.drag-right-scroll-y = root.right-scroll-y;
                                                 root.update-drag-cursor(false, r-idx, abs_x, abs_y);
                                             }
                                             row-drag-ended(abs_x, abs_y) => {
                                                 root.drag-left-pane-w = l-flick.width;
                                                 root.drag-left-scroll-y = l-flick.viewport-y;
+                                                root.drag-right-scroll-y = root.right-scroll-y;
                                                 root.finish-drag-drop(false, r-idx, abs_x, abs_y);
                                             }
                                             row-drag-to-other-pane => {
@@ -3355,18 +3503,20 @@ export component ManifoldWindow inherits Window {
                                                             icon-size: 15px;
                                                             kind: p-row.is-dir
                                                                 ? "folder"
-                                                                : (p-row.is-image
-                                                                    ? "image"
-                                                                    : ((p-row.ext-badge == "ZIP" || p-row.ext-badge == "TAR" || p-row.ext-badge == "GZ" || p-row.ext-badge == "ISO")
-                                                                        ? "archive"
-                                                                        : ((p-row.ext-badge == "MP3" || p-row.ext-badge == "FLAC" || p-row.ext-badge == "WAV" || p-row.ext-badge == "M4A" || p-row.ext-badge == "OGG" || p-row.ext-badge == "AAC")
-                                                                            ? "music"
-                                                                            : ((p-row.ext-badge == "MP4" || p-row.ext-badge == "MKV" || p-row.ext-badge == "MOV" || p-row.ext-badge == "AVI" || p-row.ext-badge == "WEBM")
-                                                                                ? "movies"
-                                                                                : (p-row.is-executable ? "terminal" : "documents")))));
+                                                                : (p-row.ext-badge == "APP"
+                                                                    ? "applications"
+                                                                    : (p-row.is-image
+                                                                        ? "image"
+                                                                        : ((p-row.ext-badge == "ZIP" || p-row.ext-badge == "TAR" || p-row.ext-badge == "GZ" || p-row.ext-badge == "ISO")
+                                                                            ? "archive"
+                                                                            : ((p-row.ext-badge == "MP3" || p-row.ext-badge == "FLAC" || p-row.ext-badge == "WAV" || p-row.ext-badge == "M4A" || p-row.ext-badge == "OGG" || p-row.ext-badge == "AAC")
+                                                                                ? "music"
+                                                                                : ((p-row.ext-badge == "MP4" || p-row.ext-badge == "MKV" || p-row.ext-badge == "MOV" || p-row.ext-badge == "AVI" || p-row.ext-badge == "WEBM")
+                                                                                    ? "movies"
+                                                                                    : (p-row.is-executable ? "terminal" : "documents"))))));
                                                             icon-color: p-row.has-color-tag
                                                                 ? p-row.color-tag-brush
-                                                                : (p-row.is-dir
+                                                                : ((p-row.is-dir || p-row.ext-badge == "APP")
                                                                     ? #38B6FF
                                                                     : (p-row.ext-badge == "PDF"
                                                                         ? #FF5F56
@@ -3459,18 +3609,20 @@ export component ManifoldWindow inherits Window {
                                                             icon-size: 15px;
                                                             kind: c-row.is-dir
                                                                 ? "folder"
-                                                                : (c-row.is-image
-                                                                    ? "image"
-                                                                    : ((c-row.ext-badge == "ZIP" || c-row.ext-badge == "TAR" || c-row.ext-badge == "GZ" || c-row.ext-badge == "ISO")
-                                                                        ? "archive"
-                                                                        : ((c-row.ext-badge == "MP3" || c-row.ext-badge == "FLAC" || c-row.ext-badge == "WAV" || c-row.ext-badge == "M4A" || c-row.ext-badge == "OGG" || c-row.ext-badge == "AAC")
-                                                                            ? "music"
-                                                                            : ((c-row.ext-badge == "MP4" || c-row.ext-badge == "MKV" || c-row.ext-badge == "MOV" || c-row.ext-badge == "AVI" || c-row.ext-badge == "WEBM")
-                                                                                ? "movies"
-                                                                                : (c-row.is-executable ? "terminal" : "documents")))));
+                                                                : (c-row.ext-badge == "APP"
+                                                                    ? "applications"
+                                                                    : (c-row.is-image
+                                                                        ? "image"
+                                                                        : ((c-row.ext-badge == "ZIP" || c-row.ext-badge == "TAR" || c-row.ext-badge == "GZ" || c-row.ext-badge == "ISO")
+                                                                            ? "archive"
+                                                                            : ((c-row.ext-badge == "MP3" || c-row.ext-badge == "FLAC" || c-row.ext-badge == "WAV" || c-row.ext-badge == "M4A" || c-row.ext-badge == "OGG" || c-row.ext-badge == "AAC")
+                                                                                ? "music"
+                                                                                : ((c-row.ext-badge == "MP4" || c-row.ext-badge == "MKV" || c-row.ext-badge == "MOV" || c-row.ext-badge == "AVI" || c-row.ext-badge == "WEBM")
+                                                                                    ? "movies"
+                                                                                    : (c-row.is-executable ? "terminal" : "documents"))))));
                                                             icon-color: c-row.has-color-tag
                                                                 ? c-row.color-tag-brush
-                                                                : (c-row.is-dir
+                                                                : ((c-row.is-dir || c-row.ext-badge == "APP")
                                                                     ? #38B6FF
                                                                     : (c-row.ext-badge == "PDF"
                                                                         ? #FF5F56
@@ -4351,7 +4503,7 @@ export component ManifoldWindow inherits Window {
                         }
 
                         // Right Pane Table Header Row (Clean Title-Case "Name | Size | Date Modified")
-                        if root.right-view-mode == 0 : Rectangle {
+                        if root.right-view-mode == 0 || root.right-view-mode == 3 : Rectangle {
                             z: 10;
                             height: 26px + Math.max(0px, root.font-size-delta);
                             background: #17171B;
@@ -4659,14 +4811,14 @@ export component ManifoldWindow inherits Window {
                                 height: parent.height;
                                 interactive: false;
                                 viewport-y <=> root.right-scroll-y;
-                                viewport-width: root.right-view-mode == 0
+                                viewport-width: (root.right-view-mode == 0 || root.right-view-mode == 3)
                                     ? Math.max(self.width, 320px + root.size-col-width + root.date-col-width)
                                     : (root.right-view-mode == 2
                                         ? Math.max(self.width, root.miller-col-width * 2 + 280px)
                                         : Math.max(self.width, 360px));
                                 viewport-height: Math.min(
                                     9600px,
-                                    root.right-view-mode == 0
+                                    (root.right-view-mode == 0 || root.right-view-mode == 3)
                                         ? Math.max(self.height, root.right-rows.length * (29px + Math.max(0px, root.font-size-delta * 2.0)) + 20px)
                                         : (root.right-view-mode == 1
                                             ? Math.max(self.height, root.right-icon-triples.length * (138px + Math.max(0px, root.font-size-delta * 4.0)) + 28px)
@@ -4675,7 +4827,7 @@ export component ManifoldWindow inherits Window {
 
                                 VerticalLayout {
                                     alignment: start;
-                                    if root.right-view-mode == 0 : VerticalLayout {
+                                    if root.right-view-mode == 0 || root.right-view-mode == 3 : VerticalLayout {
                                         alignment: start;
                                         padding-left: 6px;
                                         padding-right: 6px;
@@ -4695,6 +4847,7 @@ export component ManifoldWindow inherits Window {
                                             selected: row.is-selected;
                                             pane_focused: root.right-pane-active;
                                             depth: row.depth;
+                                            tree_mode: root.right-view-mode == 3;
                                             has_color_tag: row.has-color-tag;
                                             color_tag_name: row.color-tag-name;
                                             color_tag_brush: row.color-tag-brush;
@@ -4949,18 +5102,20 @@ export component ManifoldWindow inherits Window {
                                                             icon-size: 15px;
                                                             kind: p-row.is-dir
                                                                 ? "folder"
-                                                                : (p-row.is-image
-                                                                    ? "image"
-                                                                    : ((p-row.ext-badge == "ZIP" || p-row.ext-badge == "TAR" || p-row.ext-badge == "GZ" || p-row.ext-badge == "ISO")
-                                                                        ? "archive"
-                                                                        : ((p-row.ext-badge == "MP3" || p-row.ext-badge == "FLAC" || p-row.ext-badge == "WAV" || p-row.ext-badge == "M4A" || p-row.ext-badge == "OGG" || p-row.ext-badge == "AAC")
-                                                                            ? "music"
-                                                                            : ((p-row.ext-badge == "MP4" || p-row.ext-badge == "MKV" || p-row.ext-badge == "MOV" || p-row.ext-badge == "AVI" || p-row.ext-badge == "WEBM")
-                                                                                ? "movies"
-                                                                                : (p-row.is-executable ? "terminal" : "documents")))));
+                                                                : (p-row.ext-badge == "APP"
+                                                                    ? "applications"
+                                                                    : (p-row.is-image
+                                                                        ? "image"
+                                                                        : ((p-row.ext-badge == "ZIP" || p-row.ext-badge == "TAR" || p-row.ext-badge == "GZ" || p-row.ext-badge == "ISO")
+                                                                            ? "archive"
+                                                                            : ((p-row.ext-badge == "MP3" || p-row.ext-badge == "FLAC" || p-row.ext-badge == "WAV" || p-row.ext-badge == "M4A" || p-row.ext-badge == "OGG" || p-row.ext-badge == "AAC")
+                                                                                ? "music"
+                                                                                : ((p-row.ext-badge == "MP4" || p-row.ext-badge == "MKV" || p-row.ext-badge == "MOV" || p-row.ext-badge == "AVI" || p-row.ext-badge == "WEBM")
+                                                                                    ? "movies"
+                                                                                    : (p-row.is-executable ? "terminal" : "documents"))))));
                                                             icon-color: p-row.has-color-tag
                                                                 ? p-row.color-tag-brush
-                                                                : (p-row.is-dir
+                                                                : ((p-row.is-dir || p-row.ext-badge == "APP")
                                                                     ? #38B6FF
                                                                     : (p-row.ext-badge == "PDF"
                                                                         ? #FF5F56
@@ -5054,18 +5209,20 @@ export component ManifoldWindow inherits Window {
                                                             icon-size: 15px;
                                                             kind: c-row.is-dir
                                                                 ? "folder"
-                                                                : (c-row.is-image
-                                                                    ? "image"
-                                                                    : ((c-row.ext-badge == "ZIP" || c-row.ext-badge == "TAR" || c-row.ext-badge == "GZ" || c-row.ext-badge == "ISO")
-                                                                        ? "archive"
-                                                                        : ((c-row.ext-badge == "MP3" || c-row.ext-badge == "FLAC" || c-row.ext-badge == "WAV" || c-row.ext-badge == "M4A" || c-row.ext-badge == "OGG" || c-row.ext-badge == "AAC")
-                                                                            ? "music"
-                                                                            : ((c-row.ext-badge == "MP4" || c-row.ext-badge == "MKV" || c-row.ext-badge == "MOV" || c-row.ext-badge == "AVI" || c-row.ext-badge == "WEBM")
-                                                                                ? "movies"
-                                                                                : (c-row.is-executable ? "terminal" : "documents")))));
+                                                                : (c-row.ext-badge == "APP"
+                                                                    ? "applications"
+                                                                    : (c-row.is-image
+                                                                        ? "image"
+                                                                        : ((c-row.ext-badge == "ZIP" || c-row.ext-badge == "TAR" || c-row.ext-badge == "GZ" || c-row.ext-badge == "ISO")
+                                                                            ? "archive"
+                                                                            : ((c-row.ext-badge == "MP3" || c-row.ext-badge == "FLAC" || c-row.ext-badge == "WAV" || c-row.ext-badge == "M4A" || c-row.ext-badge == "OGG" || c-row.ext-badge == "AAC")
+                                                                                ? "music"
+                                                                                : ((c-row.ext-badge == "MP4" || c-row.ext-badge == "MKV" || c-row.ext-badge == "MOV" || c-row.ext-badge == "AVI" || c-row.ext-badge == "WEBM")
+                                                                                    ? "movies"
+                                                                                    : (c-row.is-executable ? "terminal" : "documents"))))));
                                                             icon-color: c-row.has-color-tag
                                                                 ? c-row.color-tag-brush
-                                                                : (c-row.is-dir
+                                                                : ((c-row.is-dir || c-row.ext-badge == "APP")
                                                                     ? #38B6FF
                                                                     : (c-row.ext-badge == "PDF"
                                                                         ? #FF5F56
@@ -6927,7 +7084,7 @@ export component ManifoldWindow inherits Window {
                         root.execute-context-action("open_with");
                     }
                 }
-                if root.context-target-is-dir || root.context-is-blank : ContextMenuItem {
+                if (root.context-target-is-dir && !root.context-target-is-app-bundle) || root.context-is-blank : ContextMenuItem {
                     icon-kind: "plus";
                     label: "Open in New Tab";
                     shortcut-hint: "Ctrl+T";
@@ -6937,14 +7094,30 @@ export component ManifoldWindow inherits Window {
                     }
                 }
 
-                if !root.context-is-blank : Rectangle { height: 1px; background: #323238; }
+                if !root.context-is-blank && (root.context-can-show-enclosing || root.context-target-is-archive || root.context-target-is-app-bundle) : Rectangle { height: 1px; background: #323238; }
 
-                if !root.context-is-blank : ContextMenuItem {
+                if !root.context-is-blank && root.context-can-show-enclosing : ContextMenuItem {
                     icon-kind: "folder-up";
                     label: "Show in Enclosing Folder";
                     triggered => {
                         root.show-context-menu = false;
                         root.execute-context-action("show_in_enclosing_folder");
+                    }
+                }
+                if !root.context-is-blank && root.context-target-is-archive : ContextMenuItem {
+                    icon-kind: "archive-contents";
+                    label: "Show Archive Contents";
+                    triggered => {
+                        root.show-context-menu = false;
+                        root.execute-context-action("show_archive_contents");
+                    }
+                }
+                if !root.context-is-blank && root.context-target-is-app-bundle : ContextMenuItem {
+                    icon-kind: "archive-contents";
+                    label: "Show Package Contents";
+                    triggered => {
+                        root.show-context-menu = false;
+                        root.execute-context-action("show_package_contents");
                     }
                 }
 
@@ -9941,10 +10114,10 @@ export component ManifoldWindow inherits Window {
     // LAYER 4.8 (z: 2400): FLOATING DRAG-AND-DROP GHOST PILL HUD
     if root.is-dragging-row && root.drag-ghost-label != "" : Rectangle {
         z: 2400;
-        x: Math.clamp(root.drag-ghost-x + 14px, 8px, root.width - 280px);
-        y: Math.clamp(root.drag-ghost-y + 10px, 8px, root.height - 40px);
+        x: Math.clamp(root.drag-ghost-x + 16px, 8px, root.width - self.width - 8px);
+        y: Math.clamp(root.drag-ghost-y - 14px, 8px, root.height - 36px);
         height: 28px;
-        width: 268px;
+        width: Math.clamp(ghost-pill-layout.preferred-width, 136px, 340px);
         border-radius: 14px;
         background: #202024EE;
         border-width: 1px;
@@ -9953,9 +10126,9 @@ export component ManifoldWindow inherits Window {
         drop-shadow-blur: 12px;
         drop-shadow-color: #00000099;
 
-        HorizontalLayout {
+        ghost-pill-layout := HorizontalLayout {
             padding-left: 10px;
-            padding-right: 10px;
+            padding-right: 12px;
             spacing: 6px;
             alignment: start;
 
@@ -9980,7 +10153,6 @@ export component ManifoldWindow inherits Window {
                 color: #B4B4BE;
                 font-size: 11px;
                 font-weight: 600;
-                horizontal-stretch: 1;
                 vertical-alignment: center;
                 overflow: elide;
             }
