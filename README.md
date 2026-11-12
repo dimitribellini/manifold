@@ -10,7 +10,7 @@
 
 Cross-platform dual-pane file manager and remote transfer client built in Rust and Slint.
 
-[**Releases**](https://github.com/dimitribellini/manifold/releases) · [**Quick Start**](#quick-start) · [**Features**](#features) · [**Remote Connections**](#remote-connections) · [**Keyboard Shortcuts**](#keyboard-shortcuts) · [**Build from Source**](#build-from-source) · [**Architecture**](#architecture)
+[**Releases**](https://github.com/dimitribellini/manifold/releases) · [**Quick Start**](#quick-start) · [**Features**](#features) · [**Multi-Rename**](#multi-rename-batch-rename) · [**Directory Sync**](#directory-sync--diff-cmdctrl--shift--y) · [**Remote Connections**](#remote-connections) · [**Keyboard Shortcuts**](#keyboard-shortcuts) · [**Build from Source**](#build-from-source) · [**Architecture**](#architecture)
 
 </div>
 
@@ -52,16 +52,49 @@ Expand-Archive -Path manifold-windows-x86_64.zip -DestinationPath .
 
 ## Features
 
-- **Single & Dual-Pane Layout**: Switch between single and dual panes (`Cmd/Ctrl + Alt + T`) with multiple tabs per pane and automatic session restore.
-- **Four View Modes**: Browse files as **Icons**, **List**, **Columns** (Miller view), or **Tree** (`Cmd/Ctrl + 1..4`).
+- **Single & Dual-Pane Layouts**: Switch between single, side-by-side, and top/bottom dual panes (`Cmd/Ctrl + Alt + T`) with independent per-tab history and automatic session restore.
+- **Four View Modes**: Browse `500,000+` entry directories smoothly in **Icons**, **List**, **Columns** (Miller view), or **Tree** (`Cmd/Ctrl + 1..4`).
 - **Recursive Search**: Filter the current folder and subfolders using wildcards (`*`, `?`), and jump to any result's parent folder with **Show in Enclosing Folder**.
 - **Inspector & Quick Look**: Inspect file metadata, media details, color tags, and `R/W/X` permissions (`Cmd/Ctrl + I`), or preview files with `Space`.
-- **Built-in Terminal**: Integrated terminal drawer (`>_`) running your local shell (`zsh`, `bash`, `PowerShell`) or an interactive remote `ssh` session when browsing SFTP servers.
-- **Archives & Packages**: Create `.zip` and `.tar.gz` archives, browse archive contents in place, or extract `.zip`, `.tar.*`, `.7z`, and `.rar` files.
-- **File Transfers & Sync**: Background copy/move with conflict resolution (`Replace`, `Replace Older`, `Keep Both`, `Skip`), directory comparison/sync, and batch rename.
+- **Built-in Terminal**: Integrated terminal drawer (`>_`) running your local shell (`zsh`, `bash`, `PowerShell`) or an interactive remote `ssh` session when browsing SFTP servers, with one-click **Sync CWD**.
+- **Archives & Packages**: Create `.zip` and `.tar.gz` archives, browse `.zip` and `.tar.*` archives virtually in place (`archive://`) or via **Show Archive Contents**, and safely extract `.zip`, `.tar.*`, `.7z`, `.rar`, `.gz`, `.bz2`, and `.xz` files with automatic Zip-Slip/Tar-Slip traversal protection.
+- **File Transfers**: Background copy and move queue with transactional `.part` staging, Pause/Resume/Cancel controls, a 5-stop bandwidth rate-limiting slider (`Unlimited`, `5`, `20`, `50`, `100 MB/s`), conflict resolution (`Replace`, `Replace Older`, `Keep Both`, `Skip`), and remote edit-in-place with automatic SHA-256 re-upload.
+- **Multi-Rename & Directory Sync**: Multi-step batch file renamer with saved presets and live preview (`F2` with multiple items selected), plus an interactive **Directory Sync & Diff** preview accessible from the top toolbar or `Cmd/Ctrl + Shift + Y`.
 - **Themes & Fonts**: Six built-in color themes and adjustable UI font family, size, and weight (`Cmd/Ctrl + ,`).
 
-### Folder View Options (`Cmd/Ctrl + J`)
+---
+
+## Multi-Rename (Batch Rename)
+
+<div align="center">
+  <img src="screenshots/manifold_fig4.png" alt="Manifold Multi-Rename Modal" width="100%" />
+</div>
+
+- **Multi-Rule Pipeline**: Chain multiple rename operations in sequence (`+` / `−`) and scope each rule to **Name**, **Name with Extension**, or **Extension**.
+- **Operations**:
+  - **Replace Text**: Match **All**, **First**, **Last**, or **Regular Expression** (with `$1`–`$9` capture groups and optional case sensitivity).
+  - **Change Case**: Convert to `lowercase`, `UPPERCASE`, `Title Case`, `camelCase`, `snake_case`, or `kebab-case`.
+  - **Add Sequence**: Insert padded numeric counters with custom prefix, start value, step, and digit width.
+  - **Add Text**: Insert custom text before or after the name, or replace the base name.
+  - **Add Date**: Append or prepend the current date or the file's modification timestamp (`YYYY-MM-DD`, `YYYYMMDD`, `YYYY-MM-DD_HH-mm`).
+- **Saved Presets**: Save rule pipelines to **Favorites** (`+ Save Preset`) for reuse across sessions.
+- **Live Preview & Collision Guard**: Inspect before/after filenames in real time (`=` unchanged, `→` renamed, warning icon on duplicate or invalid targets) with two-phase collision-safe execution and rollback on error.
+
+---
+
+## Directory Sync & Diff (`Cmd/Ctrl + Shift + Y`)
+
+<div align="center">
+  <img src="screenshots/manifold_fig5.png" alt="Manifold Directory Sync & Diff Preview" width="100%" />
+</div>
+
+- **Sync Strategies**: Compare the Left and Right panes using **Left → Right**, **Right → Left**, **Mirror L → R**, **Mirror R → L**, or **Bi-Directional** synchronization across local and remote VFS folders.
+- **Comparison Modes**: Detect changes by content **Hash** (`SHA-256`) or **Time + Size** metadata.
+- **Interactive Changeset**: Review every proposed operation (`Copy →`, `← Copy`, `Delete L`, `Delete R`, `Conflict`) with left/right file sizes, toggle individual items with per-row **Run** checkboxes, and inspect total create/update/delete counts before clicking **Synchronize**.
+
+---
+
+## Folder View Options (`Cmd/Ctrl + J`)
 
 <div align="center">
   <img src="screenshots/manifold_fig3.png" alt="Manifold Folder View Options" width="100%" />
@@ -83,6 +116,7 @@ Expand-Archive -Path manifold-windows-x86_64.zip -DestinationPath .
 - **Supported Protocols**: `SFTP / SSH` (password or SSH key), `Amazon S3` (and S3-compatible endpoints), `SMB`, `FTP / FTPS`, and `WebDAV`.
 - **Automatic Terminal Sync**: Opening an SFTP connection switches the bottom terminal to a live `ssh` session in the active remote folder.
 - **Mounted Shares**: Active Linux `NFS`, `SMB / CIFS`, and `SSHFS` mounts appear automatically in the `Connections` sidebar.
+- **Bandwidth Control**: Per-connection and live transfer rate limiting via a 5-stop slider (`Unlimited`, `5 MB/s`, `20 MB/s`, `50 MB/s`, `100 MB/s`).
 - **Keychain Integration**: Passwords and key passphrases are stored in the OS keyring (`macOS Keychain`, Linux `libsecret`, or `Windows Credential Manager`).
 
 ---
@@ -104,7 +138,9 @@ Expand-Archive -Path manifold-windows-x86_64.zip -DestinationPath .
 | `Cmd/Ctrl + C` / `X` / `V` | Copy / Cut / Paste selected items |
 | `Cmd/Ctrl + D` | Duplicate selected items |
 | `Cmd/Ctrl + N` | Create new folder |
-| `Cmd/Ctrl + R`, `F2`, or click selected name | Rename selected item |
+| `Cmd/Ctrl + R` | Refresh active pane(s) |
+| `F2` or click selected name | Rename selected item (or open Multi-Rename window when multiple items are selected) |
+| `Cmd/Ctrl + Shift + Y` | Open Directory Sync & Diff modal |
 | `Cmd/Ctrl + Shift + C` | Copy full path or URI to clipboard |
 | `Cmd/Ctrl + I` | Toggle Inspector drawer (`Info` / `Tasks`) |
 | `Cmd/Ctrl + J` | Toggle File & Directory View Options (`Show View Options`) |
@@ -152,7 +188,7 @@ manifold/
 │   ├── transfer/     # Transfer queue, bandwidth limiter, and conflict resolution models
 │   ├── sync/         # Directory comparison/sync engine and batch rename rules
 │   ├── preview/      # File metadata, permissions inspector, and text/hex preview formatters
-│   └── ui/           # Slint desktop interface, PTY terminal integration, and theme state
+│   └── ui/           # Modular Slint UI (ui/{components,modals,manifold}.slint), GUI controllers (src/gui/*), and PTY terminal
 └── src/
     └── main.rs       # Application entrypoint
 ```

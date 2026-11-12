@@ -3,8 +3,10 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+#[cfg(not(windows))]
+use std::process::{Command, Stdio};
 use std::sync::{Arc, RwLock};
 
 use manifold_vfs::ColorLabel;
@@ -27,6 +29,9 @@ pub enum ConfigError {
 
     #[error("Keyring error: {0}")]
     Keyring(String),
+
+    #[error("Invalid connection profile: {0}")]
+    Validation(String),
 }
 
 /// Supported remote & cloud protocols (`doc/image3.png` and `Section 3.2` of `BRIEF.md`).
@@ -182,6 +187,61 @@ impl ConnectionProfile {
             Some(format!("{base}/{rel}"))
         }
     }
+
+    /// Validates that port, host, username, and path fields contain no control characters
+    /// or option-injection prefixes (`SEC-01`, `SEC-11`).
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.port == Some(0) {
+            return Err(ConfigError::Validation(
+                "Port must be between 1 and 65535".to_string(),
+            ));
+        }
+        let has_ctrl = |s: &str| s.chars().any(|c| c.is_control());
+        for (label, val) in [
+            ("id", self.id.as_str()),
+            ("name", self.name.as_str()),
+            ("username", self.username.as_str()),
+            ("base_path", self.base_path.as_str()),
+        ] {
+            if has_ctrl(val) {
+                return Err(ConfigError::Validation(format!(
+                    "{label} contains control characters"
+                )));
+            }
+        }
+        if let Some(host) = &self.host {
+            let trimmed = host.trim();
+            if trimmed.is_empty()
+                || trimmed.starts_with('-')
+                || host.chars().any(|c| c.is_control() || c.is_whitespace())
+            {
+                return Err(ConfigError::Validation(
+                    "Server host cannot be empty, start with '-', or contain whitespace"
+                        .to_string(),
+                ));
+            }
+        }
+        if self.username.starts_with('-') || self.username.chars().any(char::is_whitespace) {
+            return Err(ConfigError::Validation(
+                "Username cannot start with '-' or contain whitespace".to_string(),
+            ));
+        }
+        for (label, opt_val) in [
+            ("endpoint", self.endpoint.as_deref()),
+            ("bucket", self.bucket.as_deref()),
+            ("region", self.region.as_deref()),
+            ("key_path", self.key_path.as_deref()),
+        ] {
+            if let Some(v) = opt_val {
+                if has_ctrl(v) || v.starts_with('-') {
+                    return Err(ConfigError::Validation(format!(
+                        "{label} cannot start with '-' or contain control characters"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Top-level `connections.toml` document.
@@ -206,13 +266,8 @@ impl ConnectionsConfig {
     }
 
     pub fn save_to_file(&self, path: impl AsRef<Path>) -> Result<(), ConfigError> {
-        let p = path.as_ref();
-        if let Some(parent) = p.parent() {
-            fs::create_dir_all(parent)?;
-        }
         let serialized = self.to_toml_string()?;
-        fs::write(p, serialized)?;
-        Ok(())
+        write_secure_config_file(path.as_ref(), &serialized)
     }
 
     pub fn default_config_path() -> PathBuf {
@@ -267,9 +322,134 @@ impl ConnectionsConfig {
     }
 }
 
+/// Escapes a token for macOS `security -i` interactive stdin commands (`SEC-06`),
+/// ensuring secrets are passed via piped `stdin` rather than process `argv`.
+pub fn escape_macos_security_token(val: &str) -> String {
+    let mut out = String::with_capacity(val.len() + 2);
+    out.push('"');
+    for ch in val.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\r' | '\n' | '\0' => {}
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+#[cfg(windows)]
+mod win_cred {
+    use std::ptr;
+
+    const CRED_TYPE_GENERIC: u32 = 1;
+    const CRED_PERSIST_LOCAL_MACHINE: u32 = 2;
+
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct FileTime {
+        dw_low_date_time: u32,
+        dw_high_date_time: u32,
+    }
+
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct CredentialW {
+        flags: u32,
+        cred_type: u32,
+        target_name: *mut u16,
+        comment: *mut u16,
+        last_written: FileTime,
+        credential_blob_size: u32,
+        credential_blob: *mut u8,
+        persist: u32,
+        attribute_count: u32,
+        attributes: *mut core::ffi::c_void,
+        target_alias: *mut u16,
+        user_name: *mut u16,
+    }
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn CredWriteW(credential: *const CredentialW, flags: u32) -> i32;
+        fn CredReadW(
+            target_name: *const u16,
+            cred_type: u32,
+            flags: u32,
+            credential: *mut *mut CredentialW,
+        ) -> i32;
+        fn CredDeleteW(target_name: *const u16, cred_type: u32, flags: u32) -> i32;
+        fn CredFree(buffer: *mut core::ffi::c_void);
+    }
+
+    fn to_wide_nul(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    pub fn write_generic(target: &str, user: &str, secret: &str) -> bool {
+        let mut target_w = to_wide_nul(target);
+        let mut user_w = to_wide_nul(user);
+        let blob_u16: Vec<u16> = secret.encode_utf16().collect();
+        let blob_len = (blob_u16.len() * 2) as u32;
+        let cred = CredentialW {
+            flags: 0,
+            cred_type: CRED_TYPE_GENERIC,
+            target_name: target_w.as_mut_ptr(),
+            comment: ptr::null_mut(),
+            last_written: FileTime {
+                dw_low_date_time: 0,
+                dw_high_date_time: 0,
+            },
+            credential_blob_size: blob_len,
+            credential_blob: blob_u16.as_ptr() as *mut u8,
+            persist: CRED_PERSIST_LOCAL_MACHINE,
+            attribute_count: 0,
+            attributes: ptr::null_mut(),
+            target_alias: ptr::null_mut(),
+            user_name: user_w.as_mut_ptr(),
+        };
+        unsafe { CredWriteW(&cred, 0) != 0 }
+    }
+
+    pub fn read_generic(target: &str) -> Option<String> {
+        let target_w = to_wide_nul(target);
+        let mut pcred: *mut CredentialW = ptr::null_mut();
+        let ok = unsafe { CredReadW(target_w.as_ptr(), CRED_TYPE_GENERIC, 0, &mut pcred) };
+        if ok == 0 || pcred.is_null() {
+            return None;
+        }
+        let result = unsafe {
+            let cred = &*pcred;
+            if cred.credential_blob.is_null() || cred.credential_blob_size == 0 {
+                None
+            } else if cred.credential_blob_size.is_multiple_of(2) {
+                let u16_len = (cred.credential_blob_size / 2) as usize;
+                let slice = std::slice::from_raw_parts(cred.credential_blob as *const u16, u16_len);
+                Some(String::from_utf16_lossy(slice))
+            } else {
+                let slice = std::slice::from_raw_parts(
+                    cred.credential_blob,
+                    cred.credential_blob_size as usize,
+                );
+                Some(String::from_utf8_lossy(slice).into_owned())
+            }
+        };
+        unsafe {
+            CredFree(pcred as *mut core::ffi::c_void);
+        }
+        result.filter(|s| !s.is_empty())
+    }
+
+    pub fn delete_generic(target: &str) -> bool {
+        let target_w = to_wide_nul(target);
+        unsafe { CredDeleteW(target_w.as_ptr(), CRED_TYPE_GENERIC, 0) != 0 }
+    }
+}
+
 /// Cross-platform OS keyring credential manager using `service = "manifold"`.
-/// Uses native OS secret storage (`secret-tool` on Linux, `security` on macOS) with a
-/// thread-safe encrypted/in-memory vault fallback when running in headless CI containers.
+/// Uses native OS secret storage (`secret-tool` on Linux, `security -i` on macOS,
+/// `Advapi32` `CredWriteW`/`CredReadW` on Windows) with a thread-safe in-memory vault fallback.
 #[derive(Clone, Default)]
 pub struct CredentialStore {
     memory_vault: Arc<RwLock<HashMap<String, String>>>,
@@ -301,28 +481,31 @@ impl CredentialStore {
 
     pub fn set_secret(&self, connection_id: &str, secret: &str) -> Result<(), ConfigError> {
         if self.use_os_backend {
+            #[cfg(windows)]
+            {
+                let target = format!("{KEYRING_SERVICE_NAME}:{connection_id}");
+                let _ = win_cred::write_generic(&target, KEYRING_SERVICE_NAME, secret);
+            }
+            #[cfg(not(windows))]
             if cfg!(target_os = "macos") {
-                let _ = Command::new("security")
-                    .args([
-                        "add-generic-password",
-                        "-U",
-                        "-s",
-                        KEYRING_SERVICE_NAME,
-                        "-a",
-                        connection_id,
-                        "-w",
-                        secret,
-                    ])
-                    .output();
-            } else if cfg!(target_os = "windows") {
-                let target_arg = format!("/generic:{KEYRING_SERVICE_NAME}:{connection_id}");
-                let user_arg = format!("/user:{KEYRING_SERVICE_NAME}");
-                let pass_arg = format!("/pass:{secret}");
-                let _ = Command::new("cmdkey")
-                    .args([&target_arg, &user_arg, &pass_arg])
-                    .output();
+                let child_res = Command::new("security")
+                    .arg("-i")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn();
+                if let Ok(mut child) = child_res {
+                    if let Some(mut stdin) = child.stdin.take() {
+                        let svc = escape_macos_security_token(KEYRING_SERVICE_NAME);
+                        let acct = escape_macos_security_token(connection_id);
+                        let pw = escape_macos_security_token(secret);
+                        let cmd = format!("add-generic-password -U -s {svc} -a {acct} -w {pw}\n");
+                        let _ = stdin.write_all(cmd.as_bytes());
+                    }
+                    let _ = child.wait();
+                }
             } else {
-                let _ = Command::new("secret-tool")
+                let child_res = Command::new("secret-tool")
                     .args([
                         "store",
                         "--label=Manifold Credential",
@@ -331,7 +514,16 @@ impl CredentialStore {
                         "account",
                         connection_id,
                     ])
-                    .output();
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn();
+                if let Ok(mut child) = child_res {
+                    if let Some(mut stdin) = child.stdin.take() {
+                        let _ = stdin.write_all(secret.as_bytes());
+                    }
+                    let _ = child.wait();
+                }
             }
         }
         let mut guard = self.memory_vault.write().map_err(Self::lock_err)?;
@@ -346,38 +538,50 @@ impl CredentialStore {
                 return Ok(Some(val.clone()));
             }
         }
-        if self.use_os_backend && !cfg!(target_os = "windows") {
-            let output = if cfg!(target_os = "macos") {
-                Command::new("security")
-                    .args([
-                        "find-generic-password",
-                        "-s",
-                        KEYRING_SERVICE_NAME,
-                        "-a",
-                        connection_id,
-                        "-w",
-                    ])
-                    .output()
-            } else {
-                Command::new("secret-tool")
-                    .args([
-                        "lookup",
-                        "service",
-                        KEYRING_SERVICE_NAME,
-                        "account",
-                        connection_id,
-                    ])
-                    .output()
-            };
-            if let Ok(out) = output {
-                if out.status.success() {
-                    let s = String::from_utf8_lossy(&out.stdout)
-                        .trim_end_matches(&['\r', '\n'][..])
-                        .to_string();
-                    if !s.is_empty() {
-                        let mut guard = self.memory_vault.write().map_err(Self::lock_err)?;
-                        guard.insert(connection_id.to_string(), s.clone());
-                        return Ok(Some(s));
+        if self.use_os_backend {
+            #[cfg(windows)]
+            {
+                let target = format!("{KEYRING_SERVICE_NAME}:{connection_id}");
+                if let Some(s) = win_cred::read_generic(&target) {
+                    let mut guard = self.memory_vault.write().map_err(Self::lock_err)?;
+                    guard.insert(connection_id.to_string(), s.clone());
+                    return Ok(Some(s));
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                let output = if cfg!(target_os = "macos") {
+                    Command::new("security")
+                        .args([
+                            "find-generic-password",
+                            "-s",
+                            KEYRING_SERVICE_NAME,
+                            "-a",
+                            connection_id,
+                            "-w",
+                        ])
+                        .output()
+                } else {
+                    Command::new("secret-tool")
+                        .args([
+                            "lookup",
+                            "service",
+                            KEYRING_SERVICE_NAME,
+                            "account",
+                            connection_id,
+                        ])
+                        .output()
+                };
+                if let Ok(out) = output {
+                    if out.status.success() {
+                        let s = String::from_utf8_lossy(&out.stdout)
+                            .trim_end_matches(&['\r', '\n'][..])
+                            .to_string();
+                        if !s.is_empty() {
+                            let mut guard = self.memory_vault.write().map_err(Self::lock_err)?;
+                            guard.insert(connection_id.to_string(), s.clone());
+                            return Ok(Some(s));
+                        }
                     }
                 }
             }
@@ -387,6 +591,12 @@ impl CredentialStore {
 
     pub fn delete_secret(&self, connection_id: &str) -> Result<(), ConfigError> {
         if self.use_os_backend {
+            #[cfg(windows)]
+            {
+                let target = format!("{KEYRING_SERVICE_NAME}:{connection_id}");
+                let _ = win_cred::delete_generic(&target);
+            }
+            #[cfg(not(windows))]
             if cfg!(target_os = "macos") {
                 let _ = Command::new("security")
                     .args([
@@ -397,9 +607,6 @@ impl CredentialStore {
                         connection_id,
                     ])
                     .output();
-            } else if cfg!(target_os = "windows") {
-                let target_arg = format!("/delete:{KEYRING_SERVICE_NAME}:{connection_id}");
-                let _ = Command::new("cmdkey").arg(&target_arg).output();
             } else {
                 let _ = Command::new("secret-tool")
                     .args([
@@ -619,13 +826,50 @@ impl SessionState {
 
     pub fn save_default(&self) -> Result<(), ConfigError> {
         let path = Self::default_config_path();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
         let serialized = self.to_toml_string()?;
-        fs::write(path, serialized)?;
-        Ok(())
+        write_secure_config_file(&path, &serialized)
     }
+}
+
+/// Writes a TOML configuration file atomically with `0700` parent directory and `0600` file
+/// permissions on Unix (`SEC-07`).
+fn write_secure_config_file(path: &Path, serialized: &str) -> Result<(), ConfigError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+        }
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("config.toml");
+    let tmp_name = format!(".{file_name}.tmp.{}", std::process::id());
+    let tmp_path = path.with_file_name(tmp_name);
+    {
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp_path)?;
+        f.write_all(serialized.as_bytes())?;
+        f.sync_all()?;
+    }
+    if let Err(err) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(ConfigError::Io(err));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
 }
 
 fn default_fav_icon_kind() -> String {
@@ -767,6 +1011,34 @@ impl Default for FolderViewOptions {
     }
 }
 
+/// Persisted rule step inside a saved Multi-Rename favorite preset (`preferences.toml`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchRenameRuleConfig {
+    pub operation: String,
+    pub apply_to: String,
+    pub occurrences: String,
+    pub find_text: String,
+    pub replace_text: String,
+    pub case_sensitive: bool,
+    pub case_mode: String,
+    pub text_position: String,
+    pub add_text: String,
+    pub seq_prefix: String,
+    pub seq_position: String,
+    pub seq_start: i32,
+    pub seq_step: i32,
+    pub seq_digits: i32,
+    pub date_position: String,
+    pub date_format: String,
+}
+
+/// Named Multi-Rename preset saved via `Add to Favorites` (`preferences.toml`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchRenameFavoritePreset {
+    pub name: String,
+    pub rules: Vec<BatchRenameRuleConfig>,
+}
+
 /// Persistent UI Preferences (`preferences.toml`) for Typography, Themes, Favorites, and View Options.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppPreferences {
@@ -794,6 +1066,10 @@ pub struct AppPreferences {
     pub default_view_options: FolderViewOptions,
     #[serde(default)]
     pub folder_view_options: HashMap<String, FolderViewOptions>,
+    #[serde(default)]
+    pub max_bandwidth_mbps: u32,
+    #[serde(default)]
+    pub batch_rename_favorites: Vec<BatchRenameFavoritePreset>,
 }
 
 impl Default for AppPreferences {
@@ -811,6 +1087,8 @@ impl Default for AppPreferences {
             file_color_labels: HashMap::new(),
             default_view_options: FolderViewOptions::default(),
             folder_view_options: HashMap::new(),
+            max_bandwidth_mbps: 0,
+            batch_rename_favorites: Vec::new(),
         }
     }
 }
@@ -861,12 +1139,29 @@ impl AppPreferences {
 
     pub fn save_default(&self) -> Result<(), ConfigError> {
         let path = Self::default_config_path();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
         let serialized = self.to_toml_string()?;
-        fs::write(path, serialized)?;
-        Ok(())
+        write_secure_config_file(&path, &serialized)
+    }
+
+    pub fn upsert_batch_rename_favorite(&mut self, preset: BatchRenameFavoritePreset) {
+        if let Some(existing) = self
+            .batch_rename_favorites
+            .iter_mut()
+            .find(|p| p.name.eq_ignore_ascii_case(&preset.name))
+        {
+            *existing = preset;
+        } else {
+            self.batch_rename_favorites.push(preset);
+        }
+    }
+
+    pub fn remove_batch_rename_favorite(&mut self, idx: usize) -> bool {
+        if idx < self.batch_rename_favorites.len() {
+            self.batch_rename_favorites.remove(idx);
+            true
+        } else {
+            false
+        }
     }
 
     pub fn upsert_favorite(&mut self, entry: FavoriteFolderEntry) {
@@ -1043,6 +1338,10 @@ mod tests {
         store.set_secret(&profile.id, "s3cr3t-p@ss").unwrap();
         let secret = store.get_secret(&profile.id).unwrap();
         assert_eq!(secret, Some("s3cr3t-p@ss".to_string()));
+        assert_eq!(
+            escape_macos_security_token("p@ss\"w\\ord\n"),
+            "\"p@ss\\\"w\\\\ord\""
+        );
     }
 
     #[test]
@@ -1202,5 +1501,72 @@ sort_direction = "ascending"
         let other_dir = prefs.effective_view_options(r"C:\Users\dimitri\Desktop");
         assert_eq!(other_dir.scope, ViewOptionsScope::AllFolders);
         assert!(other_dir.use_relative_dates);
+    }
+
+    #[test]
+    fn test_v070_connection_profile_validation_and_batch_rename_favorites() {
+        let mut valid = ConnectionProfile::new_sftp_default("id-ok", "Prod SFTP");
+        assert!(valid.validate().is_ok());
+
+        let mut port_zero = valid.clone();
+        port_zero.port = Some(0);
+        assert!(port_zero.validate().is_err());
+
+        let mut bad_host = valid.clone();
+        bad_host.host = Some("-oProxyCommand=sh".to_string());
+        assert!(bad_host.validate().is_err());
+
+        let mut space_host = valid.clone();
+        space_host.host = Some("prod.example.com --bad".to_string());
+        assert!(space_host.validate().is_err());
+
+        valid.username = "-oPermitLocalCommand=yes".to_string();
+        assert!(valid.validate().is_err());
+
+        let mut prefs = AppPreferences {
+            max_bandwidth_mbps: 50,
+            ..AppPreferences::default()
+        };
+        prefs.upsert_batch_rename_favorite(BatchRenameFavoritePreset {
+            name: "Photo Sequence".to_string(),
+            rules: vec![BatchRenameRuleConfig {
+                operation: "Add Sequence".to_string(),
+                apply_to: "Name".to_string(),
+                occurrences: "All".to_string(),
+                find_text: String::new(),
+                replace_text: String::new(),
+                case_sensitive: false,
+                case_mode: "Title Case".to_string(),
+                text_position: "After Name".to_string(),
+                add_text: String::new(),
+                seq_prefix: "_".to_string(),
+                seq_position: "After Name".to_string(),
+                seq_start: 1,
+                seq_step: 1,
+                seq_digits: 3,
+                date_position: "After Name".to_string(),
+                date_format: "File Modified (YYYY-MM-DD)".to_string(),
+            }],
+        });
+        let raw = prefs.to_toml_string().unwrap();
+        let roundtrip = AppPreferences::from_toml_str(&raw).unwrap();
+        assert_eq!(roundtrip.max_bandwidth_mbps, 50);
+        assert_eq!(roundtrip.batch_rename_favorites.len(), 1);
+        assert_eq!(roundtrip.batch_rename_favorites[0].name, "Photo Sequence");
+
+        let dir = std::env::temp_dir().join(format!("manifold_cfg_sec07_{}", std::process::id()));
+        let cfg_file = dir.join("preferences.toml");
+        write_secure_config_file(&cfg_file, &raw).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let file_meta = fs::metadata(&cfg_file).unwrap();
+            let dir_meta = fs::metadata(&dir).unwrap();
+            let file_mode = file_meta.permissions().mode() & 0o777;
+            let dir_mode = dir_meta.permissions().mode() & 0o777;
+            assert_eq!(file_mode, 0o600);
+            assert_eq!(dir_mode, 0o700);
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 }

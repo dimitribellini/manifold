@@ -77,25 +77,14 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    if cli.dump_state_json {
-        let mut state = ManifoldAppState::new_reference_workspace();
-        let l_idx = state.left_active_tab;
-        let l_tab = state.left_tabs.get_mut(l_idx);
-        if let (Some(left), Some(tab)) = (&cli.left_dir, l_tab) {
-            tab.current_path = left.to_string_lossy().to_string();
-        }
-        let r_idx = state.right_active_tab;
-        let r_tab = state.right_tabs.get_mut(r_idx);
-        if let (Some(right), Some(tab)) = (&cli.right_dir, r_tab) {
-            tab.current_path = right.to_string_lossy().to_string();
-        }
-        println!("{}", serde_json::to_string_pretty(&state)?);
-        return Ok(());
-    }
-
     let left_ref = cli.left_dir.as_deref();
     let right_ref = cli.right_dir.as_deref();
     let state = ManifoldAppState::new_live_workspace(left_ref, right_ref);
+
+    if cli.dump_state_json {
+        println!("{}", serde_json::to_string_pretty(&state)?);
+        return Ok(());
+    }
 
     if let Err(err) = manifold_ui::gui::run_desktop_gui(state) {
         eprintln!("Failed to open Manifold GUI window: {err}");

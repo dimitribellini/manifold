@@ -3,7 +3,9 @@ use std::io::{Read, Write};
 use std::path::Path;
 #[cfg(windows)]
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 
 pub const DEFAULT_TERM_FG: u32 = 0xE6EDF3;
 pub const DEFAULT_TERM_BG: u32 = 0x00000000;
@@ -518,7 +520,20 @@ impl TerminalEmulator {
         if self.scroll_offset > 0 {
             self.scroll_offset = 0;
         }
+        let width = char_display_width(ch);
         if self.wrap_pending && self.auto_wrap {
+            self.cursor_col = 0;
+            self.wrap_pending = false;
+            self.line_feed();
+        } else if width == 2 && self.cursor_col + 1 >= self.cols && self.auto_wrap {
+            let r = self.cursor_row.min(self.rows.saturating_sub(1));
+            let c = self.cursor_col.min(self.cols.saturating_sub(1));
+            let blank = self.blank_cell();
+            if let Some(row) = self.active_grid_mut().get_mut(r) {
+                if let Some(slot) = row.get_mut(c) {
+                    *slot = blank;
+                }
+            }
             self.cursor_col = 0;
             self.wrap_pending = false;
             self.line_feed();
@@ -534,16 +549,31 @@ impl TerminalEmulator {
             underline: self.cur_underline,
             inverse: self.cur_inverse,
         };
+        let cont_cell = TermCell {
+            ch: ' ',
+            fg: self.cur_fg,
+            bg: self.cur_bg,
+            bold: self.cur_bold,
+            dim: self.cur_dim,
+            underline: self.cur_underline,
+            inverse: self.cur_inverse,
+        };
         let grid = self.active_grid_mut();
         if let Some(row) = grid.get_mut(r) {
             if let Some(slot) = row.get_mut(c) {
                 *slot = cell;
             }
+            if width == 2 {
+                if let Some(slot2) = row.get_mut(c + 1) {
+                    *slot2 = cont_cell;
+                }
+            }
         }
-        if c + 1 >= self.cols {
+        if c + width >= self.cols {
             self.wrap_pending = true;
+            self.cursor_col = self.cols.saturating_sub(1);
         } else {
-            self.cursor_col = c + 1;
+            self.cursor_col = c + width;
         }
     }
 
@@ -1163,6 +1193,25 @@ fn map_dec_special_char(ch: char) -> char {
     }
 }
 
+fn char_display_width(ch: char) -> usize {
+    let cp = ch as u32;
+    let is_wide = (0x1100..=0x115F).contains(&cp)
+        || (0x2E80..=0xA4CF).contains(&cp)
+        || (0xAC00..=0xD7A3).contains(&cp)
+        || (0xF900..=0xFAFF).contains(&cp)
+        || (0xFE10..=0xFE19).contains(&cp)
+        || (0xFE30..=0xFE6F).contains(&cp)
+        || (0xFF01..=0xFF60).contains(&cp)
+        || (0xFFE0..=0xFFE6).contains(&cp)
+        || (0x1F300..=0x1FAFF).contains(&cp)
+        || (0x20000..=0x3FFFD).contains(&cp);
+    if is_wide {
+        2
+    } else {
+        1
+    }
+}
+
 fn build_styled_spans_for_row(
     cells: &[TermCell],
     cursor_col: Option<usize>,
@@ -1187,7 +1236,9 @@ fn build_styled_spans_for_row(
     }
 
     let mut spans: Vec<StyledSpan> = Vec::with_capacity(8);
-    for (idx, cell) in cells.iter().enumerate().take(last_non_blank) {
+    let mut idx = 0usize;
+    while idx < last_non_blank {
+        let cell = &cells[idx];
         let is_cur = cursor_col == Some(idx);
         let (fg, bg, bold) = if is_cur {
             let (cur_fg, cur_bg) = if focused {
@@ -1218,33 +1269,42 @@ fn build_styled_spans_for_row(
             (eff_fg, eff_bg, cell.bold)
         };
 
+        let ch_width = char_display_width(cell.ch);
         let display_ch = if cell.ch == ' ' { '\u{00A0}' } else { cell.ch };
         let span_len = spans.len();
+        let reserve_for_cursor = cursor_col.is_some_and(|cc| cc > idx);
+        let max_allowed = if reserve_for_cursor {
+            MAX_SPANS_PER_ROW.saturating_sub(1)
+        } else {
+            MAX_SPANS_PER_ROW
+        };
         if let Some(last) = spans.last_mut() {
             let same_style = !is_cur
                 && last.fg == fg
                 && last.bg == bg
                 && last.bold == bold
                 && last.underline == cell.underline;
-            if same_style && span_len < MAX_SPANS_PER_ROW {
+            if same_style || span_len >= max_allowed {
+                if is_cur && span_len >= MAX_SPANS_PER_ROW {
+                    last.fg = fg;
+                    last.bg = bg;
+                    last.bold = true;
+                }
                 last.text.push(display_ch);
-                last.char_count += 1;
-                continue;
-            }
-            if span_len >= MAX_SPANS_PER_ROW && !is_cur {
-                last.text.push(display_ch);
-                last.char_count += 1;
+                last.char_count += ch_width;
+                idx += ch_width;
                 continue;
             }
         }
         spans.push(StyledSpan {
             text: display_ch.to_string(),
-            char_count: 1,
+            char_count: ch_width,
             fg,
             bg,
             bold,
             underline: cell.underline,
         });
+        idx += ch_width;
     }
     spans
 }
@@ -1453,7 +1513,23 @@ pub struct RemoteSshSpec {
 }
 
 impl RemoteSshSpec {
+    pub fn validate(&self) -> bool {
+        manifold_vfs_remote::validate_ssh_endpoint(
+            &self.host,
+            &self.username,
+            self.key_path.as_deref(),
+        )
+        .is_ok()
+    }
+
     pub fn build_ssh_args(&self) -> Vec<String> {
+        self.build_ssh_args_with_sentinel("__MANIFOLD_SSH_READY__")
+    }
+
+    pub fn build_ssh_args_with_sentinel(&self, sentinel_tag: &str) -> Vec<String> {
+        if !self.validate() {
+            return Vec::new();
+        }
         let mut args = vec![
             "-tt".to_string(),
             "-o".to_string(),
@@ -1465,7 +1541,7 @@ impl RemoteSshSpec {
         ];
         if let Some(key) = &self.key_path {
             let trimmed = key.trim();
-            if !trimmed.is_empty() {
+            if !trimmed.is_empty() && !trimmed.starts_with('-') {
                 let expanded = if let Some(rest) = trimmed.strip_prefix("~/") {
                     let home = std::env::var("HOME").unwrap_or_default();
                     format!("{}/{rest}", home.trim_end_matches('/'))
@@ -1485,6 +1561,7 @@ impl RemoteSshSpec {
         } else {
             format!("{user_clean}@{host_clean}")
         };
+        args.push("--".to_string());
         args.push(target);
         let clean_dir = if self.remote_dir.trim().is_empty() {
             "/"
@@ -1493,9 +1570,61 @@ impl RemoteSshSpec {
         };
         let esc_dir = clean_dir.replace('\'', "'\\''");
         let sh_expr = "${SHELL:-/bin/sh}";
-        let remote_cmd = format!("cd -- '{esc_dir}' 2>/dev/null; exec \"{sh_expr}\" -l");
+        let rdy = format!("printf '{sentinel_tag}\\r'");
+        let remote_cmd = format!("{rdy}; cd -- '{esc_dir}' 2>/dev/null; exec \"{sh_expr}\" -l");
         args.push(remote_cmd);
         args
+    }
+}
+
+#[cfg(unix)]
+static TERM_SSH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[cfg(unix)]
+fn open_pty_pair(ws: &libc::winsize) -> Option<(i32, i32)> {
+    unsafe {
+        let mfd = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+        if mfd < 0 {
+            return None;
+        }
+        if libc::grantpt(mfd) != 0 || libc::unlockpt(mfd) != 0 {
+            libc::close(mfd);
+            return None;
+        }
+        #[cfg(target_os = "linux")]
+        let sfd = {
+            let mut buf = [0 as libc::c_char; 256];
+            if libc::ptsname_r(mfd, buf.as_mut_ptr(), buf.len()) != 0 {
+                libc::close(mfd);
+                return None;
+            }
+            libc::open(buf.as_ptr(), libc::O_RDWR | libc::O_NOCTTY)
+        };
+        #[cfg(target_os = "macos")]
+        let sfd = {
+            const TIOCPTYGNAME: libc::c_ulong = 0x4080_7453;
+            let mut buf = [0 as libc::c_char; 128];
+            if libc::ioctl(mfd, TIOCPTYGNAME, buf.as_mut_ptr()) != 0 {
+                libc::close(mfd);
+                return None;
+            }
+            libc::open(buf.as_ptr(), libc::O_RDWR | libc::O_NOCTTY)
+        };
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let sfd = {
+            let pts_ptr = libc::ptsname(mfd);
+            if pts_ptr.is_null() {
+                libc::close(mfd);
+                return None;
+            }
+            libc::open(pts_ptr, libc::O_RDWR | libc::O_NOCTTY)
+        };
+        if sfd < 0 {
+            libc::close(mfd);
+            return None;
+        }
+        let _ = libc::ioctl(mfd, libc::TIOCSWINSZ, ws);
+        Some((mfd, sfd))
     }
 }
 
@@ -1503,6 +1632,8 @@ pub struct NativeShellSession {
     stdin_tx: Sender<Vec<u8>>,
     stdout_rx: Receiver<Vec<u8>>,
     shell_name: String,
+    is_remote_ssh: bool,
+    prompt_idle: Arc<AtomicBool>,
     #[cfg(unix)]
     master_fd: i32,
     #[cfg(unix)]
@@ -1531,7 +1662,7 @@ impl NativeShellSession {
     }
 
     pub fn spawn_remote_ssh(spec: &RemoteSshSpec, rows: u16, cols: u16) -> Option<Self> {
-        if spec.host.trim().is_empty() {
+        if !spec.validate() {
             return None;
         }
         #[cfg(unix)]
@@ -1549,6 +1680,9 @@ impl NativeShellSession {
     }
 
     pub fn send_bytes(&self, bytes: &[u8]) -> bool {
+        if bytes.contains(&b'\r') || bytes.contains(&b'\n') {
+            self.prompt_idle.store(false, Ordering::Relaxed);
+        }
         self.stdin_tx.send(bytes.to_vec()).is_ok()
     }
 
@@ -1574,6 +1708,9 @@ impl NativeShellSession {
     }
 
     pub fn is_idle_at_prompt(&self) -> bool {
+        if self.is_remote_ssh {
+            return self.prompt_idle.load(Ordering::Relaxed);
+        }
         #[cfg(unix)]
         unsafe {
             let fg_pgid = libc::tcgetpgrp(self.master_fd);
@@ -1581,11 +1718,14 @@ impl NativeShellSession {
         }
         #[cfg(not(unix))]
         {
-            true
+            self.prompt_idle.load(Ordering::Relaxed)
         }
     }
 
     pub fn query_live_cwd(&self) -> Option<String> {
+        if self.is_remote_ssh {
+            return None;
+        }
         #[cfg(target_os = "linux")]
         {
             let proc_cwd = format!("/proc/{}/cwd", self.child_pid);
@@ -1599,43 +1739,77 @@ impl NativeShellSession {
         }
     }
 
+    pub fn is_remote(&self) -> bool {
+        self.is_remote_ssh
+    }
+
     pub fn sync_cwd_if_idle(&self, dir_path: &str) {
-        if dir_path.contains("://") || !Path::new(dir_path).is_dir() {
+        #[cfg(unix)]
+        {
+            if self.is_remote_ssh
+                || dir_path.contains("://")
+                || dir_path.contains(['\r', '\n', '\0'])
+                || !Path::new(dir_path).is_dir()
+                || !self.is_idle_at_prompt()
+            {
+                return;
+            }
+            let escaped = dir_path.replace('\'', "'\\''");
+            let cmd = format!("\x15 cd -- '{escaped}'\r");
+            let _ = self.stdin_tx.send(cmd.into_bytes());
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = dir_path;
+        }
+    }
+
+    /// Automatic remote `cd` injection is intentionally a no-op (`UI-03`) because local `tcgetpgrp`
+    /// only sees the local `ssh` client and cannot detect remote `vim`/`sudo` prompts.
+    /// Users can sync the terminal directory explicitly via [`Self::sync_cwd_explicit`].
+    pub fn sync_remote_cwd_if_idle(&self, _remote_dir: &str) {}
+
+    /// Explicitly changes the shell's working directory when the user clicks `"Sync CWD"` (`UI-03`).
+    pub fn sync_cwd_explicit(&self, target_dir: &str) {
+        if target_dir.contains(['\r', '\n', '\0']) {
             return;
         }
-        if !self.is_idle_at_prompt() {
+        if self.is_remote_ssh {
+            let clean = if target_dir.trim().is_empty() {
+                "/"
+            } else {
+                target_dir.trim()
+            };
+            let escaped = clean.replace('\'', "'\\''");
+            let cmd = format!("\x15 cd -- '{escaped}'\r");
+            let _ = self.stdin_tx.send(cmd.into_bytes());
+            return;
+        }
+        if target_dir.contains("://") || !Path::new(target_dir).is_dir() {
             return;
         }
         #[cfg(unix)]
         {
-            let escaped = dir_path.replace('\'', "'\\''");
+            let escaped = target_dir.replace('\'', "'\\''");
             let cmd = format!("\x15 cd -- '{escaped}'\r");
-            let _ = self.send_bytes(cmd.as_bytes());
+            let _ = self.stdin_tx.send(cmd.into_bytes());
         }
         #[cfg(windows)]
         {
-            let escaped = dir_path.replace('\'', "''");
+            let escaped = escape_powershell_single_quoted(target_dir);
             let cmd = format!("Set-Location -LiteralPath '{escaped}'\r\n");
-            let _ = self.send_bytes(cmd.as_bytes());
+            let _ = self.stdin_tx.send(cmd.into_bytes());
         }
-    }
-
-    pub fn sync_remote_cwd_if_idle(&self, remote_dir: &str) {
-        let clean = if remote_dir.trim().is_empty() {
-            "/"
-        } else {
-            remote_dir.trim()
-        };
-        if !self.is_idle_at_prompt() {
-            return;
-        }
-        let escaped = clean.replace('\'', "'\\''");
-        let cmd = format!("\x15 cd -- '{escaped}'\r");
-        let _ = self.send_bytes(cmd.as_bytes());
     }
 
     #[cfg(unix)]
     fn spawn_unix_ssh_pty(spec: &RemoteSshSpec, rows: u16, cols: u16) -> Option<Self> {
+        let seq = TERM_SSH_SEQ.fetch_add(1, Ordering::Relaxed);
+        let sentinel_tag = format!("__MANIFOLD_SSH_READY_{}_{seq}__", std::process::id());
+        let ssh_args = spec.build_ssh_args_with_sentinel(&sentinel_tag);
+        if ssh_args.is_empty() {
+            return None;
+        }
         let ws = libc::winsize {
             ws_row: rows.max(4),
             ws_col: cols.max(20),
@@ -1643,31 +1817,10 @@ impl NativeShellSession {
             ws_ypixel: 0,
         };
 
-        let (master_fd, slave_fd) = unsafe {
-            let mfd = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
-            if mfd < 0 {
-                return None;
-            }
-            if libc::grantpt(mfd) != 0 || libc::unlockpt(mfd) != 0 {
-                libc::close(mfd);
-                return None;
-            }
-            let pts_ptr = libc::ptsname(mfd);
-            if pts_ptr.is_null() {
-                libc::close(mfd);
-                return None;
-            }
-            let sfd = libc::open(pts_ptr, libc::O_RDWR | libc::O_NOCTTY);
-            if sfd < 0 {
-                libc::close(mfd);
-                return None;
-            }
-            let _ = libc::ioctl(mfd, libc::TIOCSWINSZ, &ws);
-            (mfd, sfd)
-        };
+        let (master_fd, slave_fd) = open_pty_pair(&ws)?;
 
         let mut raw_argv = vec!["ssh".to_string()];
-        raw_argv.extend(spec.build_ssh_args());
+        raw_argv.extend(ssh_args);
         let mut c_args = Vec::with_capacity(raw_argv.len());
         for arg in &raw_argv {
             c_args.push(std::ffi::CString::new(arg.as_str()).ok()?);
@@ -1743,6 +1896,8 @@ impl NativeShellSession {
         let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>();
         let auth_tx = stdin_tx.clone();
         let secret_pw = spec.secret.clone().filter(|s| !s.is_empty());
+        let prompt_idle = Arc::new(AtomicBool::new(false));
+        let prompt_idle_reader = Arc::clone(&prompt_idle);
 
         std::thread::spawn(move || {
             while let Ok(bytes) = stdin_rx.recv() {
@@ -1753,11 +1908,14 @@ impl NativeShellSession {
             }
         });
 
+        let sentinel_bytes = format!("{sentinel_tag}\r").into_bytes();
         std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
             let mut sent_pw = secret_pw.is_none();
+            let mut auth_phase_open = true;
             let mut strip_echo_newline = false;
             let mut tail = Vec::<u8>::new();
+            let s_len = sentinel_bytes.len();
             loop {
                 match reader_file.read(&mut buf) {
                     Ok(0) | Err(_) => break,
@@ -1772,8 +1930,19 @@ impl NativeShellSession {
                                 continue;
                             }
                         }
-                        if !sent_pw {
-                            tail.extend_from_slice(slice);
+                        let mut out_vec = slice.to_vec();
+                        if out_vec.len() >= s_len {
+                            if let Some(pos) =
+                                out_vec.windows(s_len).position(|w| w == sentinel_bytes)
+                            {
+                                out_vec.drain(pos..pos + s_len);
+                                auth_phase_open = false;
+                                sent_pw = true;
+                                prompt_idle_reader.store(true, Ordering::Relaxed);
+                            }
+                        }
+                        if !sent_pw && auth_phase_open {
+                            tail.extend_from_slice(&out_vec);
                             if tail.len() > 512 {
                                 let drain_len = tail.len() - 512;
                                 tail.drain(..drain_len);
@@ -1788,12 +1957,22 @@ impl NativeShellSession {
                                     let _ = auth_tx.send(payload);
                                 }
                                 sent_pw = true;
+                                auth_phase_open = false;
                                 strip_echo_newline = true;
                                 tail.clear();
                                 continue;
                             }
                         }
-                        if stdout_tx.send(slice.to_vec()).is_err() {
+                        let trimmed_end = out_vec
+                            .iter()
+                            .rev()
+                            .find(|&&b| b != b' ')
+                            .copied()
+                            .unwrap_or(0);
+                        if !auth_phase_open && matches!(trimmed_end, b'$' | b'#' | b'%' | b'>') {
+                            prompt_idle_reader.store(true, Ordering::Relaxed);
+                        }
+                        if !out_vec.is_empty() && stdout_tx.send(out_vec).is_err() {
                             break;
                         }
                     }
@@ -1805,6 +1984,8 @@ impl NativeShellSession {
             stdin_tx,
             stdout_rx,
             shell_name: "ssh".to_string(),
+            is_remote_ssh: true,
+            prompt_idle,
             master_fd,
             child_pid: pid,
         })
@@ -1820,28 +2001,7 @@ impl NativeShellSession {
             ws_ypixel: 0,
         };
 
-        let (master_fd, slave_fd) = unsafe {
-            let mfd = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
-            if mfd < 0 {
-                return None;
-            }
-            if libc::grantpt(mfd) != 0 || libc::unlockpt(mfd) != 0 {
-                libc::close(mfd);
-                return None;
-            }
-            let pts_ptr = libc::ptsname(mfd);
-            if pts_ptr.is_null() {
-                libc::close(mfd);
-                return None;
-            }
-            let sfd = libc::open(pts_ptr, libc::O_RDWR | libc::O_NOCTTY);
-            if sfd < 0 {
-                libc::close(mfd);
-                return None;
-            }
-            let _ = libc::ioctl(mfd, libc::TIOCSWINSZ, &ws);
-            (mfd, sfd)
-        };
+        let (master_fd, slave_fd) = open_pty_pair(&ws)?;
 
         let c_shell = std::ffi::CString::new(shell_bin.as_str()).ok()?;
         let c_arg0 = std::ffi::CString::new(shell_bin.as_str()).ok()?;
@@ -1942,6 +2102,8 @@ impl NativeShellSession {
             stdin_tx,
             stdout_rx,
             shell_name: shell_label,
+            is_remote_ssh: false,
+            prompt_idle: Arc::new(AtomicBool::new(true)),
             master_fd,
             child_pid: pid,
         })
@@ -1949,8 +2111,13 @@ impl NativeShellSession {
 
     #[cfg(windows)]
     fn spawn_windows_ssh(spec: &RemoteSshSpec, rows: u16, cols: u16) -> Option<Self> {
-        let mut cmd_parts = vec!["ssh.exe".to_string()];
-        for arg in spec.build_ssh_args() {
+        let ssh_bin = find_windows_ssh_exe()?;
+        let ssh_args = spec.build_ssh_args();
+        if ssh_args.is_empty() {
+            return None;
+        }
+        let mut cmd_parts = vec![format!("\"{ssh_bin}\"")];
+        for arg in ssh_args {
             if arg.contains(' ') {
                 let esc = arg.replace('"', "\\\"");
                 cmd_parts.push(format!("\"{esc}\""));
@@ -1959,10 +2126,11 @@ impl NativeShellSession {
             }
         }
         let cmd_line = cmd_parts.join(" ");
-        if let Some(conpty) = try_spawn_win_conpty(&cmd_line, "ssh", "C:\\", rows, cols) {
-            return Some(conpty);
-        }
-        Self::spawn_windows_powershell("C:\\", rows, cols)
+        try_spawn_win_conpty(&cmd_line, "ssh", "C:\\", rows, cols).map(|mut s| {
+            s.is_remote_ssh = true;
+            s.prompt_idle.store(false, Ordering::Relaxed);
+            s
+        })
     }
 
     #[cfg(windows)]
@@ -2112,9 +2280,61 @@ impl NativeShellSession {
             stdin_tx,
             stdout_rx,
             shell_name: ps_label,
+            is_remote_ssh: false,
+            prompt_idle: Arc::new(AtomicBool::new(true)),
             conpty_handle: 0,
         })
     }
+}
+
+#[cfg(windows)]
+fn find_windows_ssh_exe() -> Option<String> {
+    let sys_ssh = r"C:\Windows\System32\OpenSSH\ssh.exe";
+    if Path::new(sys_ssh).is_file() {
+        return Some(sys_ssh.to_string());
+    }
+    let ok = Command::new("ssh.exe")
+        .arg("-V")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok();
+    if ok {
+        Some("ssh.exe".to_string())
+    } else {
+        None
+    }
+}
+
+/// Sanitizes pasted terminal text so embedded ESC/C0/C1 sequences cannot break out of
+/// bracketed-paste mode (`\x1b[201~`) or inject raw control codes (`SEC-02`).
+pub fn sanitize_bracketed_paste(raw: &str) -> String {
+    raw.chars()
+        .filter(|&c| {
+            c != '\x1b'
+                && c != '\x7f'
+                && (c == '\r'
+                    || c == '\n'
+                    || c == '\t'
+                    || (c >= ' ' && !('\u{0080}'..='\u{009f}').contains(&c)))
+        })
+        .collect()
+}
+
+pub fn escape_powershell_single_quoted(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() + 4);
+    for ch in input.chars() {
+        match ch {
+            '\'' | '\u{2018}'..='\u{201F}' | '\u{FF07}' => {
+                out.push(ch);
+                out.push(ch);
+            }
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 #[cfg(unix)]
@@ -2123,9 +2343,28 @@ impl Drop for NativeShellSession {
         unsafe {
             if self.master_fd >= 0 {
                 libc::close(self.master_fd);
+                self.master_fd = -1;
             }
-            if self.child_pid > 0 {
-                let _ = libc::kill(self.child_pid, libc::SIGHUP);
+            let pid = self.child_pid;
+            if pid > 0 {
+                self.child_pid = -1;
+                let _ = libc::kill(pid, libc::SIGHUP);
+                let mut status: libc::c_int = 0;
+                let reaped = libc::waitpid(pid, &mut status, libc::WNOHANG);
+                if reaped == 0 {
+                    std::thread::spawn(move || {
+                        for _ in 0..10 {
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                            let mut st: libc::c_int = 0;
+                            if libc::waitpid(pid, &mut st, libc::WNOHANG) != 0 {
+                                return;
+                            }
+                        }
+                        let _ = libc::kill(pid, libc::SIGKILL);
+                        let mut st: libc::c_int = 0;
+                        let _ = libc::waitpid(pid, &mut st, 0);
+                    });
+                }
             }
         }
     }
@@ -2430,6 +2669,8 @@ fn try_spawn_win_conpty(
             stdin_tx,
             stdout_rx,
             shell_name: ps_label.to_string(),
+            is_remote_ssh: false,
+            prompt_idle: Arc::new(AtomicBool::new(false)),
             conpty_handle: h_pc,
         })
     }
@@ -2589,8 +2830,53 @@ mod tests {
         };
         let args = spec.build_ssh_args();
         assert!(args.contains(&"-tt".to_string()));
+        assert!(args.contains(&"--".to_string()));
         assert!(args.contains(&"root@192.168.8.110".to_string()));
         let last = args.last().cloned().unwrap_or_default();
         assert!(last.contains("cd -- '/var/log'"));
+
+        let bad_spec = RemoteSshSpec {
+            conn_name: "Bad".to_string(),
+            host: "-oProxyCommand=sh".to_string(),
+            port: 22,
+            username: "root".to_string(),
+            key_path: None,
+            secret: None,
+            remote_dir: "/".to_string(),
+        };
+        assert!(bad_spec.build_ssh_args().is_empty());
+        assert_eq!(
+            escape_powershell_single_quoted("C:\\Users\\a\u{2019}b'c\u{FF07}d"),
+            "C:\\Users\\a\u{2019}\u{2019}b''c\u{FF07}\u{FF07}d"
+        );
+        assert_eq!(
+            sanitize_bracketed_paste("echo safe\x1b[201~\nrm -rf /\x7f\u{009b}2J"),
+            "echo safe[201~\nrm -rf /2J"
+        );
+    }
+
+    #[test]
+    fn test_ui05_wide_cjk_and_16_span_coalescing() {
+        let mut emu = TerminalEmulator::new(4, 40);
+        emu.feed_bytes("日本語A".as_bytes());
+        let lines = emu.render_visible_lines(true);
+        let total_cols: usize = lines[0].spans.iter().map(|s| s.char_count).sum();
+        // 3 CJK chars * 2 cols + 'A' (1 col) + cursor (1 col) = 8 cols
+        assert_eq!(total_cols, 8);
+
+        let mut emu2 = TerminalEmulator::new(4, 80);
+        for i in 0..22 {
+            let color = 31 + (i % 6);
+            let chunk = format!("\x1b[{color}mX");
+            emu2.feed_bytes(chunk.as_bytes());
+        }
+        let lines2 = emu2.render_visible_lines(true);
+        assert!(lines2[0].spans.len() <= MAX_SPANS_PER_ROW);
+        let text2: String = lines2[0]
+            .spans
+            .iter()
+            .map(|s| s.text.replace('\u{00A0}', " "))
+            .collect();
+        assert_eq!(text2, "XXXXXXXXXXXXXXXXXXXXXX ");
     }
 }

@@ -115,9 +115,8 @@ impl FileInspectorViewModel {
 
         let matrix = meta.permissions_matrix();
         let preview = Self::build_preview_payload(meta, sample_bytes);
-        let default_owner = || "johnappleseed".to_string();
-        let owner = meta.owner.clone().unwrap_or_else(default_owner);
-        let group = meta.group.clone().unwrap_or_else(|| "staff".to_string());
+        let owner = meta.owner.clone().unwrap_or_else(|| "—".to_string());
+        let group = meta.group.clone().unwrap_or_else(|| "—".to_string());
 
         Self {
             title: meta.display_name(),

@@ -15,18 +15,6 @@ use serde::{Deserialize, Serialize};
 pub mod gui;
 pub mod terminal;
 
-/// Exact color tokens audited from `doc/image1.png` – `doc/image4.png`.
-pub mod theme {
-    pub const WINDOW_BG_HEX: &str = "#1E1E1E";
-    pub const SIDEBAR_BG_HEX: &str = "#282A2C";
-    pub const INSPECTOR_BG_HEX: &str = "#282A2C";
-    pub const HAIRLINE_DIVIDER_HEX: &str = "#38383A";
-    pub const ACTIVE_PANE_TOP_BAR_HEX: &str = "#4CD964";
-    pub const SELECTED_LABEL_PILL_HEX: &str = "#0A84FF";
-    pub const POLAROID_BORDER_HEX: &str = "#FFFFFF";
-    pub const MODAL_CARD_BG_HEX: &str = "#262628";
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ActivePane {
     Left,
@@ -414,6 +402,10 @@ impl VirtualizedTableViewport {
         let range = self.visible_range(scroll_offset_px, viewport_height_px, overscan_rows);
         &self.rows[range]
     }
+
+    pub fn rows_slice(&self) -> &[VirtualizedListRow] {
+        &self.rows
+    }
 }
 
 /// Tab descriptor inside a Pane's Tab Bar (`doc/image2.png`).
@@ -430,6 +422,10 @@ pub struct PaneTabModel {
     pub inline_filter: String,
     pub expanded_folders: HashSet<String>,
     pub selected_paths: HashSet<String>,
+    #[serde(default)]
+    pub back_stack: Vec<String>,
+    #[serde(default)]
+    pub forward_stack: Vec<String>,
 }
 
 /// SFTP / Cloud Connection Dialog model (`doc/image3.png`).
@@ -524,7 +520,6 @@ pub struct ManifoldAppState {
     pub split_ratio: f32,
     pub dual_pane_enabled: bool,
     pub active_pane: ActivePane,
-    pub active_pane_top_accent_hex: String,
     pub left_tabs: Vec<PaneTabModel>,
     pub left_active_tab: usize,
     pub left_header: PathAndStatusHeader,
@@ -540,12 +535,13 @@ pub struct ManifoldAppState {
 
 impl Default for ManifoldAppState {
     fn default() -> Self {
-        Self::new_reference_workspace()
+        Self::new_live_workspace(None, None)
     }
 }
 
 impl ManifoldAppState {
     /// Initializes the workspace state matching the reference screenshots (`doc/image1.png` & `doc/image2.png`).
+    #[cfg(test)]
     pub fn new_reference_workspace() -> Self {
         let vol_stats = VolumeStats {
             total_bytes: 500 * 1024 * 1024 * 1024,
@@ -757,6 +753,8 @@ impl ManifoldAppState {
                 inline_filter: String::new(),
                 expanded_folders: HashSet::new(),
                 selected_paths: HashSet::new(),
+                back_stack: Vec::new(),
+                forward_stack: Vec::new(),
             },
             PaneTabModel {
                 id: "l-tab-2".to_string(),
@@ -770,6 +768,8 @@ impl ManifoldAppState {
                 inline_filter: String::new(),
                 expanded_folders: HashSet::new(),
                 selected_paths: HashSet::new(),
+                back_stack: Vec::new(),
+                forward_stack: Vec::new(),
             },
             PaneTabModel {
                 id: "l-tab-3".to_string(),
@@ -783,6 +783,8 @@ impl ManifoldAppState {
                 inline_filter: String::new(),
                 expanded_folders: HashSet::new(),
                 selected_paths: HashSet::new(),
+                back_stack: Vec::new(),
+                forward_stack: Vec::new(),
             },
         ];
 
@@ -799,6 +801,8 @@ impl ManifoldAppState {
                 inline_filter: String::new(),
                 expanded_folders: HashSet::new(),
                 selected_paths: HashSet::new(),
+                back_stack: Vec::new(),
+                forward_stack: Vec::new(),
             },
             PaneTabModel {
                 id: "r-tab-2".to_string(),
@@ -812,6 +816,8 @@ impl ManifoldAppState {
                 inline_filter: String::new(),
                 expanded_folders: HashSet::new(),
                 selected_paths: HashSet::new(),
+                back_stack: Vec::new(),
+                forward_stack: Vec::new(),
             },
             PaneTabModel {
                 id: "r-tab-3".to_string(),
@@ -825,6 +831,8 @@ impl ManifoldAppState {
                 inline_filter: String::new(),
                 expanded_folders: HashSet::new(),
                 selected_paths: HashSet::from([waterfall_meta.path.clone()]),
+                back_stack: Vec::new(),
+                forward_stack: Vec::new(),
             },
         ];
 
@@ -846,7 +854,6 @@ impl ManifoldAppState {
             split_ratio: 0.5,
             dual_pane_enabled: true,
             active_pane: ActivePane::Right,
-            active_pane_top_accent_hex: theme::ACTIVE_PANE_TOP_BAR_HEX.to_string(),
             left_tabs,
             left_active_tab: 2,
             left_header,
@@ -1128,6 +1135,8 @@ impl ManifoldAppState {
                     inline_filter: String::new(),
                     expanded_folders: HashSet::new(),
                     selected_paths: HashSet::new(),
+                    back_stack: Vec::new(),
+                    forward_stack: Vec::new(),
                 });
             }
         }
@@ -1161,6 +1170,8 @@ impl ManifoldAppState {
             inline_filter: String::new(),
             expanded_folders: HashSet::new(),
             selected_paths: HashSet::new(),
+            back_stack: Vec::new(),
+            forward_stack: Vec::new(),
         }];
         let desktop_dir = format!("{}/Desktop", home_dir.trim_end_matches('/'));
         if Path::new(&desktop_dir).is_dir() && desktop_dir != right_initial {
@@ -1176,6 +1187,8 @@ impl ManifoldAppState {
                 inline_filter: String::new(),
                 expanded_folders: HashSet::new(),
                 selected_paths: HashSet::new(),
+                back_stack: Vec::new(),
+                forward_stack: Vec::new(),
             });
         }
 
@@ -1216,7 +1229,6 @@ impl ManifoldAppState {
             split_ratio: 0.5,
             dual_pane_enabled,
             active_pane,
-            active_pane_top_accent_hex: theme::ACTIVE_PANE_TOP_BAR_HEX.to_string(),
             left_tabs,
             left_active_tab: 0,
             left_header,
@@ -1242,7 +1254,6 @@ mod tests {
 
         assert_eq!(state.toolbar.active_folder_title, "Photos");
         assert_eq!(state.active_pane, ActivePane::Right);
-        assert_eq!(state.active_pane_top_accent_hex, "#4CD964");
 
         // Verify Combined Path & Status headers at top of each pane (doc/image1.png & doc/image2.png)
         assert_eq!(

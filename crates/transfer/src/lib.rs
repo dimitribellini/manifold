@@ -3,6 +3,7 @@
 
 use std::collections::VecDeque;
 use std::path::Path;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -169,6 +170,67 @@ pub enum TransferStatus {
     Failed,
 }
 
+/// Thread-safe control handle allowing active background transfers to be Paused, Resumed, or Cancelled (`GAP-05`).
+#[derive(Debug, Clone, Default)]
+pub struct TransferControlHandle {
+    state: Arc<AtomicU8>,
+}
+
+impl TransferControlHandle {
+    pub const STATE_RUNNING: u8 = 0;
+    pub const STATE_PAUSED: u8 = 1;
+    pub const STATE_CANCELLED: u8 = 2;
+
+    pub fn new() -> Self {
+        Self {
+            state: Arc::new(AtomicU8::new(Self::STATE_RUNNING)),
+        }
+    }
+
+    pub fn pause(&self) {
+        let _ = self.state.compare_exchange(
+            Self::STATE_RUNNING,
+            Self::STATE_PAUSED,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+    }
+
+    pub fn resume(&self) {
+        let _ = self.state.compare_exchange(
+            Self::STATE_PAUSED,
+            Self::STATE_RUNNING,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+    }
+
+    pub fn toggle_pause(&self) -> bool {
+        let cur = self.state.load(Ordering::SeqCst);
+        if cur == Self::STATE_PAUSED {
+            self.resume();
+            false
+        } else if cur == Self::STATE_RUNNING {
+            self.pause();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.state.store(Self::STATE_CANCELLED, Ordering::SeqCst);
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.state.load(Ordering::SeqCst) == Self::STATE_PAUSED
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.state.load(Ordering::SeqCst) == Self::STATE_CANCELLED
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransferTask {
     pub id: String,
@@ -220,6 +282,16 @@ impl TransferEngine {
             limiter: Arc::new(Mutex::new(TokenBucketLimiter::new(bandwidth_limit_bps))),
             sticky_conflict_policy: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Updates the live bandwidth limit across active and queued transfers (`GAP-05`).
+    pub fn set_bandwidth_limit_bps(&self, rate_bytes_per_sec: Option<u64>) {
+        self.limiter.lock().unwrap().set_rate(rate_bytes_per_sec);
+    }
+
+    /// Returns a shared handle to the token-bucket rate limiter (`GAP-05`).
+    pub fn limiter(&self) -> Arc<Mutex<TokenBucketLimiter>> {
+        Arc::clone(&self.limiter)
     }
 
     pub fn enqueue(&self, task: TransferTask) {
@@ -332,12 +404,29 @@ impl TransferEngine {
 
         task.status = TransferStatus::InProgress;
         let chunk_size = task.chunk_size.max(1024);
+        let safe_id: String = task
+            .id
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .collect();
+        let part_suffix = if safe_id.is_empty() { "0" } else { &safe_id };
+        let part_path = format!("{target_path}.__manifold_part_{part_suffix}");
+
         let mut offset = task.transferred_bytes;
-        let mut assembled = if offset > 0 {
-            dst_vfs.read_bytes(&target_path).unwrap_or_default()
-        } else {
-            Vec::with_capacity(task.total_bytes as usize)
-        };
+        if offset > 0 {
+            let valid_partial = dst_vfs
+                .metadata(&part_path)
+                .ok()
+                .and_then(|m| m.size)
+                .is_some_and(|sz| sz == offset);
+            if !valid_partial {
+                offset = 0;
+                task.transferred_bytes = 0;
+            }
+        }
+        if offset == 0 {
+            dst_vfs.write_bytes(&part_path, &[])?;
+        }
 
         while offset < task.total_bytes {
             let remaining = (task.total_bytes - offset) as usize;
@@ -350,6 +439,7 @@ impl TransferEngine {
                     Err(err) => {
                         attempt += 1;
                         if attempt > task.max_retries {
+                            let _ = dst_vfs.remove(&part_path, false);
                             task.status = TransferStatus::Failed;
                             task.error_message = Some(err.to_string());
                             return Err(err);
@@ -361,13 +451,34 @@ impl TransferEngine {
             if chunk.is_empty() {
                 break;
             }
-            let _throttle_delay = self.limiter.lock().unwrap().consume(chunk.len());
-            assembled.extend_from_slice(&chunk);
+            let throttle_delay = self.limiter.lock().unwrap().consume(chunk.len());
+            if !throttle_delay.is_zero() {
+                std::thread::sleep(throttle_delay);
+            }
+            let write_res = if offset == 0 {
+                dst_vfs.write_bytes(&part_path, &chunk)
+            } else {
+                dst_vfs.append_bytes(&part_path, &chunk)
+            };
+            if let Err(err) = write_res {
+                let _ = dst_vfs.remove(&part_path, false);
+                task.status = TransferStatus::Failed;
+                task.error_message = Some(err.to_string());
+                return Err(err);
+            }
             offset += chunk.len() as u64;
             task.transferred_bytes = offset;
         }
 
-        dst_vfs.write_bytes(&target_path, &assembled)?;
+        if dst_vfs.rename(&part_path, &target_path).is_err() {
+            let _ = dst_vfs.remove(&target_path, false);
+            if let Err(err) = dst_vfs.rename(&part_path, &target_path) {
+                let _ = dst_vfs.remove(&part_path, false);
+                task.status = TransferStatus::Failed;
+                task.error_message = Some(err.to_string());
+                return Err(err);
+            }
+        }
         task.status = TransferStatus::Completed;
         self.completed_tasks.lock().unwrap().push(task.clone());
         Ok(task)
@@ -468,5 +579,147 @@ mod tests {
         assert_eq!(finished.destination_path, "/Text 2.txt");
         assert_eq!(dst_vfs.read_bytes("/Text 2.txt").unwrap(), b"new content");
         assert_eq!(dst_vfs.read_bytes("/Text.txt").unwrap(), existing);
+    }
+
+    #[test]
+    fn test_bug03_chunked_streaming_and_transactional_replace_preserves_existing() {
+        struct FailingMidReadVfs {
+            inner: ArchiveBackend,
+        }
+        impl FileSystemBackend for FailingMidReadVfs {
+            fn scheme(&self) -> &str {
+                "fail"
+            }
+            fn list_directory(&self, p: &str) -> Result<Vec<FileMetadata>, VfsError> {
+                self.inner.list_directory(p)
+            }
+            fn metadata(&self, p: &str) -> Result<FileMetadata, VfsError> {
+                self.inner.metadata(p)
+            }
+            fn volume_stats(&self, p: &str) -> Result<manifold_vfs::VolumeStats, VfsError> {
+                self.inner.volume_stats(p)
+            }
+            fn create_dir(&self, p: &str) -> Result<(), VfsError> {
+                self.inner.create_dir(p)
+            }
+            fn remove(&self, p: &str, r: bool) -> Result<(), VfsError> {
+                self.inner.remove(p, r)
+            }
+            fn rename(&self, f: &str, t: &str) -> Result<(), VfsError> {
+                self.inner.rename(f, t)
+            }
+            fn copy_file(&self, f: &str, t: &str) -> Result<(), VfsError> {
+                self.inner.copy_file(f, t)
+            }
+            fn read_bytes(&self, p: &str) -> Result<Vec<u8>, VfsError> {
+                self.inner.read_bytes(p)
+            }
+            fn read_range(&self, p: &str, offset: u64, len: usize) -> Result<Vec<u8>, VfsError> {
+                if offset >= 1024 {
+                    return Err(VfsError::NetworkError("connection dropped".to_string()));
+                }
+                self.inner.read_range(p, offset, len)
+            }
+            fn write_bytes(&self, p: &str, d: &[u8]) -> Result<(), VfsError> {
+                self.inner.write_bytes(p, d)
+            }
+            fn set_permissions(&self, p: &str, m: u32) -> Result<(), VfsError> {
+                self.inner.set_permissions(p, m)
+            }
+            fn set_color_label(
+                &self,
+                p: &str,
+                l: manifold_vfs::ColorLabel,
+            ) -> Result<(), VfsError> {
+                self.inner.set_color_label(p, l)
+            }
+            fn set_hide_extension(&self, p: &str, h: bool) -> Result<(), VfsError> {
+                self.inner.set_hide_extension(p, h)
+            }
+            fn set_locked(&self, p: &str, l: bool) -> Result<(), VfsError> {
+                self.inner.set_locked(p, l)
+            }
+        }
+
+        let engine = TransferEngine::new(None);
+        let src_ok = ArchiveBackend::new("src.zip", ArchiveFormat::Zip);
+        let payload: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
+        src_ok.write_bytes("/big.bin", &payload).unwrap();
+
+        let dst_dir = tempfile::tempdir().unwrap();
+        let dst_vfs = manifold_vfs::LocalFsBackend::with_sandbox_root(dst_dir.path()).unwrap();
+        dst_vfs.write_bytes("/big.bin", b"precious-old").unwrap();
+
+        // 1. Multi-chunk Replace succeeds and writes exact bytes
+        let ok_task = TransferTask {
+            id: "chunk-ok".to_string(),
+            priority: TransferPriority::Foreground,
+            source_path: "/big.bin".to_string(),
+            destination_path: "/big.bin".to_string(),
+            total_bytes: payload.len() as u64,
+            transferred_bytes: 0,
+            chunk_size: 1024,
+            max_retries: 0,
+            status: TransferStatus::Queued,
+            error_message: None,
+        };
+        let done = engine
+            .execute_task(
+                ok_task,
+                &src_ok,
+                &dst_vfs,
+                ConflictResolution::Replace,
+                false,
+            )
+            .unwrap();
+        assert_eq!(done.status, TransferStatus::Completed);
+        assert_eq!(dst_vfs.read_bytes("/big.bin").unwrap(), payload);
+
+        // 2. Mid-transfer failure preserves existing destination and removes `.part`
+        dst_vfs.write_bytes("/big.bin", b"precious-v2").unwrap();
+        let failing_src = FailingMidReadVfs { inner: src_ok };
+        let fail_task = TransferTask {
+            id: "chunk-fail".to_string(),
+            priority: TransferPriority::Foreground,
+            source_path: "/big.bin".to_string(),
+            destination_path: "/big.bin".to_string(),
+            total_bytes: payload.len() as u64,
+            transferred_bytes: 0,
+            chunk_size: 1024,
+            max_retries: 1,
+            status: TransferStatus::Queued,
+            error_message: None,
+        };
+        assert!(engine
+            .execute_task(
+                fail_task,
+                &failing_src,
+                &dst_vfs,
+                ConflictResolution::Replace,
+                false,
+            )
+            .is_err());
+        assert_eq!(dst_vfs.read_bytes("/big.bin").unwrap(), b"precious-v2");
+        assert_eq!(dst_vfs.list_directory("/").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_gap05_transfer_control_handle_and_token_bucket_rate_update() {
+        let ctrl = TransferControlHandle::new();
+        assert!(!ctrl.is_paused());
+        assert!(!ctrl.is_cancelled());
+        assert!(ctrl.toggle_pause());
+        assert!(ctrl.is_paused());
+        assert!(!ctrl.toggle_pause());
+        assert!(!ctrl.is_paused());
+        ctrl.cancel();
+        assert!(ctrl.is_cancelled());
+        assert!(!ctrl.toggle_pause());
+
+        let mut limiter = TokenBucketLimiter::new(None);
+        assert_eq!(limiter.consume(8 * 1024 * 1024), Duration::ZERO);
+        limiter.set_rate(Some(1024));
+        assert_eq!(limiter.consume(1024), Duration::ZERO);
+        assert!(limiter.consume(1024) >= Duration::from_millis(900));
     }
 }

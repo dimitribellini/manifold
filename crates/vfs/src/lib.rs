@@ -6,11 +6,13 @@
 use std::collections::HashMap;
 #[cfg(unix)]
 use std::ffi::CString;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
@@ -164,6 +166,13 @@ impl PermissionsMatrix {
             | (self.owner.to_octal_digit() << 6)
             | (self.group.to_octal_digit() << 3)
             | self.others.to_octal_digit()
+    }
+
+    /// Preserves upper POSIX mode bits (`SUID` `0o4000`, `SGID` `0o2000`, sticky `0o1000`)
+    /// from `original_mode` when updating `R/W/X` triads (`UI-10`).
+    pub const fn with_preserved_special_bits(mut self, original_mode: u32) -> Self {
+        self.special_bits = (original_mode >> 9) & 0o7;
+        self
     }
 
     /// Formats the 3-digit octal string (e.g. `"644"`).
@@ -330,7 +339,7 @@ impl FileMetadata {
 }
 
 /// Converts a [`SystemTime`] into `(year, month, day, hour, minute)` in UTC.
-pub fn system_time_to_civil(time: SystemTime) -> (i32, u32, u32, u32, u32) {
+pub fn system_time_to_utc_civil(time: SystemTime) -> (i32, u32, u32, u32, u32) {
     let secs = match time.duration_since(std::time::UNIX_EPOCH) {
         Ok(d) => d.as_secs() as i64,
         Err(_) => 0,
@@ -350,6 +359,215 @@ pub fn system_time_to_civil(time: SystemTime) -> (i32, u32, u32, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = if m <= 2 { y + 1 } else { y };
     (year as i32, m, d, hour, minute)
+}
+
+/// Converts a [`SystemTime`] into `(year, month, day, hour, minute)` in the host OS local timezone (`UI-07`).
+pub fn system_time_to_civil(time: SystemTime) -> (i32, u32, u32, u32, u32) {
+    let secs = match time.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        Err(_) => return (1970, 1, 1, 0, 0),
+    };
+    #[cfg(unix)]
+    unsafe {
+        let t = secs as libc::time_t;
+        let mut tm: libc::tm = std::mem::zeroed();
+        if !libc::localtime_r(&t, &mut tm).is_null() {
+            let year = tm.tm_year + 1900;
+            let month = (tm.tm_mon + 1).clamp(1, 12) as u32;
+            let day = tm.tm_mday.clamp(1, 31) as u32;
+            let hour = tm.tm_hour.clamp(0, 23) as u32;
+            let minute = tm.tm_min.clamp(0, 59) as u32;
+            return (year, month, day, hour, minute);
+        }
+    }
+    #[cfg(windows)]
+    unsafe {
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        #[allow(dead_code)]
+        struct WinFileTime {
+            dw_low_date_time: u32,
+            dw_high_date_time: u32,
+        }
+        #[repr(C)]
+        #[allow(dead_code)]
+        struct WinSystemTime {
+            w_year: u16,
+            w_month: u16,
+            w_day_of_week: u16,
+            w_day: u16,
+            w_hour: u16,
+            w_minute: u16,
+            w_second: u16,
+            w_milliseconds: u16,
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn FileTimeToLocalFileTime(
+                lp_file_time: *const WinFileTime,
+                lp_local_file_time: *mut WinFileTime,
+            ) -> i32;
+            fn FileTimeToSystemTime(
+                lp_file_time: *const WinFileTime,
+                lp_system_time: *mut WinSystemTime,
+            ) -> i32;
+        }
+        let intervals = (secs as u64)
+            .saturating_mul(10_000_000)
+            .saturating_add(116_444_736_000_000_000);
+        let ft = WinFileTime {
+            dw_low_date_time: (intervals & 0xFFFF_FFFF) as u32,
+            dw_high_date_time: (intervals >> 32) as u32,
+        };
+        let mut local_ft = WinFileTime {
+            dw_low_date_time: 0,
+            dw_high_date_time: 0,
+        };
+        let mut st: WinSystemTime = std::mem::zeroed();
+        if FileTimeToLocalFileTime(&ft, &mut local_ft) != 0
+            && FileTimeToSystemTime(&local_ft, &mut st) != 0
+        {
+            return (
+                st.w_year as i32,
+                st.w_month as u32,
+                st.w_day as u32,
+                st.w_hour as u32,
+                st.w_minute as u32,
+            );
+        }
+    }
+    system_time_to_utc_civil(time)
+}
+
+/// Returns the current local `(year, month, day, hour, minute)`.
+pub fn current_local_civil_datetime() -> (i32, u32, u32, u32, u32) {
+    system_time_to_civil(SystemTime::now())
+}
+
+static SECURE_TMP_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// Resolves and initializes a private per-user runtime/cache directory with `0700` permissions (`SEC-07`),
+/// avoiding predictable world-writable shared `/tmp/manifold-*` directories.
+pub fn secure_runtime_subdir(subdir: &str) -> Result<PathBuf, VfsError> {
+    let clean_sub: String = subdir
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        .collect();
+    let sub_name = if clean_sub.is_empty() {
+        "runtime"
+    } else {
+        clean_sub.as_str()
+    };
+
+    let non_empty_env = |key: &str| {
+        let val = std::env::var(key).ok()?;
+        (!val.trim().is_empty()).then_some(val)
+    };
+    let base_root = if let Some(xdg_rt) = non_empty_env("XDG_RUNTIME_DIR") {
+        PathBuf::from(xdg_rt).join("manifold")
+    } else if let Some(xdg_cache) = non_empty_env("XDG_CACHE_HOME") {
+        PathBuf::from(xdg_cache).join("manifold")
+    } else if cfg!(target_os = "macos") && non_empty_env("HOME").is_some() {
+        PathBuf::from(non_empty_env("HOME").unwrap_or_default())
+            .join("Library")
+            .join("Caches")
+            .join("manifold")
+    } else if cfg!(target_os = "windows") && non_empty_env("LOCALAPPDATA").is_some() {
+        PathBuf::from(non_empty_env("LOCALAPPDATA").unwrap_or_default())
+            .join("Manifold")
+            .join("Cache")
+    } else if let Some(home) = non_empty_env("HOME").or_else(|| non_empty_env("USERPROFILE")) {
+        PathBuf::from(home).join(".cache").join("manifold")
+    } else {
+        #[cfg(unix)]
+        let uid = unsafe { libc::geteuid() };
+        #[cfg(not(unix))]
+        let uid = std::process::id();
+        std::env::temp_dir().join(format!("manifold-runtime-{uid}"))
+    };
+
+    ensure_private_dir(&base_root)?;
+    let target = base_root.join(sub_name);
+    ensure_private_dir(&target)?;
+    Ok(target)
+}
+
+fn ensure_private_dir(dir: &Path) -> Result<(), VfsError> {
+    if !dir.exists() {
+        fs::create_dir_all(dir)?;
+    }
+    #[cfg(unix)]
+    {
+        let meta = fs::symlink_metadata(dir)?;
+        if meta.file_type().is_symlink() {
+            let msg = format!("Refusing symlinked runtime directory: {}", dir.display());
+            return Err(VfsError::InvalidPath(msg));
+        }
+        let euid = unsafe { libc::geteuid() };
+        if meta.uid() != euid {
+            let msg = format!("Runtime directory UID mismatch: {}", dir.display());
+            return Err(VfsError::PermissionDenied(msg));
+        }
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Atomically creates a new private (`0600`, `O_CREAT | O_EXCL`) temporary file inside
+/// `secure_runtime_subdir(subdir)` (`SEC-07`).
+pub fn create_secure_temp_file(
+    subdir: &str,
+    prefix: &str,
+    suffix: &str,
+) -> Result<(PathBuf, fs::File), VfsError> {
+    let dir = secure_runtime_subdir(subdir)?;
+    let pid = std::process::id();
+    for _ in 0..32 {
+        let seq = SECURE_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let rand_tok = nanos
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(seq);
+        let fname = format!("{prefix}-{pid}-{seq}-{rand_tok:016x}{suffix}");
+        let candidate = dir.join(fname);
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        opts.mode(0o600);
+        match opts.open(&candidate) {
+            Ok(file) => return Ok((candidate, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(VfsError::IoError(e)),
+        }
+    }
+    let msg = format!("Failed to allocate unique temp file in {}", dir.display());
+    Err(VfsError::IoError(std::io::Error::other(msg)))
+}
+
+/// Purges transient runtime staging subdirectories (e.g. `"drag"`, `"archive-contents"`)
+/// on clean application shutdown (`SEC-07`).
+pub fn cleanup_secure_runtime_subdirs(subdirs: &[&str]) {
+    for &sub in subdirs {
+        if let Ok(dir) = secure_runtime_subdir(sub) {
+            if let Ok(meta) = fs::symlink_metadata(&dir) {
+                if meta.is_dir() && !meta.file_type().is_symlink() {
+                    let _ = fs::remove_dir_all(&dir);
+                }
+            }
+        }
+    }
+}
+
+/// Guards a local path passed to CLI tools so leading `-` is never parsed as an option flag (`SEC-03`).
+pub fn safe_cli_path_arg(path: &str) -> String {
+    if path.starts_with('-') {
+        format!("./{path}")
+    } else {
+        path.to_string()
+    }
 }
 
 /// Classifies a human-readable `Kind` label from file extension and directory flag.
@@ -433,6 +651,25 @@ pub trait FileSystemBackend: Send + Sync {
     /// Writes `data` to `path`, creating or truncating the file.
     fn write_bytes(&self, path: &str, data: &[u8]) -> Result<(), VfsError>;
 
+    /// Appends `data` to `path` (creating the file if missing) without loading existing bytes into RAM (`GAP-05`).
+    fn append_bytes(&self, path: &str, data: &[u8]) -> Result<(), VfsError> {
+        let mut existing = match self.read_bytes(path) {
+            Ok(bytes) => bytes,
+            Err(VfsError::NotFound(_)) => Vec::new(),
+            Err(err) => return Err(err),
+        };
+        existing.extend_from_slice(data);
+        self.write_bytes(path, &existing)
+    }
+
+    /// Creates a symbolic link at `link_path` pointing to `target_path`, enforcing sandbox safety (`SEC-09`).
+    fn create_symlink(&self, target_path: &str, link_path: &str) -> Result<(), VfsError> {
+        let _ = (target_path, link_path);
+        Err(VfsError::UnsupportedOperation(
+            "Symbolic links are not supported on this backend".to_string(),
+        ))
+    }
+
     /// Updates POSIX permissions mode (e.g. `0o644`).
     fn set_permissions(&self, path: &str, mode: u32) -> Result<(), VfsError>;
 
@@ -474,6 +711,7 @@ pub struct ExtendedItemAttributes {
 }
 
 /// Local filesystem implementation of [`FileSystemBackend`] with optional sandbox root boundary.
+#[derive(Clone)]
 pub struct LocalFsBackend {
     sandbox_root: Option<PathBuf>,
     attrs_overlay: Arc<RwLock<HashMap<PathBuf, ExtendedItemAttributes>>>,
@@ -536,6 +774,42 @@ impl LocalFsBackend {
             let normalized = normalize_lexical(&joined);
             if !normalized.starts_with(root) {
                 let msg = format!("Path {raw_path} escapes sandbox root");
+                return Err(VfsError::InvalidPath(msg));
+            }
+            // Enforce canonical symlink resolution against sandbox escape (SEC-09)
+            let mut probe = normalized.as_path();
+            while !probe.exists() && fs::symlink_metadata(probe).is_err() {
+                let Some(parent) = probe.parent() else {
+                    break;
+                };
+                if parent == probe {
+                    break;
+                }
+                probe = parent;
+            }
+            if fs::symlink_metadata(probe)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false)
+            {
+                let link_target = fs::read_link(probe)?;
+                let base_dir = probe.parent().unwrap_or(root);
+                let combined = if link_target.is_absolute() {
+                    link_target
+                } else {
+                    base_dir.join(link_target)
+                };
+                let canon_target =
+                    fs::canonicalize(&combined).unwrap_or_else(|_| normalize_lexical(&combined));
+                if !canon_target.starts_with(root) {
+                    let msg = format!("Symlink {raw_path} escapes sandbox root");
+                    return Err(VfsError::InvalidPath(msg));
+                }
+            }
+            if fs::canonicalize(probe)
+                .map(|c| !c.starts_with(root))
+                .unwrap_or(false)
+            {
+                let msg = format!("Resolved path {raw_path} escapes sandbox root");
                 return Err(VfsError::InvalidPath(msg));
             }
             Ok(normalized)
@@ -617,16 +891,8 @@ impl LocalFsBackend {
             let perm_bits = target_meta.permissions().mode() & 0o7777;
             let uid = target_meta.uid();
             let gid = target_meta.gid();
-            let owner = if uid == 0 {
-                "root".to_string()
-            } else {
-                std::env::var("USER").unwrap_or_else(|_| uid.to_string())
-            };
-            let group = match gid {
-                0 => "wheel".to_string(),
-                20 => "staff".to_string(),
-                _ => gid.to_string(),
-            };
+            let owner = resolve_unix_uid_name(uid);
+            let group = resolve_unix_gid_name(gid);
             (perm_bits, owner, group)
         };
         #[cfg(windows)]
@@ -662,6 +928,72 @@ impl LocalFsBackend {
             group: Some(group_str),
         })
     }
+}
+
+#[cfg(unix)]
+fn resolve_unix_uid_name(uid: u32) -> String {
+    use std::sync::OnceLock;
+    static UID_CACHE: OnceLock<RwLock<HashMap<u32, String>>> = OnceLock::new();
+    let cache = UID_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+    if let Ok(guard) = cache.read() {
+        if let Some(name) = guard.get(&uid) {
+            return name.clone();
+        }
+    }
+    let resolved = unsafe {
+        let mut pwd = std::mem::zeroed::<libc::passwd>();
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        let mut buf = [0 as libc::c_char; 1024];
+        let rc = libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result);
+        if rc == 0 && !result.is_null() && !pwd.pw_name.is_null() {
+            std::ffi::CStr::from_ptr(pwd.pw_name)
+                .to_string_lossy()
+                .into_owned()
+        } else if uid == 0 {
+            "root".to_string()
+        } else {
+            uid.to_string()
+        }
+    };
+    if let Ok(mut guard) = cache.write() {
+        guard.insert(uid, resolved.clone());
+    }
+    resolved
+}
+
+#[cfg(unix)]
+fn resolve_unix_gid_name(gid: u32) -> String {
+    use std::sync::OnceLock;
+    static GID_CACHE: OnceLock<RwLock<HashMap<u32, String>>> = OnceLock::new();
+    let cache = GID_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+    if let Ok(guard) = cache.read() {
+        if let Some(name) = guard.get(&gid) {
+            return name.clone();
+        }
+    }
+    let resolved = unsafe {
+        let mut grp = std::mem::zeroed::<libc::group>();
+        let mut result: *mut libc::group = std::ptr::null_mut();
+        let mut buf = [0 as libc::c_char; 1024];
+        let rc = libc::getgrgid_r(gid, &mut grp, buf.as_mut_ptr(), buf.len(), &mut result);
+        if rc == 0 && !result.is_null() && !grp.gr_name.is_null() {
+            std::ffi::CStr::from_ptr(grp.gr_name)
+                .to_string_lossy()
+                .into_owned()
+        } else if gid == 0 {
+            if cfg!(target_os = "macos") {
+                "wheel".to_string()
+            } else {
+                "root".to_string()
+            }
+        } else {
+            gid.to_string()
+        }
+    };
+    if let Ok(mut guard) = cache.write() {
+        guard.insert(gid, resolved.clone());
+    }
+    resolved
 }
 
 fn normalize_lexical(path: &Path) -> PathBuf {
@@ -766,7 +1098,6 @@ impl FileSystemBackend for LocalFsBackend {
         }
         #[cfg(windows)]
         {
-            use std::os::windows::ffi::OsStrExt;
             #[link(name = "kernel32")]
             extern "system" {
                 fn GetDiskFreeSpaceExW(
@@ -776,7 +1107,7 @@ impl FileSystemBackend for LocalFsBackend {
                     lp_total_number_of_free_bytes: *mut u64,
                 ) -> i32;
             }
-            let mut wide: Vec<u16> = resolved.as_os_str().encode_wide().collect();
+            let mut wide: Vec<u16> = resolved.to_string_lossy().encode_utf16().collect();
             wide.push(0);
             let mut avail: u64 = 0;
             let mut total: u64 = 0;
@@ -881,6 +1212,50 @@ impl FileSystemBackend for LocalFsBackend {
         let mut file = fs::File::create(&resolved)?;
         file.write_all(data)?;
         file.sync_all()?;
+        Ok(())
+    }
+
+    fn append_bytes(&self, path: &str, data: &[u8]) -> Result<(), VfsError> {
+        let resolved = self.resolve_safe_path(path)?;
+        if let Some(attrs) = self.get_attrs(&resolved) {
+            if attrs.is_locked {
+                let msg = format!("Item is locked: {}", resolved.display());
+                return Err(VfsError::PermissionDenied(msg));
+            }
+        }
+        if let Some(parent) = resolved.parent() {
+            let needs_create = !parent.as_os_str().is_empty() && !parent.exists();
+            if needs_create {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&resolved)?;
+        file.write_all(data)?;
+        Ok(())
+    }
+
+    fn create_symlink(&self, target_path: &str, link_path: &str) -> Result<(), VfsError> {
+        let resolved_target = self.resolve_safe_path(target_path)?;
+        let resolved_link = self.resolve_safe_path(link_path)?;
+        if resolved_link.exists() || fs::symlink_metadata(&resolved_link).is_ok() {
+            let msg = format!("Alias already exists: {}", resolved_link.display());
+            return Err(VfsError::AlreadyExists(msg));
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&resolved_target, &resolved_link)?;
+        }
+        #[cfg(windows)]
+        {
+            if resolved_target.is_dir() {
+                std::os::windows::fs::symlink_dir(&resolved_target, &resolved_link)?;
+            } else {
+                std::os::windows::fs::symlink_file(&resolved_target, &resolved_link)?;
+            }
+        }
         Ok(())
     }
 
@@ -1059,18 +1434,333 @@ impl ArchiveBackend {
         Ok(())
     }
 
-    fn normalize_virtual_path(path: &str) -> Result<String, VfsError> {
-        if path.contains("..") || path.contains('\0') {
+    pub fn insert_metadata_only(
+        &self,
+        path: &str,
+        size_bytes: u64,
+        is_dir: bool,
+    ) -> Result<(), VfsError> {
+        let norm = Self::normalize_virtual_path(path)?;
+        if norm == "/" {
+            return Ok(());
+        }
+        if let Some((parent, _)) = norm.rsplit_once('/') {
+            let parent_norm = if parent.is_empty() { "/" } else { parent };
+            let has_parent = self.entries.read().unwrap().contains_key(parent_norm);
+            if !has_parent {
+                self.insert_metadata_only(parent_norm, 0, true)?;
+            }
+        }
+        let name = norm.rsplit('/').next().unwrap_or(&norm).to_string();
+        let (extension, kind) = infer_file_kind(&name, is_dir);
+        let mut entries = self.entries.write().unwrap();
+        entries
+            .entry(norm.clone())
+            .or_insert_with(|| ArchiveEntryNode {
+                metadata: FileMetadata {
+                    name,
+                    path: norm,
+                    extension,
+                    kind,
+                    size: if is_dir { Some(0) } else { Some(size_bytes) },
+                    is_dir,
+                    is_symlink: false,
+                    is_hidden: false,
+                    is_locked: false,
+                    hide_extension: false,
+                    color_label: ColorLabel::None,
+                    modified: Some(SystemTime::now()),
+                    created: Some(SystemTime::now()),
+                    added: Some(SystemTime::now()),
+                    permissions: if is_dir { 0o755 } else { 0o644 },
+                    owner: Some("archive".to_string()),
+                    group: Some("archive".to_string()),
+                },
+                data: Vec::new(),
+            });
+        Ok(())
+    }
+
+    /// Opens a real `.zip`, `.tar`, `.tar.gz`, `.tar.bz2`, `.tar.xz`, or `.7z` archive from disk (`GAP-06`),
+    /// validating all member paths against Zip-Slip and symlink escape (`SEC-03`).
+    pub fn open_from_disk(archive_path: &str) -> Result<Self, VfsError> {
+        let fmt = ArchiveFormat::detect(archive_path).ok_or_else(|| {
+            VfsError::UnsupportedOperation(format!("Unsupported archive format: {archive_path}"))
+        })?;
+        let p = Path::new(archive_path);
+        if !p.is_file() {
+            return Err(VfsError::NotFound(archive_path.to_string()));
+        }
+        let backend = Self::new(archive_path, fmt);
+        let raw_entries = inspect_archive_entries_on_disk(archive_path, fmt)?;
+        for (member_path, size_bytes, is_dir) in raw_entries {
+            backend.insert_metadata_only(&member_path, size_bytes, is_dir)?;
+        }
+        Ok(backend)
+    }
+
+    pub fn normalize_virtual_path(path: &str) -> Result<String, VfsError> {
+        let unified = path.replace('\\', "/");
+        let has_drive = unified.len() >= 2 && unified.as_bytes()[1] == b':';
+        if unified.contains('\0') || has_drive || unified.split('/').any(|seg| seg == "..") {
             let msg = format!("Zip-slip / path traversal rejected in archive: {path}");
             return Err(VfsError::InvalidPath(msg));
         }
-        let trimmed = path.trim().trim_matches('/');
-        if trimmed.is_empty() {
+        let mut clean_segs = Vec::new();
+        for seg in unified.trim().split('/') {
+            if seg.is_empty() || seg == "." {
+                continue;
+            }
+            clean_segs.push(seg);
+        }
+        if clean_segs.is_empty() {
             Ok("/".to_string())
         } else {
-            Ok(format!("/{trimmed}"))
+            Ok(format!("/{}", clean_segs.join("/")))
         }
     }
+}
+
+/// Validates an archive on disk against Zip-Slip (`..`, leading `/`, drive letters, or external symlinks)
+/// before extraction (`SEC-03`), returning `(virtual_path, size_bytes, is_dir)` for every entry.
+pub fn inspect_archive_entries_on_disk(
+    archive_path: &str,
+    fmt: ArchiveFormat,
+) -> Result<Vec<(String, u64, bool)>, VfsError> {
+    let py_script = r#"
+import os, sys, json, posixpath
+
+path = os.environ["MANIFOLD_ARCHIVE_PATH"]
+fmt = os.environ["MANIFOLD_ARCHIVE_FMT"]
+out = []
+
+def check_safe(name, linkname=""):
+    u = name.replace("\\", "/")
+    if "\0" in u or u.startswith("/") or (len(u) >= 2 and u[1] == ":"):
+        raise ValueError("Unsafe absolute archive path: " + name)
+    parts = [p for p in u.split("/") if p not in ("", ".")]
+    if any(p == ".." for p in parts):
+        raise ValueError("Zip-slip traversal in archive: " + name)
+    norm = "/" + "/".join(parts) if parts else "/"
+    if linkname:
+        lu = linkname.replace("\\", "/")
+        if lu.startswith("/") or (len(lu) >= 2 and lu[1] == ":"):
+            raise ValueError("Unsafe absolute symlink in archive: " + linkname)
+        parent = posixpath.dirname(norm.lstrip("/"))
+        joined = posixpath.normpath(posixpath.join(parent, lu))
+        if joined.startswith("..") or joined.startswith("/"):
+            raise ValueError("Symlink escapes archive root: " + linkname)
+    return norm
+
+if fmt == "zip":
+    import zipfile
+    with zipfile.ZipFile(path, "r") as zf:
+        for info in zf.infolist():
+            is_dir = info.filename.endswith("/")
+            is_sym = ((info.external_attr >> 16) & 0o170000) == 0o120000
+            link_target = ""
+            if is_sym and info.file_size < 4096:
+                link_target = zf.read(info.filename).decode("utf-8", "replace")
+            norm = check_safe(info.filename, link_target)
+            if norm != "/":
+                out.append([norm, int(info.file_size), bool(is_dir)])
+else:
+    import tarfile
+    with tarfile.open(path, "r:*") as tf:
+        for m in tf.getmembers():
+            link_target = m.linkname if (m.issym() or m.islnk()) else ""
+            norm = check_safe(m.name, link_target)
+            if norm != "/":
+                out.append([norm, int(m.size), bool(m.isdir())])
+
+sys.stdout.write(json.dumps(out))
+"#;
+    if matches!(
+        fmt,
+        ArchiveFormat::Zip
+            | ArchiveFormat::Tar
+            | ArchiveFormat::TarGz
+            | ArchiveFormat::TarBz2
+            | ArchiveFormat::TarXz
+    ) {
+        let fmt_tag = if fmt == ArchiveFormat::Zip {
+            "zip"
+        } else {
+            "tar"
+        };
+        let py_out = Command::new("python3")
+            .args(["-c", py_script])
+            .env("MANIFOLD_ARCHIVE_PATH", archive_path)
+            .env("MANIFOLD_ARCHIVE_FMT", fmt_tag)
+            .output();
+        if let Ok(output) = py_out {
+            if !output.status.success() {
+                let err_txt = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                return Err(VfsError::InvalidPath(err_txt));
+            }
+            let stdout_str = String::from_utf8_lossy(&output.stdout);
+            if let Ok(parsed) = parse_archive_json_listing(&stdout_str) {
+                return Ok(parsed);
+            }
+        }
+    }
+
+    // Fallback CLI inspection for 7z/rar or systems without python3
+    let safe_arg = safe_cli_path_arg(archive_path);
+    let output = match fmt {
+        ArchiveFormat::Zip => Command::new("zipinfo")
+            .args(["-1", "--", &safe_arg])
+            .output(),
+        ArchiveFormat::Tar
+        | ArchiveFormat::TarGz
+        | ArchiveFormat::TarBz2
+        | ArchiveFormat::TarXz => {
+            let mut cmd = Command::new("tar");
+            if cfg!(target_os = "linux") && safe_arg.contains(':') {
+                cmd.arg("--force-local");
+            }
+            cmd.args(["-tf", &safe_arg]);
+            cmd.output()
+        }
+        ArchiveFormat::SevenZ => Command::new("7z")
+            .args(["l", "-ba", "--", &safe_arg])
+            .output(),
+        ArchiveFormat::Rar => {
+            let mut cmd = Command::new("unrar");
+            cmd.args(["lb", "--", &safe_arg]);
+            cmd.output()
+        }
+    }?;
+    if !output.status.success() {
+        let err_txt = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(VfsError::InvalidPath(err_txt));
+    }
+    let mut list = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let raw = line.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        if raw.starts_with('/') || (raw.len() >= 2 && raw.as_bytes()[1] == b':') {
+            let msg = format!("Unsafe absolute path in archive: {raw}");
+            return Err(VfsError::InvalidPath(msg));
+        }
+        let is_dir = raw.ends_with('/');
+        let norm = ArchiveBackend::normalize_virtual_path(raw)?;
+        if norm != "/" {
+            list.push((norm, 0, is_dir));
+        }
+    }
+    Ok(list)
+}
+
+fn parse_archive_json_listing(raw: &str) -> Result<Vec<(String, u64, bool)>, VfsError> {
+    // Lightweight parser for `[["/path", 123, false], ...]` without extra crate deps
+    let trimmed = raw.trim();
+    if trimmed == "[]" {
+        return Ok(Vec::new());
+    }
+    let inner = trimmed
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .ok_or_else(|| VfsError::InvalidPath("Malformed archive JSON".to_string()))?;
+    let mut entries = Vec::new();
+    for item in inner.split("],") {
+        let clean = item.trim().trim_start_matches('[').trim_end_matches(']');
+        if clean.is_empty() {
+            continue;
+        }
+        let first_quote = clean
+            .find('"')
+            .ok_or_else(|| VfsError::InvalidPath("Malformed archive JSON path".to_string()))?;
+        let rest_after_first = &clean[first_quote + 1..];
+        let mut path_buf = String::new();
+        let mut escaped = false;
+        let mut end_idx = 0;
+        for (i, ch) in rest_after_first.char_indices() {
+            if escaped {
+                path_buf.push(ch);
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                end_idx = i;
+                break;
+            } else {
+                path_buf.push(ch);
+            }
+        }
+        let tail = rest_after_first[end_idx + 1..]
+            .trim()
+            .trim_start_matches(',');
+        let mut parts = tail.split(',');
+        let size_str = parts.next().unwrap_or("0").trim();
+        let dir_str = parts.next().unwrap_or("false").trim();
+        let size_bytes = size_str.parse::<u64>().unwrap_or(0);
+        let is_dir = dir_str == "true";
+        let norm = ArchiveBackend::normalize_virtual_path(&path_buf)?;
+        entries.push((norm, size_bytes, is_dir));
+    }
+    Ok(entries)
+}
+
+fn extract_single_archive_member(
+    archive_path: &str,
+    fmt: ArchiveFormat,
+    virtual_path: &str,
+) -> Result<Vec<u8>, VfsError> {
+    let rel_member = virtual_path.trim_start_matches('/');
+    let py_script = r#"
+import os, sys
+path = os.environ["MANIFOLD_ARCHIVE_PATH"]
+fmt = os.environ["MANIFOLD_ARCHIVE_FMT"]
+member = os.environ["MANIFOLD_ARCHIVE_MEMBER"]
+if fmt == "zip":
+    import zipfile
+    with zipfile.ZipFile(path, "r") as zf:
+        for info in zf.infolist():
+            clean = info.filename.replace("\\", "/").strip("/")
+            if clean == member:
+                sys.stdout.buffer.write(zf.read(info.filename))
+                sys.exit(0)
+else:
+    import tarfile
+    with tarfile.open(path, "r:*") as tf:
+        for m in tf.getmembers():
+            clean = m.name.replace("\\", "/").lstrip("./").strip("/")
+            if clean == member and m.isfile():
+                f = tf.extractfile(m)
+                if f:
+                    sys.stdout.buffer.write(f.read())
+                    sys.exit(0)
+sys.exit(2)
+"#;
+    if matches!(
+        fmt,
+        ArchiveFormat::Zip
+            | ArchiveFormat::Tar
+            | ArchiveFormat::TarGz
+            | ArchiveFormat::TarBz2
+            | ArchiveFormat::TarXz
+    ) {
+        let fmt_tag = if fmt == ArchiveFormat::Zip {
+            "zip"
+        } else {
+            "tar"
+        };
+        let out = Command::new("python3")
+            .args(["-c", py_script])
+            .env("MANIFOLD_ARCHIVE_PATH", archive_path)
+            .env("MANIFOLD_ARCHIVE_FMT", fmt_tag)
+            .env("MANIFOLD_ARCHIVE_MEMBER", rel_member)
+            .output();
+        if let Ok(res) = out {
+            if res.status.success() {
+                return Ok(res.stdout);
+            }
+        }
+    }
+    Err(VfsError::NotFound(virtual_path.to_string()))
 }
 
 impl FileSystemBackend for ArchiveBackend {
@@ -1124,33 +1814,37 @@ impl FileSystemBackend for ArchiveBackend {
 
     fn create_dir(&self, path: &str) -> Result<(), VfsError> {
         let norm = Self::normalize_virtual_path(path)?;
-        let name = norm.rsplit('/').next().unwrap_or(&norm).to_string();
+        let mut accum = String::new();
         let mut entries = self.entries.write().unwrap();
-        entries.insert(
-            norm.clone(),
-            ArchiveEntryNode {
-                metadata: FileMetadata {
-                    name,
-                    path: norm,
-                    extension: None,
-                    kind: "Folder".to_string(),
-                    size: Some(0),
-                    is_dir: true,
-                    is_symlink: false,
-                    is_hidden: false,
-                    is_locked: false,
-                    hide_extension: false,
-                    color_label: ColorLabel::None,
-                    modified: Some(SystemTime::now()),
-                    created: Some(SystemTime::now()),
-                    added: Some(SystemTime::now()),
-                    permissions: 0o755,
-                    owner: Some("archive".to_string()),
-                    group: Some("archive".to_string()),
-                },
-                data: Vec::new(),
-            },
-        );
+        for seg in norm.trim_matches('/').split('/').filter(|s| !s.is_empty()) {
+            accum.push('/');
+            accum.push_str(seg);
+            let cur = accum.clone();
+            entries
+                .entry(cur.clone())
+                .or_insert_with(|| ArchiveEntryNode {
+                    metadata: FileMetadata {
+                        name: seg.to_string(),
+                        path: cur,
+                        extension: None,
+                        kind: "Folder".to_string(),
+                        size: Some(0),
+                        is_dir: true,
+                        is_symlink: false,
+                        is_hidden: seg.starts_with('.'),
+                        is_locked: false,
+                        hide_extension: false,
+                        color_label: ColorLabel::None,
+                        modified: Some(SystemTime::now()),
+                        created: Some(SystemTime::now()),
+                        added: Some(SystemTime::now()),
+                        permissions: 0o755,
+                        owner: Some("archive".to_string()),
+                        group: Some("archive".to_string()),
+                    },
+                    data: Vec::new(),
+                });
+        }
         Ok(())
     }
 
@@ -1193,9 +1887,23 @@ impl FileSystemBackend for ArchiveBackend {
 
     fn read_bytes(&self, path: &str) -> Result<Vec<u8>, VfsError> {
         let norm = Self::normalize_virtual_path(path)?;
-        let entries = self.entries.read().unwrap();
-        let found = entries.get(&norm).map(|n| n.data.clone());
-        found.ok_or(VfsError::NotFound(norm))
+        {
+            let entries = self.entries.read().unwrap();
+            let node = entries
+                .get(&norm)
+                .ok_or_else(|| VfsError::NotFound(norm.clone()))?;
+            if !node.data.is_empty() || node.metadata.is_dir || node.metadata.size == Some(0) {
+                return Ok(node.data.clone());
+            }
+        }
+        let bytes = extract_single_archive_member(&self.archive_path, self.format, &norm)?;
+        if bytes.len() <= 16 * 1024 * 1024 {
+            let mut entries = self.entries.write().unwrap();
+            if let Some(node) = entries.get_mut(&norm) {
+                node.data = bytes.clone();
+            }
+        }
+        Ok(bytes)
     }
 
     fn write_bytes(&self, path: &str, data: &[u8]) -> Result<(), VfsError> {
@@ -1372,7 +2080,42 @@ mod tests {
         assert_eq!(admin_list.len(), 2);
         assert_eq!(admin_list[0].name, "index.php");
 
-        // Verify zip-slip / traversal rejection
+        // Verify zip-slip / traversal rejection while allowing filenames with '..' (UI-06)
         assert!(archive.write_bytes("../../etc/passwd", b"x").is_err());
+        assert!(archive.write_bytes("/admin/v1..v2.patch", b"diff").is_ok());
+
+        // Verify special bits preservation (UI-10)
+        let suid_mode = 0o4755u32;
+        let updated = PermissionsMatrix::from_octal_str("750")
+            .unwrap()
+            .with_preserved_special_bits(suid_mode);
+        assert_eq!(updated.to_mode(), 0o4750);
+
+        // Verify secure runtime subdir and 0600 temp file creation (SEC-07)
+        let (tmp_path, _file) = create_secure_temp_file("unit_test", "probe", ".tmp").unwrap();
+        assert!(tmp_path.exists());
+        #[cfg(unix)]
+        {
+            let tmp_meta = fs::metadata(&tmp_path).unwrap();
+            let m = tmp_meta.permissions().mode() & 0o777;
+            assert_eq!(m, 0o600);
+        }
+        let _ = fs::remove_file(&tmp_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_local_fs_symlink_sandbox_escape_rejected() {
+        let outer = tempfile::tempdir().unwrap();
+        let outside_file = outer.path().join("outside_secret.txt");
+        fs::write(&outside_file, b"secret").unwrap();
+
+        let sandbox_dir = outer.path().join("sandbox");
+        fs::create_dir_all(&sandbox_dir).unwrap();
+        let vfs = LocalFsBackend::with_sandbox_root(&sandbox_dir).unwrap();
+
+        let evil_link = sandbox_dir.join("escape_link");
+        std::os::unix::fs::symlink(&outside_file, &evil_link).unwrap();
+        assert!(vfs.read_bytes("escape_link").is_err());
     }
 }

@@ -11,6 +11,7 @@ heck.workspace = true
 indexmap.workspace = true
 log.workspace = true
 manifold-vfs.workspace = true
+regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
