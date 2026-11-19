@@ -7,6 +7,7 @@ import {
     FileRowSlint,
     IconGridTripleSlint,
     TransferRowSlint,
+    UpdateInfoSlint,
     SyncPreviewRowSlint,
     OpenWithAppSlint,
     BatchRenameRuleSlint,
@@ -32,6 +33,7 @@ export {
     FileRowSlint,
     IconGridTripleSlint,
     TransferRowSlint,
+    UpdateInfoSlint,
     SyncPreviewRowSlint,
     OpenWithAppSlint,
     BatchRenameRuleSlint,
@@ -79,11 +81,21 @@ export component ManifoldWindow inherits Window {
     in-out property <string> resolved-mono-font-family: "Menlo";
     in-out property <bool> ui-font-bold: false;
     in-out property <int> pref-max-bandwidth-mbps: 0;
-    in-out property <string> app-version-label: "v0.7.0";
+    in-out property <string> app-version-label: "v0.7.6";
     in-out property <bool> show-app-menu: false;
     in-out property <bool> show-about-modal: false;
     in-out property <bool> show-preferences-modal: false;
     in-out property <bool> show-tab-preview: true;
+    in-out property <bool> show-update-modal: false;
+    in-out property <UpdateInfoSlint> update-info: {
+        available: false,
+        checking: false,
+        latest-version: "",
+        notes: "",
+        command: "",
+        hint-text: "",
+        copied: false,
+    };
 
     // Toolbar & layout state
     in-out property <string> active-folder-title: "Home";
@@ -601,6 +613,7 @@ export component ManifoldWindow inherits Window {
     callback set-view-options-sort(string);
     callback set-view-options-icon-size(int);
     callback use-view-options-as-defaults();
+    callback update-action(string);
 
     public function focus-filter-box() {
         filter-text-input.focus();
@@ -725,6 +738,13 @@ export component ManifoldWindow inherits Window {
                                     font-size: 12.5px + root.font-size-delta;
                                     font-weight: 700;
                                     vertical-alignment: center;
+                                }
+                                if root.update-info.available : Rectangle {
+                                    width: 6px;
+                                    height: 6px;
+                                    y: (parent.height - self.height) / 2;
+                                    border-radius: 3px;
+                                    background: #388BFD;
                                 }
                                 LucideIcon {
                                     y: (parent.height - self.height) / 2;
@@ -1055,6 +1075,42 @@ export component ManifoldWindow inherits Window {
                                         }
                                     }
                                 }
+                            }
+                        }
+
+                        if root.update-info.available : Rectangle {
+                            height: 26px;
+                            y: (parent.height - self.height) / 2;
+                            width: upd-badge-layout.preferred-width;
+                            horizontal-stretch: 0;
+                            border-radius: 13px;
+                            background: upd-badge-touch.has-hover ? #1F6FEB : #1F6FEB33;
+                            border-width: 1px;
+                            border-color: #388BFD;
+                            upd-badge-layout := HorizontalLayout {
+                                padding-left: 9px;
+                                padding-right: 10px;
+                                spacing: 6px;
+                                alignment: center;
+                                Rectangle {
+                                    width: 6px;
+                                    height: 6px;
+                                    y: (parent.height - self.height) / 2;
+                                    border-radius: 3px;
+                                    background: upd-badge-touch.has-hover ? #FFFFFF : #58A6FF;
+                                }
+                                Text {
+                                    text: "Update " + root.update-info.latest-version;
+                                    color: upd-badge-touch.has-hover ? #FFFFFF : #8EC8FF;
+                                    font-size: 11.5px + root.font-size-delta * 0.5;
+                                    font-family: root.resolved-font-family;
+                                    font-weight: 700;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            upd-badge-touch := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.update-action("open_modal"); }
                             }
                         }
 
@@ -5172,6 +5228,7 @@ export component ManifoldWindow inherits Window {
         show-sync-modal <=> root.show-sync-modal;
         show-tasks-popover <=> root.show-tasks-popover;
         show-terminal-drawer: root.show-terminal-drawer;
+        show-update-modal <=> root.show-update-modal;
         show-view-options-popover <=> root.show-view-options-popover;
         sibling-dropdown-is-right: root.sibling-dropdown-is-right;
         sibling-dropdown-items: root.sibling-dropdown-items;
@@ -5213,6 +5270,7 @@ export component ManifoldWindow inherits Window {
         ui-font-family: root.ui-font-family;
         ui-font-size-delta: root.ui-font-size-delta;
         ui-theme-preset: root.ui-theme-preset;
+        update-info: root.update-info;
         view-options-font-menu-open <=> root.view-options-font-menu-open;
         view-options-icon-menu-open <=> root.view-options-icon-menu-open;
         view-options-scope-menu-open <=> root.view-options-scope-menu-open;
@@ -5287,6 +5345,7 @@ export component ManifoldWindow inherits Window {
         toggle-sync-row-approved(a0) => { root.toggle-sync-row-approved(a0); }
         toggle-view-options-option(a0) => { root.toggle-view-options-option(a0); }
         update-batch-rename-rule(a0, a1, a2) => { root.update-batch-rename-rule(a0, a1, a2); }
+        update-action(a0) => { root.update-action(a0); }
         update-sync-options(a0, a1) => { root.update-sync-options(a0, a1); }
         use-view-options-as-defaults => { root.use-view-options-as-defaults(); }
     }

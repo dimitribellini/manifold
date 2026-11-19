@@ -1014,3 +1014,117 @@ fn test_virtual_scroll_ensure_row_visible_and_short_dir() {
     let big_icon_geom = compute_pane_scroll_geometry(100, 0, 1.0, 32, vp_h);
     assert!((big_icon_geom.row_stride_px - 47.0).abs() < 1e-6);
 }
+
+#[test]
+fn test_update_semver_comparison_and_github_release_parser() {
+    assert!(is_newer_version("0.7.5", "v0.8.0"));
+    assert!(is_newer_version("0.7.5", "v.0.7.6"));
+    assert!(is_newer_version("0.7.5", "0.7.5.1"));
+    assert!(!is_newer_version("0.7.5", "v0.7.5"));
+    assert!(!is_newer_version("0.7.5", "v0.7.4"));
+    assert!(!is_newer_version("0.7.5", "v0.8.0-rc.1"));
+
+    let newer_json = r#"{
+        "tag_name": "v0.8.0",
+        "draft": false,
+        "prerelease": false,
+        "html_url": "https://github.com/dimitribellini/manifold/releases/tag/v0.8.0",
+        "body": "Fixed scrolling and added AppImage support."
+    }"#;
+    let res = parse_github_latest_release_json(newer_json, "0.7.5", "macos").unwrap();
+    let UpdateCheckResult::UpdateAvailable(info) = res else {
+        panic!("expected UpdateAvailable");
+    };
+    assert_eq!(info.tag_name, "v0.8.0");
+    assert_eq!(info.display_version, "v.0.8.0");
+    assert!(info.html_url.ends_with("/releases/tag/v0.8.0"));
+    assert!(info.notes.contains("AppImage support"));
+    assert!(info.upgrade_command.contains("/Applications/Manifold.app"));
+
+    let untrusted_url_json = r#"{
+        "tag_name": "v0.8.1",
+        "draft": false,
+        "prerelease": false,
+        "html_url": "https://evil.example.com/phish",
+        "body": ""
+    }"#;
+    let res2 = parse_github_latest_release_json(untrusted_url_json, "0.7.5", "linux").unwrap();
+    let UpdateCheckResult::UpdateAvailable(info2) = res2 else {
+        panic!("expected UpdateAvailable");
+    };
+    assert_eq!(info2.html_url, GITHUB_RELEASES_FALLBACK_URL);
+    assert!(info2
+        .upgrade_command
+        .contains("manifold-linux-x86_64.AppImage"));
+
+    let same_json = r#"{
+        "tag_name": "v0.7.5",
+        "draft": false,
+        "prerelease": false,
+        "html_url": "https://github.com/dimitribellini/manifold/releases/tag/v0.7.5",
+        "body": ""
+    }"#;
+    let res3 = parse_github_latest_release_json(same_json, "0.7.5", "windows").unwrap();
+    assert!(matches!(res3, UpdateCheckResult::UpToDate { .. }));
+
+    let draft_json = r#"{
+        "tag_name": "v0.9.0",
+        "draft": true,
+        "prerelease": false,
+        "html_url": "https://github.com/dimitribellini/manifold/releases/tag/v0.9.0",
+        "body": ""
+    }"#;
+    let res4 = parse_github_latest_release_json(draft_json, "0.7.5", "macos").unwrap();
+    assert!(matches!(res4, UpdateCheckResult::UpToDate { .. }));
+}
+
+#[test]
+fn test_archive_virtual_copy_preserves_macos_app_executable_bit() {
+    use std::io::Write;
+    let dir_name = format!("manifold_archive_copy_app_test_{}", std::process::id());
+    let work_dir = std::env::temp_dir().join(dir_name);
+    let _ = std::fs::remove_dir_all(&work_dir);
+    let src_root = work_dir.join("src");
+    let macos_dir = src_root.join("Mini.app/Contents/MacOS");
+    std::fs::create_dir_all(&macos_dir).unwrap();
+    let bin_src = macos_dir.join("Mini");
+    {
+        let mut f = std::fs::File::create(&bin_src).unwrap();
+        f.write_all(b"#!/bin/sh\necho ok\n").unwrap();
+    }
+    let tar_path = work_dir.join("mini.tar.gz");
+    let status = Command::new("tar")
+        .args(["-czf"])
+        .arg(&tar_path)
+        .args(["-C"])
+        .arg(&src_root)
+        .arg("Mini.app")
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let tar_str = tar_path.to_string_lossy().to_string();
+    let arch = ArchiveBackend::open_from_disk(&tar_str).unwrap();
+    let out_app = work_dir.join("out/Mini.app");
+    std::fs::create_dir_all(out_app.parent().unwrap()).unwrap();
+    let out_str = out_app.to_string_lossy().to_string();
+
+    let local_vfs = LocalFsBackend::new();
+    let (tx, _rx) = mpsc::channel();
+    let ctrl = TransferControlHandle::default();
+    let lim = Arc::new(Mutex::new(TokenBucketLimiter::new(None)));
+    let prog = (&tx, "t1", "Copy Mini.app", 0, 100, &ctrl, &lim);
+
+    copy_archive_dir_to_local((&arch, &tar_str), "/Mini.app", &local_vfs, &out_str, prog).unwrap();
+
+    let out_bin = out_app.join("Contents/MacOS/Mini");
+    let copied = std::fs::read(&out_bin).unwrap();
+    assert_eq!(copied, b"#!/bin/sh\necho ok\n");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&out_bin).unwrap().permissions().mode();
+        assert_ne!(mode & 0o111, 0, "expected +x mode on Contents/MacOS/Mini");
+    }
+    let _ = std::fs::remove_dir_all(&work_dir);
+}

@@ -673,6 +673,91 @@ type BgProgressCtx<'a> = (
     &'a std::sync::Arc<std::sync::Mutex<TokenBucketLimiter>>,
 );
 
+fn copy_archive_dir_children(
+    arch: &ArchiveBackend,
+    inner: &str,
+    local_vfs: &LocalFsBackend,
+    dst_dir: &str,
+    prog: BgProgressCtx<'_>,
+) -> Result<(), String> {
+    let (tx, task_id, label, base_transferred, total_bytes, ctrl, _) = prog;
+    local_vfs.create_dir(dst_dir).map_err(|e| e.to_string())?;
+    let children = arch.list_directory(inner).map_err(|e| e.to_string())?;
+    for child in children {
+        while ctrl.is_paused() && !ctrl.is_cancelled() {
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        if ctrl.is_cancelled() {
+            return Err("Cancelled by user".to_string());
+        }
+        let child_dst = join_vfs_path(dst_dir, &child.name);
+        if child.is_dir {
+            let sub_prog = (
+                tx,
+                task_id,
+                label,
+                base_transferred,
+                total_bytes,
+                ctrl,
+                prog.6,
+            );
+            copy_archive_dir_children(arch, &child.path, local_vfs, &child_dst, sub_prog)?;
+            continue;
+        }
+        let data = arch.read_bytes(&child.path).map_err(|e| e.to_string())?;
+        let part_dst = local_part_sibling(&child_dst);
+        let part_str = part_dst.to_string_lossy().to_string();
+        local_vfs
+            .write_bytes(&part_str, &data)
+            .map_err(|e| e.to_string())?;
+        if child.permissions & 0o111 != 0 {
+            let _ = local_vfs.set_permissions(&part_str, child.permissions);
+        }
+        swap_local_staged_into_place(&part_dst, &child_dst)?;
+        let _ = tx.send(BgWorkerEvent::Progress {
+            task_id: task_id.to_string(),
+            transferred: base_transferred.saturating_add(data.len() as u64),
+            total: total_bytes,
+            label: label.to_string(),
+        });
+    }
+    Ok(())
+}
+
+pub(super) fn copy_archive_dir_to_local(
+    arch_ctx: (&ArchiveBackend, &str),
+    inner: &str,
+    local_vfs: &LocalFsBackend,
+    dst_path: &str,
+    prog: BgProgressCtx<'_>,
+) -> Result<(), String> {
+    let (arch, _) = arch_ctx;
+    let is_app = dst_path.to_ascii_lowercase().ends_with(".app");
+    if is_app {
+        let stage_wrap = local_part_sibling(dst_path);
+        let dst_name = Path::new(dst_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("App.app");
+        let stage_app = stage_wrap.join(dst_name);
+        let stage_str = stage_app.to_string_lossy().to_string();
+        if let Err(err) = std::fs::create_dir_all(&stage_app) {
+            return Err(format!("Failed to create bundle stage dir: {err}"));
+        }
+        if let Err(err) = copy_archive_dir_children(arch, inner, local_vfs, &stage_str, prog) {
+            let _ = std::fs::remove_dir_all(&stage_wrap);
+            return Err(err);
+        }
+        ensure_macos_bundle_executables_chmod(&stage_app);
+        let swap_res = swap_local_staged_into_place(&stage_app, dst_path);
+        let _ = std::fs::remove_dir_all(&stage_wrap);
+        return swap_res;
+    }
+    copy_archive_dir_children(arch, inner, local_vfs, dst_path, prog)?;
+    sanitize_macos_app_bundle(Path::new(dst_path), cfg!(target_os = "macos"));
+    Ok(())
+}
+
 pub(super) fn perform_bg_single_transfer(
     local_vfs: &LocalFsBackend,
     remotes: &HashMap<String, RemoteVfsBackend>,
@@ -704,18 +789,23 @@ pub(super) fn perform_bg_single_transfer(
                     .get(&p2)
                     .ok_or_else(|| "Remote VFS not connected".to_string())?;
                 remote.create_dir(&sub2).map_err(|e| e.to_string())?;
-            } else {
-                local_vfs.create_dir(dst_path).map_err(|e| e.to_string())?;
+                let children = arch.list_directory(&inner).map_err(|e| e.to_string())?;
+                for child in children {
+                    let child_src = format!("archive://{arch_path}#{}", child.path);
+                    let child_dst = join_vfs_path(dst_path, &child.name);
+                    perform_bg_single_transfer(
+                        local_vfs, remotes, &child_src, &child_dst, false, prog,
+                    )?;
+                }
+                return Ok(());
             }
-            let children = arch.list_directory(&inner).map_err(|e| e.to_string())?;
-            for child in children {
-                let child_src = format!("archive://{arch_path}#{}", child.path);
-                let child_dst = join_vfs_path(dst_path, &child.name);
-                perform_bg_single_transfer(
-                    local_vfs, remotes, &child_src, &child_dst, false, prog,
-                )?;
-            }
-            return Ok(());
+            return copy_archive_dir_to_local(
+                (&arch, &arch_path),
+                &inner,
+                local_vfs,
+                dst_path,
+                prog,
+            );
         }
         let data = arch.read_bytes(&inner).map_err(|e| e.to_string())?;
         if let Some((p2, sub2)) = split_remote_uri(dst_path) {

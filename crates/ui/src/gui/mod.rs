@@ -50,6 +50,7 @@ slint::slint! {
         FileRowSlint,
         IconGridTripleSlint,
         TransferRowSlint,
+        UpdateInfoSlint,
         OpenWithAppSlint,
         BatchRenameRuleSlint,
         BatchRenamePreviewRowSlint,
@@ -67,11 +68,12 @@ mod shortcuts;
 mod sync_modal;
 mod transfer_worker;
 mod trash;
+mod updater;
 
 pub use self::clipboard::{current_app_version_label, format_app_version_label};
 use self::{
     archive::*, batch_rename::*, clipboard::*, shortcuts::*, sync_modal::*, transfer_worker::*,
-    trash::*,
+    trash::*, updater::*,
 };
 
 const VIRTUAL_WINDOW_MIN_ROWS: usize = 12;
@@ -380,6 +382,11 @@ struct GuiRuntime {
     session_save_tick: u32,
     session_dirty: bool,
     native_os_drag_handed_off: bool,
+    update_tx: mpsc::Sender<UpdateCheckEvent>,
+    update_rx: mpsc::Receiver<UpdateCheckEvent>,
+    latest_update: Option<ReleaseUpdateInfo>,
+    update_checking: bool,
+    update_command_copied: bool,
 }
 
 impl GuiRuntime {
@@ -485,6 +492,7 @@ impl GuiRuntime {
         let (search_tx, search_rx) = mpsc::channel();
         let (sync_tx, sync_rx) = mpsc::channel();
         let (dir_size_tx, dir_size_rx) = mpsc::channel();
+        let (update_tx, update_rx) = mpsc::channel();
         let init_rate = mbps_to_rate_bps(prefs.max_bandwidth_mbps);
         let shared_limiter = Arc::new(Mutex::new(TokenBucketLimiter::new(init_rate)));
         let staging_dir = manifold_vfs::secure_runtime_subdir("staging").ok();
@@ -593,6 +601,11 @@ impl GuiRuntime {
             session_save_tick: 0,
             session_dirty: false,
             native_os_drag_handed_off: false,
+            update_tx,
+            update_rx,
+            latest_update: None,
+            update_checking: false,
+            update_command_copied: false,
         };
         runtime.reload_pane_entries(false);
         runtime.reload_pane_entries(true);
@@ -2297,6 +2310,9 @@ impl GuiRuntime {
             for child in children {
                 let child_dst = join_vfs_path(dst_path, &child.name);
                 self.vfs_copy_entry(&child.path, &child_dst)?;
+            }
+            if split_remote_uri(dst_path).is_none() && split_archive_uri(src_path).is_some() {
+                sanitize_macos_app_bundle(Path::new(dst_path), cfg!(target_os = "macos"));
             }
             return Ok(());
         }
@@ -4991,11 +5007,88 @@ fn build_icon_triples(rows: &[FileRowSlint], virtual_top: usize) -> Vec<IconGrid
     triples
 }
 
+fn sync_update_info_to_window(w: &ManifoldWindow, rt: &GuiRuntime) {
+    let hint = build_update_hint_for_os(std::env::consts::OS);
+    let info = match &rt.latest_update {
+        Some(u) => UpdateInfoSlint {
+            available: true,
+            checking: rt.update_checking,
+            latest_version: u.display_version.clone().into(),
+            notes: u.notes.clone().into(),
+            command: u.upgrade_command.clone().into(),
+            hint_text: hint.into(),
+            copied: rt.update_command_copied,
+        },
+        None => UpdateInfoSlint {
+            available: false,
+            checking: rt.update_checking,
+            latest_version: SharedString::default(),
+            notes: SharedString::default(),
+            command: SharedString::default(),
+            hint_text: hint.into(),
+            copied: false,
+        },
+    };
+    w.set_update_info(info);
+}
+
 /// Launches the native cross-platform Slint desktop GUI window for Manifold.
 pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
     let window = ManifoldWindow::new().map_err(|e| e.to_string())?;
     window.set_app_version_label(current_app_version_label().into());
     let rt = Rc::new(RefCell::new(GuiRuntime::new(initial_state)));
+    sync_update_info_to_window(&window, &rt.borrow());
+    spawn_update_check(rt.borrow().update_tx.clone(), false);
+
+    // Release Update Checker action handler
+    {
+        let rt = Rc::clone(&rt);
+        let win_weak = window.as_weak();
+        window.on_update_action(move |action| {
+            let mut guard = rt.borrow_mut();
+            match action.as_str() {
+                "check" => {
+                    if guard.update_checking {
+                        return;
+                    }
+                    guard.update_checking = true;
+                    if let Some(w) = win_weak.upgrade() {
+                        sync_update_info_to_window(&w, &guard);
+                    }
+                    let tx = guard.update_tx.clone();
+                    spawn_update_check(tx, true);
+                }
+                "open_modal" => {
+                    guard.update_command_copied = false;
+                    if let Some(w) = win_weak.upgrade() {
+                        sync_update_info_to_window(&w, &guard);
+                        w.set_show_update_modal(true);
+                    }
+                }
+                "copy" => {
+                    let cmd = guard
+                        .latest_update
+                        .as_ref()
+                        .map(|u| u.upgrade_command.clone())
+                        .unwrap_or_else(|| build_upgrade_command_for_os(std::env::consts::OS));
+                    copy_string_to_system_clipboard(&cmd);
+                    guard.update_command_copied = true;
+                    if let Some(w) = win_weak.upgrade() {
+                        sync_update_info_to_window(&w, &guard);
+                    }
+                }
+                "open" => {
+                    let url = guard
+                        .latest_update
+                        .as_ref()
+                        .map(|u| u.html_url.as_str())
+                        .unwrap_or(GITHUB_RELEASES_FALLBACK_URL);
+                    open_url_in_browser(url);
+                }
+                _ => {}
+            }
+        });
+    }
 
     rt.borrow_mut().restore_saved_session(&window);
     sync_window_from_runtime(&window, &mut rt.borrow_mut());
@@ -8699,6 +8792,43 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                     let r_vp_h = w.get_reported_right_viewport_height() as f64;
                     if guard.update_pane_viewport_h(true, r_vp_h) {
                         sync_pane_virtual_scroll(&w, &mut guard, true, true);
+                    }
+                }
+            }
+
+            while let Ok(upd_ev) = guard.update_rx.try_recv() {
+                guard.update_checking = false;
+                match upd_ev.result {
+                    UpdateCheckResult::UpdateAvailable(info) => {
+                        let log_msg =
+                            format!("[UPDATE] Available: {} ({})", info.tag_name, info.html_url);
+                        guard.logs.push(log_msg);
+                        guard.latest_update = Some(info);
+                        if upd_ev.manual {
+                            guard.update_command_copied = false;
+                        }
+                        sync_update_info_to_window(&w, &guard);
+                        if upd_ev.manual {
+                            w.set_show_update_modal(true);
+                        }
+                    }
+                    UpdateCheckResult::UpToDate { current, latest } => {
+                        sync_update_info_to_window(&w, &guard);
+                        if upd_ev.manual {
+                            let msg = format!("Manifold {current} is up to date ({latest}).");
+                            guard.show_toast("success", msg);
+                            w.set_status_banner_text(guard.status_banner_text.as_str().into());
+                            w.set_status_banner_is_error(guard.status_banner_is_error);
+                        }
+                    }
+                    UpdateCheckResult::Failed(err) => {
+                        sync_update_info_to_window(&w, &guard);
+                        if upd_ev.manual {
+                            guard.logs.push(format!("[UPDATE_ERR] {err}"));
+                            guard.show_toast("error", format!("Update check failed: {err}"));
+                            w.set_status_banner_text(guard.status_banner_text.as_str().into());
+                            w.set_status_banner_is_error(guard.status_banner_is_error);
+                        }
                     }
                 }
             }

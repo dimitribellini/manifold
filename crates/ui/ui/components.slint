@@ -95,6 +95,16 @@ export struct TransferRowSlint {
     can-control: bool,
 }
 
+export struct UpdateInfoSlint {
+    available: bool,
+    checking: bool,
+    latest-version: string,
+    notes: string,
+    command: string,
+    hint-text: string,
+    copied: bool,
+}
+
 export struct SyncPreviewRowSlint {
     relative-path: string,
     action: string,

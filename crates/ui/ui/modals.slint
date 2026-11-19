@@ -3,6 +3,7 @@ import { ScrollView } from "std-widgets.slint";
 import {
     BreadcrumbSegmentSlint,
     TransferRowSlint,
+    UpdateInfoSlint,
     SyncPreviewRowSlint,
     OpenWithAppSlint,
     BatchRenameRuleSlint,
@@ -1035,6 +1036,7 @@ export component WindowOverlays inherits Rectangle {
     in-out property <bool> show-sync-modal;
     in-out property <bool> show-tasks-popover;
     in property <bool> show-terminal-drawer;
+    in-out property <bool> show-update-modal;
     in-out property <bool> show-view-options-popover;
     in property <bool> sibling-dropdown-is-right;
     in property <[BreadcrumbSegmentSlint]> sibling-dropdown-items;
@@ -1076,6 +1078,7 @@ export component WindowOverlays inherits Rectangle {
     in property <string> ui-font-family;
     in property <int> ui-font-size-delta;
     in property <string> ui-theme-preset;
+    in property <UpdateInfoSlint> update-info;
     in-out property <bool> view-options-font-menu-open;
     in-out property <bool> view-options-icon-menu-open;
     in-out property <bool> view-options-scope-menu-open;
@@ -1126,6 +1129,7 @@ export component WindowOverlays inherits Rectangle {
     callback open-sync-modal();
     callback open-terminal();
     callback open-terminal-here();
+    callback update-action(string);
     callback remove-batch-rename-rule(int);
     callback reset-batch-rename-rules();
     callback resolve-conflict(string);
@@ -4025,6 +4029,16 @@ export component WindowOverlays inherits Rectangle {
                     }
                 }
                 ContextMenuItem {
+                    icon-kind: "downloads";
+                    label: root.update-info.available
+                        ? ("Update Available (" + root.update-info.latest-version + ")…")
+                        : (root.update-info.checking ? "Checking for Updates…" : "Check for Updates…");
+                    triggered => {
+                        root.show-app-menu = false;
+                        root.update-action(root.update-info.available ? "open_modal" : "check");
+                    }
+                }
+                ContextMenuItem {
                     icon-kind: "star";
                     label: "Preferences & Themes…";
                     shortcut-hint: "Ctrl+,";
@@ -5261,8 +5275,8 @@ export component WindowOverlays inherits Rectangle {
         }
 
         Rectangle {
-            width: 300px;
-            height: 214px;
+            width: 340px;
+            height: 222px;
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
             border-radius: 12px;
@@ -5322,12 +5336,225 @@ export component WindowOverlays inherits Rectangle {
 
                 HorizontalLayout {
                     alignment: center;
+                    spacing: 10px;
+                    Rectangle {
+                        height: 30px;
+                        width: abt-upd-txt.preferred-width + 20px;
+                        border-radius: 6px;
+                        background: root.update-info.available
+                            ? (abt-upd-touch.has-hover ? #2B78F0 : #1F6FEB)
+                            : (abt-upd-touch.has-hover ? #26262B : #161618);
+                        border-width: 1px;
+                        border-color: root.update-info.available ? #388BFD : #28282D;
+                        opacity: root.update-info.checking ? 0.5 : 1.0;
+                        abt-upd-txt := Text {
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            text: root.update-info.available
+                                ? ("Update " + root.update-info.latest-version)
+                                : (root.update-info.checking ? "Checking…" : "Check for Updates");
+                            color: root.update-info.available ? #FFFFFF : #E1E1E6;
+                            font-size: 12px + root.font-size-delta * 0.5;
+                            font-family: root.resolved-font-family;
+                            font-weight: 600;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        abt-upd-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                if !root.update-info.checking {
+                                    root.show-about-modal = false;
+                                    root.update-action(
+                                        root.update-info.available ? "open_modal" : "check"
+                                    );
+                                }
+                            }
+                        }
+                    }
                     ToolbarButton {
                         label: "Close";
-                        active: true;
+                        active: !root.update-info.available;
                         accent-bg: root.theme-accent;
                         font-family: root.resolved-font-family;
                         clicked => { root.show-about-modal = false; }
+                    }
+                }
+            }
+        }
+    }
+
+    // LAYER 4.15 (z: 2160): UPDATE AVAILABLE MODAL
+    if root.show-update-modal : Rectangle {
+        z: 2160;
+        width: 100%;
+        height: 100%;
+        background: #00000088;
+        TouchArea {
+            clicked => { root.show-update-modal = false; }
+        }
+
+        Rectangle {
+            width: 540px;
+            height: upd-modal-col.preferred-height;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            border-radius: 12px;
+            background: root.theme-bg-popover;
+            border-width: 1px;
+            border-color: root.theme-border;
+            drop-shadow-offset-y: 14px;
+            drop-shadow-blur: 32px;
+            drop-shadow-color: #000000AA;
+
+            TouchArea {}
+
+            upd-modal-col := VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+
+                VerticalLayout {
+                    spacing: 2px;
+                    Text {
+                        text: "Manifold Update Available";
+                        color: root.theme-text-primary;
+                        font-size: 15px + root.font-size-delta;
+                        font-family: root.resolved-font-family;
+                        font-weight: 700;
+                    }
+                    Text {
+                        text: root.app-version-label + "  →  " + root.update-info.latest-version;
+                        color: #8EC8FF;
+                        font-size: 12px + root.font-size-delta * 0.5;
+                        font-family: "monospace";
+                        font-weight: 600;
+                    }
+                }
+
+                Rectangle {
+                    height: Math.min(130px, upd-notes-txt.preferred-height + 16px);
+                    border-radius: 8px;
+                    background: root.theme-bg-canvas;
+                    border-width: 1px;
+                    border-color: root.theme-border;
+                    clip: true;
+
+                    upd-notes-txt := Text {
+                        x: 10px;
+                        y: 8px;
+                        width: parent.width - 20px;
+                        text: root.update-info.notes;
+                        color: root.theme-text-secondary;
+                        font-size: 11.5px + root.font-size-delta * 0.5;
+                        font-family: root.resolved-font-family;
+                        wrap: word-wrap;
+                    }
+                }
+
+                VerticalLayout {
+                    spacing: 6px;
+                    Text {
+                        text: root.update-info.hint-text;
+                        color: root.theme-text-secondary;
+                        font-size: 11.5px + root.font-size-delta * 0.5;
+                        font-family: root.resolved-font-family;
+                        wrap: word-wrap;
+                    }
+                    Rectangle {
+                        height: upd-cmd-txt.preferred-height + 16px;
+                        border-radius: 6px;
+                        background: #0D0E12;
+                        border-width: 1px;
+                        border-color: #2B2D36;
+                        upd-cmd-txt := Text {
+                            x: 10px;
+                            y: 8px;
+                            width: parent.width - 20px;
+                            text: root.update-info.command;
+                            color: #E6EDF3;
+                            font-size: 11px + root.font-size-delta * 0.4;
+                            font-family: "monospace";
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 10px;
+                    Rectangle {
+                        height: 30px;
+                        width: upd-later-txt.preferred-width + 20px;
+                        border-radius: 6px;
+                        background: upd-later-touch.has-hover ? #26262B : #161618;
+                        border-width: 1px;
+                        border-color: #28282D;
+                        upd-later-txt := Text {
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            text: "Later";
+                            color: #E1E1E6;
+                            font-size: 12px + root.font-size-delta * 0.5;
+                            font-family: root.resolved-font-family;
+                            font-weight: 500;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        upd-later-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.show-update-modal = false; }
+                        }
+                    }
+                    Rectangle {
+                        height: 30px;
+                        width: upd-copy-txt.preferred-width + 22px;
+                        border-radius: 6px;
+                        background: root.update-info.copied
+                            ? #238636
+                            : (upd-copy-touch.has-hover ? #26262B : #161618);
+                        border-width: 1px;
+                        border-color: root.update-info.copied ? #2EA043 : #28282D;
+                        upd-copy-txt := Text {
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            text: root.update-info.copied ? "Copied ✓" : "Copy Command";
+                            color: root.update-info.copied ? #FFFFFF : #E1E1E6;
+                            font-size: 12px + root.font-size-delta * 0.5;
+                            font-family: root.resolved-font-family;
+                            font-weight: root.update-info.copied ? 600 : 500;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        upd-copy-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.update-action("copy"); }
+                        }
+                    }
+                    Rectangle {
+                        height: 30px;
+                        width: upd-open-txt.preferred-width + 24px;
+                        border-radius: 6px;
+                        background: root.theme-accent;
+                        border-width: 1px;
+                        border-color: #388BFD;
+                        upd-open-txt := Text {
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            text: "Open Release Page";
+                            color: #FFFFFF;
+                            font-size: 12px + root.font-size-delta * 0.5;
+                            font-family: root.resolved-font-family;
+                            font-weight: 600;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        upd-open-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                root.update-action("open");
+                                root.show-update-modal = false;
+                            }
+                        }
                     }
                 }
             }

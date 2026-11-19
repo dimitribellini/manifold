@@ -277,8 +277,10 @@ pub(super) fn copy_local_dir_preserving_bundle(
     let stage_dst_str = stage_dst.to_string_lossy().to_string();
 
     let copied_ok = if cfg!(target_os = "macos") {
+        let safe_src = manifold_vfs::safe_cli_path_arg(src_path);
+        let safe_dst = manifold_vfs::safe_cli_path_arg(&stage_dst_str);
         let ditto_ok = Command::new("/usr/bin/ditto")
-            .args(["--noqtn", "--", src_path, &stage_dst_str])
+            .args([safe_src.as_str(), safe_dst.as_str()])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

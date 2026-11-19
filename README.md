@@ -27,11 +27,22 @@ Cross-platform dual-pane file manager and remote transfer client built in Rust a
 Download the latest release for **macOS (Apple Silicon)**, **Linux (x86_64)**, or **Windows (x86_64)** from [GitHub Releases](https://github.com/dimitribellini/manifold/releases).
 
 ### macOS (Apple Silicon / ARM64)
+
+**Terminal install / upgrade (recommended — avoids browser quarantine):**
 ```bash
-curl -sSL https://github.com/dimitribellini/manifold/releases/latest/download/manifold-macos-arm64.tar.gz | tar -xz
-mv Manifold.app /Applications/
+rm -rf /tmp/Manifold.app
+curl -sSL https://github.com/dimitribellini/manifold/releases/latest/download/manifold-macos-arm64.tar.gz | tar -xz -C /tmp
+rm -rf /Applications/Manifold.app && mv /tmp/Manifold.app /Applications/
 open /Applications/Manifold.app
 ```
+
+**Homebrew Tap:**
+```bash
+brew tap dimitribellini/tap
+brew install --cask manifold
+```
+
+> **macOS Gatekeeper Note:** Manifold is currently ad-hoc signed without an Apple Developer ID. If you download the `.tar.gz` via a web browser and macOS shows *"Apple could not verify 'Manifold' is free of malware"*, click **Done**, then open **System Settings → Privacy & Security → Open Anyway**, or install using the Terminal `curl` command above.
 
 ### Linux (x86_64 AppImage)
 ```bash

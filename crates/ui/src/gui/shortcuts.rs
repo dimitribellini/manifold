@@ -18,6 +18,7 @@ pub(super) fn handle_keyboard_shortcut(
         }
         let had_overlay = w.get_show_app_menu()
             || w.get_show_about_modal()
+            || w.get_show_update_modal()
             || w.get_show_context_menu()
             || w.get_show_sidebar_context_menu()
             || w.get_show_view_options_popover()
@@ -37,6 +38,7 @@ pub(super) fn handle_keyboard_shortcut(
             || w.get_right_path_edit_mode();
         w.set_show_app_menu(false);
         w.set_show_about_modal(false);
+        w.set_show_update_modal(false);
         w.set_show_context_menu(false);
         w.set_show_sidebar_context_menu(false);
         w.set_show_view_options_popover(false);
@@ -93,6 +95,7 @@ pub(super) fn handle_keyboard_shortcut(
         || w.get_show_open_with_modal()
         || w.get_show_preferences_modal()
         || w.get_show_about_modal()
+        || w.get_show_update_modal()
         || w.get_show_batch_rename_modal()
         || w.get_show_sync_modal()
     {
