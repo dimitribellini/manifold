@@ -389,12 +389,8 @@ pub(super) fn handle_keyboard_shortcut(
                 } else {
                     (cur + 1).min(len - 1)
                 };
-                guard.apply_row_selection(is_right, next, shift, false);
-                guard.refresh_headers_and_inspector();
-                let local_idx =
-                    sync_virtual_window_for_selection(w, &mut guard, is_right, next, view_mode);
+                select_and_scroll_row(w, &mut guard, is_right, next, shift);
                 drop(guard);
-                w.invoke_ensure_row_visible(is_right, local_idx);
             }
             return true;
         }
@@ -428,13 +424,8 @@ pub(super) fn handle_keyboard_shortcut(
                                 guard.left_entries.len()
                             };
                             let next = (cur + 1).min(len.saturating_sub(1));
-                            guard.apply_row_selection(is_right, next, shift, false);
-                            guard.refresh_headers_and_inspector();
-                            let local_idx = sync_virtual_window_for_selection(
-                                w, &mut guard, is_right, next, view_mode,
-                            );
+                            select_and_scroll_row(w, &mut guard, is_right, next, shift);
                             drop(guard);
-                            w.invoke_ensure_row_visible(is_right, local_idx);
                         }
                         return true;
                     }
@@ -454,13 +445,8 @@ pub(super) fn handle_keyboard_shortcut(
                                 .find(|&i| guard.left_entries[i].depth < depth)
                         };
                         if let Some(p_idx) = parent_idx {
-                            guard.apply_row_selection(is_right, p_idx, shift, false);
-                            guard.refresh_headers_and_inspector();
-                            let local_idx = sync_virtual_window_for_selection(
-                                w, &mut guard, is_right, p_idx, view_mode,
-                            );
+                            select_and_scroll_row(w, &mut guard, is_right, p_idx, shift);
                             drop(guard);
-                            w.invoke_ensure_row_visible(is_right, local_idx);
                             return true;
                         }
                     }
@@ -546,21 +532,18 @@ pub(super) fn handle_keyboard_shortcut(
             } else {
                 1
             };
+            let page_step = guard.pane_page_step(is_right);
             let next = match key {
                 "\u{f700}" => cur.saturating_sub(step),
                 "\u{f701}" => (cur + step).min(len - 1),
                 "\u{f729}" => 0,
                 "\u{f72b}" => len - 1,
-                "\u{f72c}" => cur.saturating_sub(18),
-                "\u{f72d}" => (cur + 18).min(len - 1),
+                "\u{f72c}" => cur.saturating_sub(page_step),
+                "\u{f72d}" => (cur + page_step).min(len - 1),
                 _ => cur,
             };
-            guard.apply_row_selection(is_right, next, shift, false);
-            guard.refresh_headers_and_inspector();
-            let local_idx =
-                sync_virtual_window_for_selection(w, &mut guard, is_right, next, view_mode);
+            select_and_scroll_row(w, &mut guard, is_right, next, shift);
             drop(guard);
-            w.invoke_ensure_row_visible(is_right, local_idx);
         }
         return true;
     }
@@ -586,46 +569,18 @@ pub(super) fn handle_keyboard_shortcut(
     false
 }
 
-fn sync_virtual_window_for_selection(
+fn select_and_scroll_row(
     w: &ManifoldWindow,
     guard: &mut GuiRuntime,
     is_right: bool,
     target_idx: usize,
-    view_mode: PaneViewMode,
-) -> i32 {
-    const WINDOW_CAP: usize = 300;
-    let total = if is_right {
-        guard.right_entries.len()
-    } else {
-        guard.left_entries.len()
-    };
-    let cur_top = if is_right {
-        guard.right_virtual_top_row
-    } else {
-        guard.left_virtual_top_row
-    };
-    let max_top = total.saturating_sub(WINDOW_CAP);
-    let mut new_top = if target_idx < cur_top {
-        target_idx.saturating_sub(24).min(max_top)
-    } else if target_idx >= cur_top + WINDOW_CAP {
-        target_idx.saturating_sub(WINDOW_CAP - 36).min(max_top)
-    } else {
-        cur_top
-    };
-    if view_mode == PaneViewMode::Icons {
-        new_top -= new_top % 3;
-    }
-    if new_top != cur_top {
-        if is_right {
-            guard.right_virtual_top_row = new_top;
-        } else {
-            guard.left_virtual_top_row = new_top;
-        }
-        sync_window_from_runtime(w, guard);
-    } else {
-        sync_selection_and_inspector(w, guard);
-    }
-    target_idx.saturating_sub(new_top) as i32
+    shift: bool,
+) {
+    guard.apply_row_selection(is_right, target_idx, shift, false);
+    guard.refresh_headers_and_inspector();
+    guard.ensure_row_visible_in_pane(w, is_right, target_idx);
+    sync_selection_and_inspector(w, guard);
+    w.invoke_focus_main_key_router();
 }
 
 pub(super) fn normalize_fav_target(raw: &str) -> String {

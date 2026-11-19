@@ -923,11 +923,94 @@ fn test_v070_per_tab_history_split_vertical_drop_and_500k_window_slice() {
         &thumbs,
         &mut missing,
         &vo,
-        (400_000, None),
+        (400_000, 40, None),
     );
-    assert_eq!(win_rows.len(), VIRTUAL_WINDOW_CAP);
+    assert_eq!(win_rows.len(), 40);
     assert_eq!(win_rows[0].name.as_str(), "item_400000.log");
     assert!(win_rows[5].is_selected);
 
     let _ = std::fs::remove_dir_all(&base_dir);
+}
+
+#[test]
+fn test_virtual_scroll_3603_items_reaches_final_item_and_accumulates_small_deltas() {
+    let vp_h = 500.0;
+    let geom = compute_pane_scroll_geometry(3603, 0, 1.0, 16, vp_h);
+    assert!((geom.row_stride_px - 31.0).abs() < 1e-6);
+    assert!(geom.max_scroll_px > 0.0);
+
+    // Simulate 20 small macOS wheel ticks of dy = -6.0px (scroll_y += 6.0px per tick)
+    let mut scroll_y = 0.0;
+    let mut prev_sub = compute_pane_scroll_window(&geom, scroll_y, vp_h).sub_row_offset_px;
+    for tick in 1..=20 {
+        scroll_y = (scroll_y + 6.0).clamp(0.0, geom.max_scroll_px);
+        assert!((scroll_y - (tick as f64) * 6.0).abs() < 1e-6);
+        let win = compute_pane_scroll_window(&geom, scroll_y, vp_h);
+        if tick == 1 {
+            // Tick 1 (6px) immediately moves sub_row_offset_px instead of rounding to 0
+            assert!(win.sub_row_offset_px < prev_sub);
+        }
+        prev_sub = win.sub_row_offset_px;
+        assert!(win.sub_row_offset_px > -geom.row_stride_px);
+        assert!(win.sub_row_offset_px <= geom.padding_top_px);
+    }
+    let after_20 = compute_pane_scroll_window(&geom, scroll_y, vp_h);
+    assert_eq!(after_20.top_item_index, 3);
+
+    // Scrolling to max_scroll_px must expose final item #3602 within the viewport
+    let bottom_win = compute_pane_scroll_window(&geom, geom.max_scroll_px, vp_h);
+    let end_idx = (bottom_win.top_item_index + bottom_win.max_items_slice).min(3603);
+    assert!(
+        (bottom_win.top_item_index..end_idx).contains(&3602),
+        "expected item 3602 inside {}..{}",
+        bottom_win.top_item_index,
+        end_idx
+    );
+    let last_offset = 3602 - bottom_win.top_item_index;
+    let last_bottom_y = bottom_win.sub_row_offset_px
+        + (last_offset as f64) * geom.row_stride_px
+        + geom.row_height_px;
+    assert!(last_bottom_y <= vp_h + 1e-6 && last_bottom_y >= vp_h - 13.0);
+}
+
+#[test]
+fn test_virtual_scroll_icons_and_columns_views_beyond_300() {
+    let vp_h = 520.0;
+    // Mode 1 (Icons View, 3 columns per row, 3603 items)
+    let icons_geom = compute_pane_scroll_geometry(3603, 1, 1.0, 16, vp_h);
+    assert_eq!(icons_geom.items_per_row, 3);
+    let mid_icons = compute_pane_scroll_window(&icons_geom, 15_000.0, vp_h);
+    assert_eq!(mid_icons.top_item_index % 3, 0);
+    assert!(mid_icons.top_item_index > 300);
+    let bot_icons = compute_pane_scroll_window(&icons_geom, icons_geom.max_scroll_px, vp_h);
+    let icons_end = (bot_icons.top_item_index + bot_icons.max_items_slice).min(3603);
+    assert!((bot_icons.top_item_index..icons_end).contains(&3602));
+
+    // Mode 2 (Miller Columns View, 3603 items)
+    let col_geom = compute_pane_scroll_geometry(3603, 2, 1.0, 16, vp_h);
+    assert!((col_geom.row_stride_px - 26.0).abs() < 1e-6);
+    let bot_col = compute_pane_scroll_window(&col_geom, col_geom.max_scroll_px, vp_h);
+    let col_end = (bot_col.top_item_index + bot_col.max_items_slice).min(3603);
+    assert!((bot_col.top_item_index..col_end).contains(&3602));
+}
+
+#[test]
+fn test_virtual_scroll_ensure_row_visible_and_short_dir() {
+    let vp_h = 500.0;
+    let geom = compute_pane_scroll_geometry(3603, 0, 1.0, 16, vp_h);
+    let at_end = compute_ensure_row_visible_scroll(&geom, 0.0, vp_h, 3602);
+    assert!((at_end - geom.max_scroll_px).abs() < 1e-6);
+    let at_home = compute_ensure_row_visible_scroll(&geom, at_end, vp_h, 0);
+    assert!((at_home - 0.0).abs() < 1e-6);
+
+    // Short 5-item directory: max_scroll_px == 0, top_item_index == 0, sub_row_offset == 4.0
+    let short_geom = compute_pane_scroll_geometry(5, 0, 1.0, 16, vp_h);
+    assert!((short_geom.max_scroll_px - 0.0).abs() < 1e-6);
+    let short_win = compute_pane_scroll_window(&short_geom, 100.0, vp_h);
+    assert_eq!(short_win.top_item_index, 0);
+    assert!((short_win.sub_row_offset_px - 4.0).abs() < 1e-6);
+
+    // Custom icon_size = 32 produces row_stride = 29 + 2*1 + 16 = 47.0
+    let big_icon_geom = compute_pane_scroll_geometry(100, 0, 1.0, 32, vp_h);
+    assert!((big_icon_geom.row_stride_px - 47.0).abs() < 1e-6);
 }

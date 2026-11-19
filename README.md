@@ -33,12 +33,11 @@ mv Manifold.app /Applications/
 open /Applications/Manifold.app
 ```
 
-### Linux (x86_64)
+### Linux (x86_64 AppImage)
 ```bash
-curl -sSL https://github.com/dimitribellini/manifold/releases/latest/download/manifold-linux-x86_64.tar.gz | tar -xz
-chmod +x manifold-linux-x86_64
-sudo mv manifold-linux-x86_64 /usr/local/bin/manifold
-manifold
+curl -sSL -o manifold-linux-x86_64.AppImage https://github.com/dimitribellini/manifold/releases/latest/download/manifold-linux-x86_64.AppImage
+chmod +x manifold-linux-x86_64.AppImage
+./manifold-linux-x86_64.AppImage
 ```
 
 ### Windows (x86_64)

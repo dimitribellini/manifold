@@ -74,7 +74,166 @@ use self::{
     trash::*,
 };
 
-const VIRTUAL_WINDOW_CAP: usize = 300;
+const VIRTUAL_WINDOW_MIN_ROWS: usize = 12;
+const VIRTUAL_WINDOW_MAX_ROWS: usize = 120;
+const MILLER_PARENT_CAP: usize = 300;
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PaneScrollGeometry {
+    pub(super) total_items: usize,
+    pub(super) items_per_row: usize,
+    pub(super) total_rows: usize,
+    pub(super) row_height_px: f64,
+    pub(super) row_stride_px: f64,
+    pub(super) padding_top_px: f64,
+    pub(super) total_content_px: f64,
+    pub(super) max_scroll_px: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PaneScrollWindow {
+    pub(super) clamped_scroll_px: f64,
+    pub(super) top_item_index: usize,
+    pub(super) sub_row_offset_px: f64,
+    pub(super) max_items_slice: usize,
+}
+
+pub(super) fn compute_pane_scroll_geometry(
+    total_items: usize,
+    view_mode: i32,
+    font_delta: f64,
+    icon_size: u16,
+    viewport_h: f64,
+) -> PaneScrollGeometry {
+    let fd = font_delta.max(0.0);
+    let (items_per_row, row_height_px, row_stride_px, padding_top_px, padding_bottom_px) =
+        match view_mode {
+            1 => {
+                let h = 128.0 + fd * 4.0;
+                (3usize, h, h + 10.0, 12.0, 12.0)
+            }
+            2 => (1usize, 26.0, 26.0, 0.0, 8.0),
+            _ => {
+                let h = 28.0 + fd * 2.0 + (icon_size as f64 - 16.0).max(0.0);
+                (1usize, h, h + 1.0, 4.0, 12.0)
+            }
+        };
+    let total_rows = total_items.div_ceil(items_per_row);
+    let total_content_px = if total_rows == 0 {
+        0.0
+    } else {
+        let gap = row_stride_px - row_height_px;
+        padding_top_px + (total_rows as f64) * row_stride_px - gap + padding_bottom_px
+    };
+    let vp_h = viewport_h.max(60.0);
+    let max_scroll_px = (total_content_px - vp_h).max(0.0);
+    PaneScrollGeometry {
+        total_items,
+        items_per_row,
+        total_rows,
+        row_height_px,
+        row_stride_px,
+        padding_top_px,
+        total_content_px,
+        max_scroll_px,
+    }
+}
+
+pub(super) fn compute_pane_scroll_window(
+    geom: &PaneScrollGeometry,
+    scroll_y_px: f64,
+    viewport_h: f64,
+) -> PaneScrollWindow {
+    if geom.total_items == 0 || geom.total_rows == 0 {
+        return PaneScrollWindow {
+            clamped_scroll_px: 0.0,
+            top_item_index: 0,
+            sub_row_offset_px: geom.padding_top_px,
+            max_items_slice: 0,
+        };
+    }
+    let clamped_scroll_px = scroll_y_px.clamp(0.0, geom.max_scroll_px);
+    let (top_row, sub_row_offset_px) = if clamped_scroll_px <= geom.padding_top_px {
+        (0usize, geom.padding_top_px - clamped_scroll_px)
+    } else {
+        let effective = clamped_scroll_px - geom.padding_top_px;
+        let r = ((effective / geom.row_stride_px).floor() as usize)
+            .min(geom.total_rows.saturating_sub(1));
+        let row_y = geom.padding_top_px + (r as f64) * geom.row_stride_px;
+        (r, row_y - clamped_scroll_px)
+    };
+    let top_item_index = (top_row * geom.items_per_row).min(geom.total_items.saturating_sub(1));
+    let span = viewport_h.max(120.0) - sub_row_offset_px.min(0.0);
+    let visible_rows = ((span / geom.row_stride_px).ceil() as usize + 4)
+        .clamp(VIRTUAL_WINDOW_MIN_ROWS, VIRTUAL_WINDOW_MAX_ROWS);
+    let max_items_slice = visible_rows * geom.items_per_row;
+    PaneScrollWindow {
+        clamped_scroll_px,
+        top_item_index,
+        sub_row_offset_px,
+        max_items_slice,
+    }
+}
+
+pub(super) fn compute_ensure_row_visible_scroll(
+    geom: &PaneScrollGeometry,
+    cur_scroll_px: f64,
+    viewport_h: f64,
+    target_idx: usize,
+) -> f64 {
+    if geom.total_items == 0 || geom.total_rows == 0 {
+        return 0.0;
+    }
+    let clamped_idx = target_idx.min(geom.total_items - 1);
+    let target_row = clamped_idx / geom.items_per_row;
+    let vp_h = viewport_h.max(60.0);
+    let cur = cur_scroll_px.clamp(0.0, geom.max_scroll_px);
+    let item_top = if target_row == 0 {
+        0.0
+    } else {
+        geom.padding_top_px + (target_row as f64) * geom.row_stride_px
+    };
+    let item_bottom = if target_row + 1 >= geom.total_rows {
+        geom.total_content_px
+    } else {
+        geom.padding_top_px + (target_row as f64) * geom.row_stride_px + geom.row_height_px
+    };
+    let next = if item_top < cur {
+        item_top
+    } else if item_bottom > cur + vp_h {
+        item_bottom - vp_h
+    } else {
+        cur
+    };
+    next.clamp(0.0, geom.max_scroll_px)
+}
+
+fn sync_vec_model_in_place<T: Clone + 'static>(
+    current: &ModelRc<T>,
+    new_items: Vec<T>,
+    setter: impl FnOnce(ModelRc<T>),
+) {
+    if let Some(vec_model) = current.as_any().downcast_ref::<VecModel<T>>() {
+        let old_len = vec_model.row_count();
+        let new_len = new_items.len();
+        let common = old_len.min(new_len);
+        let mut iter = new_items.into_iter();
+        for (i, item) in iter.by_ref().take(common).enumerate() {
+            vec_model.set_row_data(i, item);
+        }
+        if new_len > old_len {
+            for item in iter {
+                vec_model.push(item);
+            }
+        } else if old_len > new_len {
+            for i in (new_len..old_len).rev() {
+                vec_model.remove(i);
+            }
+        }
+    } else {
+        setter(ModelRc::new(VecModel::from(new_items)));
+    }
+}
 
 #[derive(Clone)]
 struct FlattenedRowEntry {
@@ -143,6 +302,15 @@ struct GuiRuntime {
     pending_thumbs: RefCell<HashSet<String>>,
     left_virtual_top_row: usize,
     right_virtual_top_row: usize,
+    left_scroll_y_px: f64,
+    right_scroll_y_px: f64,
+    left_viewport_h: f64,
+    right_viewport_h: f64,
+    left_rendered_slice_len: usize,
+    right_rendered_slice_len: usize,
+    left_reset_aux_scroll: bool,
+    right_reset_aux_scroll: bool,
+    tab_scroll_positions: HashMap<String, f64>,
     saved_connections: ConnectionsConfig,
     prefs: AppPreferences,
     credential_store: CredentialStore,
@@ -350,6 +518,15 @@ impl GuiRuntime {
             pending_thumbs: RefCell::new(HashSet::new()),
             left_virtual_top_row: 0,
             right_virtual_top_row: 0,
+            left_scroll_y_px: 0.0,
+            right_scroll_y_px: 0.0,
+            left_viewport_h: 560.0,
+            right_viewport_h: 560.0,
+            left_rendered_slice_len: 0,
+            right_rendered_slice_len: 0,
+            left_reset_aux_scroll: false,
+            right_reset_aux_scroll: false,
+            tab_scroll_positions: HashMap::new(),
             saved_connections,
             prefs,
             credential_store,
@@ -2261,6 +2438,139 @@ impl GuiRuntime {
         }
     }
 
+    fn reset_pane_scroll(&mut self, is_right: bool) {
+        if is_right {
+            self.right_scroll_y_px = 0.0;
+            self.right_virtual_top_row = 0;
+            self.right_rendered_slice_len = 0;
+            self.right_reset_aux_scroll = true;
+        } else {
+            self.left_scroll_y_px = 0.0;
+            self.left_virtual_top_row = 0;
+            self.left_rendered_slice_len = 0;
+            self.left_reset_aux_scroll = true;
+        }
+    }
+
+    fn active_tab_id(&self, is_right: bool) -> Option<String> {
+        if is_right {
+            self.app_state
+                .right_tabs
+                .get(self.app_state.right_active_tab)
+                .map(|t| t.id.clone())
+        } else {
+            self.app_state
+                .left_tabs
+                .get(self.app_state.left_active_tab)
+                .map(|t| t.id.clone())
+        }
+    }
+
+    fn save_active_tab_scroll(&mut self, is_right: bool) {
+        if let Some(id) = self.active_tab_id(is_right) {
+            let cur = if is_right {
+                self.right_scroll_y_px
+            } else {
+                self.left_scroll_y_px
+            };
+            self.tab_scroll_positions.insert(id, cur);
+        }
+    }
+
+    fn restore_active_tab_scroll(&mut self, is_right: bool) {
+        let saved = self
+            .active_tab_id(is_right)
+            .and_then(|id| self.tab_scroll_positions.get(&id).copied())
+            .unwrap_or(0.0);
+        if is_right {
+            self.right_scroll_y_px = saved;
+            self.right_rendered_slice_len = 0;
+            self.right_reset_aux_scroll = true;
+        } else {
+            self.left_scroll_y_px = saved;
+            self.left_rendered_slice_len = 0;
+            self.left_reset_aux_scroll = true;
+        }
+    }
+
+    fn update_pane_viewport_h(&mut self, is_right: bool, vp_h_px: f64) -> bool {
+        if vp_h_px <= 40.0 {
+            return false;
+        }
+        let target = if is_right {
+            &mut self.right_viewport_h
+        } else {
+            &mut self.left_viewport_h
+        };
+        if (*target - vp_h_px).abs() > 0.5 {
+            *target = vp_h_px;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn pane_scroll_geometry(&self, is_right: bool) -> PaneScrollGeometry {
+        let (total_items, view_mode, vp_h) = if is_right {
+            let mode = self
+                .app_state
+                .right_tabs
+                .get(self.app_state.right_active_tab)
+                .map(|t| view_mode_to_int(t.view_mode))
+                .unwrap_or(1);
+            (self.right_entries.len(), mode, self.right_viewport_h)
+        } else {
+            let mode = self
+                .app_state
+                .left_tabs
+                .get(self.app_state.left_active_tab)
+                .map(|t| view_mode_to_int(t.view_mode))
+                .unwrap_or(0);
+            (self.left_entries.len(), mode, self.left_viewport_h)
+        };
+        let cur_path = self.current_pane_path(is_right);
+        let vo = self.effective_view_options_for_dir(&cur_path);
+        compute_pane_scroll_geometry(
+            total_items,
+            view_mode,
+            self.prefs.font_size_delta as f64,
+            vo.icon_size,
+            vp_h,
+        )
+    }
+
+    pub(super) fn pane_page_step(&self, is_right: bool) -> usize {
+        let geom = self.pane_scroll_geometry(is_right);
+        let vp_h = if is_right {
+            self.right_viewport_h
+        } else {
+            self.left_viewport_h
+        };
+        let rows_per_page = (vp_h / geom.row_stride_px).floor().max(1.0) as usize;
+        rows_per_page.saturating_mul(geom.items_per_row).max(1)
+    }
+
+    pub(super) fn ensure_row_visible_in_pane(
+        &mut self,
+        window: &ManifoldWindow,
+        is_right: bool,
+        target_idx: usize,
+    ) {
+        let geom = self.pane_scroll_geometry(is_right);
+        let (cur_scroll, vp_h) = if is_right {
+            (self.right_scroll_y_px, self.right_viewport_h)
+        } else {
+            (self.left_scroll_y_px, self.left_viewport_h)
+        };
+        let next_scroll = compute_ensure_row_visible_scroll(&geom, cur_scroll, vp_h, target_idx);
+        if is_right {
+            self.right_scroll_y_px = next_scroll;
+        } else {
+            self.left_scroll_y_px = next_scroll;
+        }
+        sync_pane_virtual_scroll(window, self, is_right, false);
+    }
+
     fn set_current_pane_path(&mut self, is_right: bool, new_path: String) {
         if let Some((arch_path, _)) = split_archive_uri(&new_path) {
             self.ensure_archive_mounted(&arch_path);
@@ -2289,7 +2599,6 @@ impl GuiRuntime {
             self.right_selected_indices.clear();
             self.right_selected_indices.insert(0);
             self.right_anchor_idx = Some(0);
-            self.right_virtual_top_row = 0;
         } else {
             let idx = self.app_state.left_active_tab;
             if let Some(tab) = self.app_state.left_tabs.get_mut(idx) {
@@ -2305,8 +2614,8 @@ impl GuiRuntime {
             self.left_selected_indices.clear();
             self.left_selected_indices.insert(0);
             self.left_anchor_idx = Some(0);
-            self.left_virtual_top_row = 0;
         }
+        self.reset_pane_scroll(is_right);
         self.cancel_pane_search(is_right);
         self.app_state.toolbar.search_query.clear();
         self.app_state.toolbar.active_folder_title = title;
@@ -3463,27 +3772,11 @@ fn sync_window_from_runtime(window: &ManifoldWindow, rt: &mut GuiRuntime) {
     window.set_show_hidden_files(show_hidden || active_vo.show_hidden_files);
 
     // Rows, 3-Column Polaroid Icon Triples, and Miller Parent Columns
-    let mut missing_thumbs = Vec::new();
-    let l_total = rt.left_entries.len();
-    let l_max_top = l_total.saturating_sub(VIRTUAL_WINDOW_CAP);
-    rt.left_virtual_top_row = rt.left_virtual_top_row.min(l_max_top);
-    window.set_left_total_rows(l_total as i32);
-    window.set_left_virtual_top_row(rt.left_virtual_top_row as i32);
+    let left_h = window.get_left_viewport_height() as f64;
+    rt.update_pane_viewport_h(false, left_h);
+    sync_pane_virtual_scroll(window, rt, false, true);
 
-    let l_base_opt = (!l_filter.is_empty()).then_some(l_cur_path.as_str());
-    let l_rows = build_slint_rows_from_flattened(
-        &rt.left_entries,
-        &rt.left_selected_indices,
-        &rt.thumbnail_cache,
-        &mut missing_thumbs,
-        &l_vo,
-        (rt.left_virtual_top_row, l_base_opt),
-    );
-    let l_triples = if l_mode == 1 {
-        build_icon_triples(&l_rows, rt.left_virtual_top_row)
-    } else {
-        Vec::new()
-    };
+    let mut missing_thumbs = Vec::new();
     let l_parent_rows = if l_mode == 2 {
         let l_parent_sel = rt
             .left_parent_entries
@@ -3499,31 +3792,16 @@ fn sync_window_from_runtime(window: &ManifoldWindow, rt: &mut GuiRuntime) {
     } else {
         Vec::new()
     };
-    window.set_left_rows(ModelRc::new(VecModel::from(l_rows)));
-    window.set_left_icon_triples(ModelRc::new(VecModel::from(l_triples)));
-    window.set_left_parent_rows(ModelRc::new(VecModel::from(l_parent_rows)));
+    let cur_l_parents = window.get_left_parent_rows();
+    sync_vec_model_in_place(&cur_l_parents, l_parent_rows, |m| {
+        window.set_left_parent_rows(m);
+    });
 
     if dual_mode {
-        let r_total = rt.right_entries.len();
-        let r_max_top = r_total.saturating_sub(VIRTUAL_WINDOW_CAP);
-        rt.right_virtual_top_row = rt.right_virtual_top_row.min(r_max_top);
-        window.set_right_total_rows(r_total as i32);
-        window.set_right_virtual_top_row(rt.right_virtual_top_row as i32);
+        let right_h = window.get_reported_right_viewport_height() as f64;
+        rt.update_pane_viewport_h(true, right_h);
+        sync_pane_virtual_scroll(window, rt, true, true);
 
-        let r_base_opt = (!r_filter.is_empty()).then_some(r_cur_path.as_str());
-        let r_rows = build_slint_rows_from_flattened(
-            &rt.right_entries,
-            &rt.right_selected_indices,
-            &rt.thumbnail_cache,
-            &mut missing_thumbs,
-            &r_vo,
-            (rt.right_virtual_top_row, r_base_opt),
-        );
-        let r_triples = if r_mode == 1 {
-            build_icon_triples(&r_rows, rt.right_virtual_top_row)
-        } else {
-            Vec::new()
-        };
         let r_parent_rows = if r_mode == 2 {
             let r_parent_sel = rt
                 .right_parent_entries
@@ -3539,9 +3817,10 @@ fn sync_window_from_runtime(window: &ManifoldWindow, rt: &mut GuiRuntime) {
         } else {
             Vec::new()
         };
-        window.set_right_rows(ModelRc::new(VecModel::from(r_rows)));
-        window.set_right_icon_triples(ModelRc::new(VecModel::from(r_triples)));
-        window.set_right_parent_rows(ModelRc::new(VecModel::from(r_parent_rows)));
+        let cur_r_parents = window.get_right_parent_rows();
+        sync_vec_model_in_place(&cur_r_parents, r_parent_rows, |m| {
+            window.set_right_parent_rows(m);
+        });
     }
     for p in missing_thumbs {
         rt.request_bg_thumbnail(&p);
@@ -3653,6 +3932,142 @@ fn update_triples_selection_in_place(
                 triples.set_row_data(idx, triple);
             }
         }
+    }
+}
+
+fn sync_pane_virtual_scroll(
+    window: &ManifoldWindow,
+    rt: &mut GuiRuntime,
+    is_right: bool,
+    force_model_refresh: bool,
+) {
+    let cur_path = rt.current_pane_path(is_right);
+    let vo = rt.effective_view_options_for_dir(&cur_path);
+    let (view_mode, filter, cur_scroll, vp_h, prev_top, prev_slice_len) = if is_right {
+        let tab = rt.app_state.right_tabs.get(rt.app_state.right_active_tab);
+        let mode = tab.map(|t| view_mode_to_int(t.view_mode)).unwrap_or(1);
+        let q = tab
+            .map(|t| t.inline_filter.trim().to_string())
+            .unwrap_or_default();
+        (
+            mode,
+            q,
+            rt.right_scroll_y_px,
+            rt.right_viewport_h,
+            rt.right_virtual_top_row,
+            rt.right_rendered_slice_len,
+        )
+    } else {
+        let tab = rt.app_state.left_tabs.get(rt.app_state.left_active_tab);
+        let mode = tab.map(|t| view_mode_to_int(t.view_mode)).unwrap_or(0);
+        let q = tab
+            .map(|t| t.inline_filter.trim().to_string())
+            .unwrap_or_default();
+        (
+            mode,
+            q,
+            rt.left_scroll_y_px,
+            rt.left_viewport_h,
+            rt.left_virtual_top_row,
+            rt.left_rendered_slice_len,
+        )
+    };
+    let total_items = if is_right {
+        rt.right_entries.len()
+    } else {
+        rt.left_entries.len()
+    };
+    let geom = compute_pane_scroll_geometry(
+        total_items,
+        view_mode,
+        rt.prefs.font_size_delta as f64,
+        vo.icon_size,
+        vp_h,
+    );
+    let win = compute_pane_scroll_window(&geom, cur_scroll, vp_h);
+    let expected_slice_len = total_items
+        .saturating_sub(win.top_item_index)
+        .min(win.max_items_slice);
+    let need_rows = force_model_refresh
+        || prev_top != win.top_item_index
+        || prev_slice_len != expected_slice_len;
+    let drag_scroll = (win.sub_row_offset_px - geom.padding_top_px) as f32;
+
+    if is_right {
+        rt.right_scroll_y_px = win.clamped_scroll_px;
+        window.set_right_total_rows(total_items as i32);
+        window.set_right_scroll_y_px(win.clamped_scroll_px as f32);
+        window.set_right_max_scroll_px(geom.max_scroll_px as f32);
+        window.set_right_total_content_px(geom.total_content_px as f32);
+        window.set_right_sub_row_offset(win.sub_row_offset_px as f32);
+        window.set_drag_right_scroll_y(drag_scroll);
+        if rt.right_reset_aux_scroll {
+            rt.right_reset_aux_scroll = false;
+            window.set_right_scroll_x(0.0);
+            window.set_right_parent_scroll_y(0.0);
+        }
+    } else {
+        rt.left_scroll_y_px = win.clamped_scroll_px;
+        window.set_left_total_rows(total_items as i32);
+        window.set_left_scroll_y_px(win.clamped_scroll_px as f32);
+        window.set_left_max_scroll_px(geom.max_scroll_px as f32);
+        window.set_left_total_content_px(geom.total_content_px as f32);
+        window.set_left_sub_row_offset(win.sub_row_offset_px as f32);
+        window.set_drag_left_scroll_y(drag_scroll);
+        if rt.left_reset_aux_scroll {
+            rt.left_reset_aux_scroll = false;
+            window.set_left_scroll_x(0.0);
+            window.set_left_parent_scroll_y(0.0);
+        }
+    }
+    if !need_rows {
+        return;
+    }
+
+    let mut missing_thumbs = Vec::new();
+    let base_opt = (!filter.is_empty()).then_some(cur_path.as_str());
+    let (entries, selected) = if is_right {
+        (&rt.right_entries, &rt.right_selected_indices)
+    } else {
+        (&rt.left_entries, &rt.left_selected_indices)
+    };
+    let rows = build_slint_rows_from_flattened(
+        entries,
+        selected,
+        &rt.thumbnail_cache,
+        &mut missing_thumbs,
+        &vo,
+        (win.top_item_index, win.max_items_slice, base_opt),
+    );
+    let triples = if view_mode == 1 {
+        build_icon_triples(&rows, win.top_item_index)
+    } else {
+        Vec::new()
+    };
+
+    if is_right {
+        rt.right_virtual_top_row = win.top_item_index;
+        rt.right_rendered_slice_len = expected_slice_len;
+        window.set_right_virtual_top_row(win.top_item_index as i32);
+        let cur_rows = window.get_right_rows();
+        sync_vec_model_in_place(&cur_rows, rows, |m| window.set_right_rows(m));
+        let cur_triples = window.get_right_icon_triples();
+        sync_vec_model_in_place(&cur_triples, triples, |m| {
+            window.set_right_icon_triples(m);
+        });
+    } else {
+        rt.left_virtual_top_row = win.top_item_index;
+        rt.left_rendered_slice_len = expected_slice_len;
+        window.set_left_virtual_top_row(win.top_item_index as i32);
+        let cur_rows = window.get_left_rows();
+        sync_vec_model_in_place(&cur_rows, rows, |m| window.set_left_rows(m));
+        let cur_triples = window.get_left_icon_triples();
+        sync_vec_model_in_place(&cur_triples, triples, |m| {
+            window.set_left_icon_triples(m);
+        });
+    }
+    for p in missing_thumbs {
+        rt.request_bg_thumbnail(&p);
     }
 }
 
@@ -4297,14 +4712,14 @@ fn build_slint_rows_from_flattened(
     thumb_cache: &HashMap<String, Option<Image>>,
     missing_thumbs: &mut Vec<String>,
     vo: &FolderViewOptions,
-    window_ctx: (usize, Option<&str>),
+    window_ctx: (usize, usize, Option<&str>),
 ) -> Vec<FileRowSlint> {
-    let (virtual_top, search_base_dir) = window_ctx;
+    let (virtual_top, limit, search_base_dir) = window_ctx;
     entries
         .iter()
         .enumerate()
         .skip(virtual_top)
-        .take(VIRTUAL_WINDOW_CAP)
+        .take(limit)
         .map(|(idx, entry)| {
             let state = (
                 entry.depth,
@@ -4333,7 +4748,7 @@ fn build_slint_rows_from_meta(
     entries
         .iter()
         .enumerate()
-        .take(VIRTUAL_WINDOW_CAP)
+        .take(MILLER_PARENT_CAP)
         .map(|(idx, meta)| {
             let is_sel = selected_idx == Some(idx);
             meta_to_slint_row(meta, (0, false, is_sel), thumb_cache, missing_thumbs, vo)
@@ -4543,7 +4958,7 @@ fn empty_slint_row() -> FileRowSlint {
 
 fn build_icon_triples(rows: &[FileRowSlint], virtual_top: usize) -> Vec<IconGridTripleSlint> {
     let mut triples = Vec::new();
-    let limit = rows.len().min(VIRTUAL_WINDOW_CAP);
+    let limit = rows.len();
     let mut idx = 0usize;
     while idx < limit {
         let item_0 = rows[idx].clone();
@@ -4659,22 +5074,68 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
     {
         let rt = Rc::clone(&rt);
         let win_weak = window.as_weak();
-        window.on_set_virtual_scroll_row(move |is_right, top_row| {
+        window.on_scroll_pane_vertical(move |is_right, dy_px, vp_h_px| {
             let mut guard = rt.borrow_mut();
-            let clamped = top_row.max(0) as usize;
-            let changed = if is_right {
-                let prev = guard.right_virtual_top_row;
-                guard.right_virtual_top_row = clamped;
-                prev != clamped
+            let use_right = is_right && guard.app_state.dual_pane_enabled;
+            guard.update_pane_viewport_h(use_right, vp_h_px as f64);
+            let geom = guard.pane_scroll_geometry(use_right);
+            let cur = if use_right {
+                guard.right_scroll_y_px
             } else {
-                let prev = guard.left_virtual_top_row;
-                guard.left_virtual_top_row = clamped;
-                prev != clamped
+                guard.left_scroll_y_px
             };
-            if changed {
-                if let Some(w) = win_weak.upgrade() {
-                    sync_window_from_runtime(&w, &mut guard);
+            let next = (cur - dy_px as f64).clamp(0.0, geom.max_scroll_px);
+            if use_right {
+                guard.right_scroll_y_px = next;
+            } else {
+                guard.left_scroll_y_px = next;
+            }
+            if let Some(w) = win_weak.upgrade() {
+                sync_pane_virtual_scroll(&w, &mut guard, use_right, false);
+            }
+        });
+    }
+    {
+        let rt = Rc::clone(&rt);
+        let win_weak = window.as_weak();
+        window.on_set_pane_scroll_ratio(move |is_right, ratio, vp_h_px| {
+            let mut guard = rt.borrow_mut();
+            let use_right = is_right && guard.app_state.dual_pane_enabled;
+            guard.update_pane_viewport_h(use_right, vp_h_px as f64);
+            let geom = guard.pane_scroll_geometry(use_right);
+            let next = (ratio.clamp(0.0, 1.0) as f64) * geom.max_scroll_px;
+            if use_right {
+                guard.right_scroll_y_px = next;
+            } else {
+                guard.left_scroll_y_px = next;
+            }
+            if let Some(w) = win_weak.upgrade() {
+                sync_pane_virtual_scroll(&w, &mut guard, use_right, false);
+            }
+        });
+    }
+    {
+        let rt = Rc::clone(&rt);
+        let win_weak = window.as_weak();
+        window.on_pane_viewport_resized(move |is_right, vp_h_px| {
+            if let Ok(mut guard) = rt.try_borrow_mut() {
+                let use_right = is_right && guard.app_state.dual_pane_enabled;
+                if guard.update_pane_viewport_h(use_right, vp_h_px as f64) {
+                    if let Some(w) = win_weak.upgrade() {
+                        sync_pane_virtual_scroll(&w, &mut guard, use_right, true);
+                    }
                 }
+            } else {
+                let rt_c = Rc::clone(&rt);
+                let ww = win_weak.clone();
+                Timer::single_shot(Duration::ZERO, move || {
+                    if let (Some(w), Ok(mut guard)) = (ww.upgrade(), rt_c.try_borrow_mut()) {
+                        let use_right = is_right && guard.app_state.dual_pane_enabled;
+                        if guard.update_pane_viewport_h(use_right, vp_h_px as f64) {
+                            sync_pane_virtual_scroll(&w, &mut guard, use_right, true);
+                        }
+                    }
+                });
             }
         });
     }
@@ -5347,6 +5808,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
         window.on_select_tab(move |is_right, tab_idx| {
             let mut guard = rt.borrow_mut();
             let idx = tab_idx as usize;
+            guard.save_active_tab_scroll(is_right);
             if is_right && idx < guard.app_state.right_tabs.len() {
                 guard.app_state.right_active_tab = idx;
                 guard.right_selected_idx = Some(0);
@@ -5360,6 +5822,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 guard.left_selected_indices.clear();
                 guard.left_selected_indices.insert(0);
             }
+            guard.restore_active_tab_scroll(is_right);
             guard.reload_pane_entries(is_right);
             guard.sync_selected_sidebar_to_active_dir();
             if let Some(w) = win_weak.upgrade() {
@@ -5375,6 +5838,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
         let win_weak = window.as_weak();
         window.on_add_tab(move |is_right| {
             let mut guard = rt.borrow_mut();
+            guard.save_active_tab_scroll(is_right);
             let path = guard.current_pane_path(is_right);
             let title = guard.format_tab_title(&path);
             let vfs_url = if path.contains("://") {
@@ -5410,6 +5874,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 let new_idx = guard.app_state.left_tabs.len() - 1;
                 guard.app_state.left_active_tab = new_idx;
             }
+            guard.reset_pane_scroll(is_right);
             guard.reload_pane_entries(is_right);
             guard.sync_selected_sidebar_to_active_dir();
             if let Some(w) = win_weak.upgrade() {
@@ -5426,20 +5891,30 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
         window.on_close_tab(move |is_right, tab_idx| {
             let mut guard = rt.borrow_mut();
             let idx = tab_idx as usize;
-            let state = &mut guard.app_state;
-            if is_right && state.right_tabs.len() > 1 && idx < state.right_tabs.len() {
-                state.right_tabs.remove(idx);
-                let max_idx = state.right_tabs.len() - 1;
-                if state.right_active_tab > max_idx {
-                    state.right_active_tab = max_idx;
+            let removed_id = {
+                let state = &mut guard.app_state;
+                if is_right && state.right_tabs.len() > 1 && idx < state.right_tabs.len() {
+                    let rem = state.right_tabs.remove(idx);
+                    let max_idx = state.right_tabs.len() - 1;
+                    if state.right_active_tab > max_idx {
+                        state.right_active_tab = max_idx;
+                    }
+                    Some(rem.id)
+                } else if !is_right && state.left_tabs.len() > 1 && idx < state.left_tabs.len() {
+                    let rem = state.left_tabs.remove(idx);
+                    let max_idx = state.left_tabs.len() - 1;
+                    if state.left_active_tab > max_idx {
+                        state.left_active_tab = max_idx;
+                    }
+                    Some(rem.id)
+                } else {
+                    None
                 }
-            } else if !is_right && state.left_tabs.len() > 1 && idx < state.left_tabs.len() {
-                state.left_tabs.remove(idx);
-                let max_idx = state.left_tabs.len() - 1;
-                if state.left_active_tab > max_idx {
-                    state.left_active_tab = max_idx;
-                }
+            };
+            if let Some(id) = removed_id {
+                guard.tab_scroll_positions.remove(&id);
             }
+            guard.restore_active_tab_scroll(is_right);
             guard.reload_pane_entries(is_right);
             guard.sync_selected_sidebar_to_active_dir();
             if let Some(w) = win_weak.upgrade() {
@@ -5513,6 +5988,8 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                     guard.app_state.left_active_tab = ins;
                     guard.app_state.active_pane = ActivePane::Left;
                 }
+                guard.restore_active_tab_scroll(false);
+                guard.restore_active_tab_scroll(true);
                 guard.reload_pane_entries(false);
                 guard.reload_pane_entries(true);
             }
@@ -5846,7 +6323,8 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                                 guard.left_selected_idx
                             };
                             if let Some(idx) = sel_idx {
-                                w.invoke_ensure_row_visible(is_right, idx as i32);
+                                guard.ensure_row_visible_in_pane(&w, is_right, idx);
+                                w.invoke_focus_main_key_router();
                             }
                         }
                         return;
@@ -6832,6 +7310,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                     tab.sort_direction = SortDirection::Ascending;
                 }
             }
+            guard.reset_pane_scroll(is_right);
             guard.reload_pane_entries(is_right);
             if let Some(w) = win_weak.upgrade() {
                 w.set_show_tab_preview(true);
@@ -6860,6 +7339,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                     tab.inline_filter = q_str;
                 }
             }
+            guard.reset_pane_scroll(is_right);
             guard.reload_pane_entries(is_right);
             if let Some(w) = win_weak.upgrade() {
                 w.set_show_tab_preview(true);
@@ -6886,6 +7366,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                     tab.inline_filter.clear();
                 }
             }
+            guard.reset_pane_scroll(use_right);
             guard.reload_pane_entries(use_right);
             if let Some(w) = win_weak.upgrade() {
                 w.set_show_tab_preview(true);
@@ -6913,6 +7394,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                     tab.view_mode = mode;
                 }
             }
+            guard.reset_pane_scroll(is_right);
             guard.reload_pane_entries(is_right);
             if let Some(w) = win_weak.upgrade() {
                 w.set_show_tab_preview(true);
@@ -8207,6 +8689,18 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
             let mut need_full_sync = guard.poll_search_events();
             if guard.poll_bg_dir_sizes() || guard.drain_thumb_queue() {
                 need_full_sync = true;
+            }
+            if !need_full_sync {
+                let l_vp_h = w.get_left_viewport_height() as f64;
+                if guard.update_pane_viewport_h(false, l_vp_h) {
+                    sync_pane_virtual_scroll(&w, &mut guard, false, true);
+                }
+                if guard.app_state.dual_pane_enabled {
+                    let r_vp_h = w.get_reported_right_viewport_height() as f64;
+                    if guard.update_pane_viewport_h(true, r_vp_h) {
+                        sync_pane_virtual_scroll(&w, &mut guard, true, true);
+                    }
+                }
             }
 
             while let Ok(sync_ev) = guard.sync_rx.try_recv() {

@@ -480,7 +480,7 @@ export component FileRow inherits Rectangle {
     callback row-drag-ended(length, length);
     callback row-drag-to-other-pane();
     callback toggle-expand();
-    callback wheel-scroll(length);
+    callback wheel-scroll(length, length);
 
     height: 28px + Math.max(0px, root.font_delta * 2.0) + Math.max(0px, root.view_icon_size - 16px);
     border-radius: 4px;
@@ -577,7 +577,7 @@ export component FileRow inherits Rectangle {
             }
         }
         scroll-event(ev) => {
-            root.wheel-scroll(ev.delta-y);
+            root.wheel-scroll(ev.delta-x, ev.delta-y);
             return accept;
         }
     }
@@ -626,7 +626,7 @@ export component FileRow inherits Rectangle {
                     root.toggle-expand();
                 }
                 scroll-event(ev) => {
-                    root.wheel-scroll(ev.delta-y);
+                    root.wheel-scroll(ev.delta-x, ev.delta-y);
                     return accept;
                 }
             }
@@ -1212,7 +1212,7 @@ export component PolaroidCell inherits Rectangle {
     callback cell-unhovered();
     callback cell-drag-moved(length, length);
     callback cell-drag-ended(length, length);
-    callback wheel-scroll(length);
+    callback wheel-scroll(length, length);
 
     height: 128px + Math.max(0px, root.font-delta * 4.0);
     horizontal-stretch: 1;
@@ -1451,7 +1451,7 @@ export component PolaroidCell inherits Rectangle {
             }
         }
         scroll-event(ev) => {
-            root.wheel-scroll(ev.delta-y);
+            root.wheel-scroll(ev.delta-x, ev.delta-y);
             return accept;
         }
     }

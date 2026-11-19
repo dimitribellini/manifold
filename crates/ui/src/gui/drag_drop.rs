@@ -241,9 +241,10 @@ impl GuiRuntime {
             (left_scroll_y, self.left_virtual_top_row as isize)
         };
         let slice_idx = if view_mode == 0 || view_mode == 3 {
+            let vo = self.effective_view_options_for_dir(&self.current_pane_path(target_is_right));
             let table_hdr_h = 26.0 + font_delta;
             let list_rows_top = path_bar_bottom + table_hdr_h + 4.0;
-            let row_stride = 29.0 + font_delta * 2.0;
+            let row_stride = 29.0 + font_delta * 2.0 + (vo.icon_size as f32 - 16.0).max(0.0);
             if abs_y >= path_bar_bottom + table_hdr_h {
                 ((abs_y - list_rows_top - scroll_y) / row_stride).floor() as isize
             } else {

@@ -101,8 +101,23 @@ export component ManifoldWindow inherits Window {
     in-out property <bool> right-search-running: false;
     in-out property <int> left-virtual-top-row: 0;
     in-out property <int> left-total-rows: 0;
+    in-out property <length> left-sub-row-offset: 4px;
+    in-out property <float> left-scroll-y-px: 0.0;
+    in-out property <float> left-max-scroll-px: 0.0;
+    in-out property <float> left-total-content-px: 0.0;
+    in-out property <length> left-scroll-x: 0px;
+    in-out property <length> left-parent-scroll-y: 0px;
+    out property <length> left-viewport-height: l-viewport.height;
+
     in-out property <int> right-virtual-top-row: 0;
     in-out property <int> right-total-rows: 0;
+    in-out property <length> right-sub-row-offset: 4px;
+    in-out property <float> right-scroll-y-px: 0.0;
+    in-out property <float> right-max-scroll-px: 0.0;
+    in-out property <float> right-total-content-px: 0.0;
+    in-out property <length> right-scroll-x: 0px;
+    in-out property <length> right-parent-scroll-y: 0px;
+    in-out property <length> reported-right-viewport-height: 560px;
 
     // Resizable Panel & Column Dimensions + Non-Oscillating Drag Anchors
     in-out property <length> sidebar-width: 205px;
@@ -478,7 +493,9 @@ export component ManifoldWindow inherits Window {
     callback toggle-dual-pane();
     callback set-panes-layout(int);
     callback set-split-ratio(float);
-    callback set-virtual-scroll-row(bool, int);
+    callback scroll-pane-vertical(bool, float, float);
+    callback set-pane-scroll-ratio(bool, float, float);
+    callback pane-viewport-resized(bool, float);
     callback go-back();
     callback go-forward();
     callback select-sidebar-item(int);
@@ -608,87 +625,32 @@ export component ManifoldWindow inherits Window {
         root.show-terminal-drawer = true;
     }
 
-    in-out property <length> right-scroll-y: 0px;
-
     public function focus-main-key-router() {
         key-router.focus();
     }
 
-    function scroll-pane-by-delta(is-right: bool, dy: length) {
+    function scroll-pane-by-delta(is-right: bool, dx: length, dy: length, max-scroll-x: length, vp-h: length) {
         if !is-right {
-            if (root.left-view-mode == 0 || root.left-view-mode == 3) && root.left-total-rows > root.left-rows.length {
-                root.set-virtual-scroll-row(
-                    false,
-                    Math.clamp(
-                        root.left-virtual-top-row - Math.round(dy / (29px + Math.max(0px, root.font-size-delta * 2.0))),
-                        0,
-                        Math.max(0, root.left-total-rows - root.left-rows.length)
-                    )
-                );
-            } else {
-                l-flick.viewport-y = Math.clamp(
-                    l-flick.viewport-y + dy,
-                    Math.min(0px, l-flick.height - l-flick.viewport-height),
+            if dx != 0px {
+                root.left-scroll-x = Math.clamp(
+                    root.left-scroll-x + dx,
+                    Math.min(0px, max-scroll-x),
                     0px
                 );
             }
+            if dy != 0px {
+                root.scroll-pane-vertical(false, dy / 1px, vp-h / 1px);
+            }
         } else {
-            if (root.right-view-mode == 0 || root.right-view-mode == 3) && root.right-total-rows > root.right-rows.length {
-                root.set-virtual-scroll-row(
-                    true,
-                    Math.clamp(
-                        root.right-virtual-top-row - Math.round(dy / (29px + Math.max(0px, root.font-size-delta * 2.0))),
-                        0,
-                        Math.max(0, root.right-total-rows - root.right-rows.length)
-                    )
+            if dx != 0px {
+                root.right-scroll-x = Math.clamp(
+                    root.right-scroll-x + dx,
+                    Math.min(0px, max-scroll-x),
+                    0px
                 );
-            } else {
-                root.right-scroll-y = Math.min(0px, root.right-scroll-y + dy);
             }
-        }
-    }
-
-    public function ensure-row-visible(is-right: bool, row-idx: int) {
-        key-router.focus();
-        if !is-right {
-            if root.left-view-mode == 1 {
-                if (Math.floor(row-idx / 3) * (138px + Math.max(0px, root.font-size-delta * 4.0))) < (-l-flick.viewport-y) {
-                    l-flick.viewport-y = -(Math.floor(row-idx / 3) * (138px + Math.max(0px, root.font-size-delta * 4.0)));
-                } else if ((Math.floor(row-idx / 3) + 1) * (138px + Math.max(0px, root.font-size-delta * 4.0)) + 24px) > (-l-flick.viewport-y + l-flick.height) {
-                    l-flick.viewport-y = Math.min(
-                        0px,
-                        l-flick.height - ((Math.floor(row-idx / 3) + 1) * (138px + Math.max(0px, root.font-size-delta * 4.0)) + 24px)
-                    );
-                }
-            } else {
-                if (row-idx * (29px + Math.max(0px, root.font-size-delta * 2.0) + Math.max(0px, root.left-icon-size * 1px - 16px))) < (-l-flick.viewport-y) {
-                    l-flick.viewport-y = -(row-idx * (29px + Math.max(0px, root.font-size-delta * 2.0) + Math.max(0px, root.left-icon-size * 1px - 16px)));
-                } else if ((row-idx + 2) * (29px + Math.max(0px, root.font-size-delta * 2.0) + Math.max(0px, root.left-icon-size * 1px - 16px))) > (-l-flick.viewport-y + l-flick.height) {
-                    l-flick.viewport-y = Math.min(
-                        0px,
-                        l-flick.height - ((row-idx + 2) * (29px + Math.max(0px, root.font-size-delta * 2.0) + Math.max(0px, root.left-icon-size * 1px - 16px)))
-                    );
-                }
-            }
-        } else {
-            if root.right-view-mode == 1 {
-                if (Math.floor(row-idx / 3) * (138px + Math.max(0px, root.font-size-delta * 4.0))) < (-root.right-scroll-y) {
-                    root.right-scroll-y = -(Math.floor(row-idx / 3) * (138px + Math.max(0px, root.font-size-delta * 4.0)));
-                } else if ((Math.floor(row-idx / 3) + 1) * (138px + Math.max(0px, root.font-size-delta * 4.0)) + 24px) > (-root.right-scroll-y + l-flick.height) {
-                    root.right-scroll-y = Math.min(
-                        0px,
-                        l-flick.height - ((Math.floor(row-idx / 3) + 1) * (138px + Math.max(0px, root.font-size-delta * 4.0)) + 24px)
-                    );
-                }
-            } else {
-                if (row-idx * (29px + Math.max(0px, root.font-size-delta * 2.0) + Math.max(0px, root.right-icon-size * 1px - 16px))) < (-root.right-scroll-y) {
-                    root.right-scroll-y = -(row-idx * (29px + Math.max(0px, root.font-size-delta * 2.0) + Math.max(0px, root.right-icon-size * 1px - 16px)));
-                } else if ((row-idx + 2) * (29px + Math.max(0px, root.font-size-delta * 2.0) + Math.max(0px, root.right-icon-size * 1px - 16px))) > (-root.right-scroll-y + l-flick.height) {
-                    root.right-scroll-y = Math.min(
-                        0px,
-                        l-flick.height - ((row-idx + 2) * (29px + Math.max(0px, root.font-size-delta * 2.0) + Math.max(0px, root.right-icon-size * 1px - 16px)))
-                    );
-                }
+            if dy != 0px {
+                root.scroll-pane-vertical(true, dy / 1px, vp-h / 1px);
             }
         }
     }
@@ -860,8 +822,6 @@ export component ManifoldWindow inherits Window {
                                     font-family: root.resolved-font-family;
                                     active: (root.right-pane-active && root.dual-pane-mode ? root.right-view-mode : root.left-view-mode) == 1;
                                     clicked => {
-                                        l-flick.viewport-y = 0px;
-                                        l-flick.viewport-x = 0px;
                                         root.set-view-mode(1);
                                     }
                                 }
@@ -881,8 +841,6 @@ export component ManifoldWindow inherits Window {
                                     font-family: root.resolved-font-family;
                                     active: (root.right-pane-active && root.dual-pane-mode ? root.right-view-mode : root.left-view-mode) == 0;
                                     clicked => {
-                                        l-flick.viewport-y = 0px;
-                                        l-flick.viewport-x = 0px;
                                         root.set-view-mode(0);
                                     }
                                 }
@@ -902,8 +860,6 @@ export component ManifoldWindow inherits Window {
                                     font-family: root.resolved-font-family;
                                     active: (root.right-pane-active && root.dual-pane-mode ? root.right-view-mode : root.left-view-mode) == 2;
                                     clicked => {
-                                        l-flick.viewport-y = 0px;
-                                        l-flick.viewport-x = 0px;
                                         root.set-view-mode(2);
                                     }
                                 }
@@ -923,8 +879,6 @@ export component ManifoldWindow inherits Window {
                                     font-family: root.resolved-font-family;
                                     active: (root.right-pane-active && root.dual-pane-mode ? root.right-view-mode : root.left-view-mode) == 3;
                                     clicked => {
-                                        l-flick.viewport-y = 0px;
-                                        l-flick.viewport-x = 0px;
                                         root.set-view-mode(3);
                                     }
                                 }
@@ -2074,21 +2028,23 @@ export component ManifoldWindow inherits Window {
                                     }
                                 }
                                 scroll-event(ev) => {
-                                    root.scroll-pane-by-delta(false, ev.delta-y);
-                                    l-flick.viewport-x = Math.clamp(
-                                        l-flick.viewport-x + ev.delta-x,
-                                        Math.min(0px, l-flick.width - l-flick.viewport-width),
-                                        0px
+                                    root.scroll-pane-by-delta(
+                                        false,
+                                        ev.delta-x,
+                                        ev.delta-y,
+                                        l-viewport.width - l-viewport.content-width,
+                                        l-viewport.height
                                     );
                                     return accept;
                                 }
                             }
 
-                            l-flick := Flickable {
+                            l-viewport := Rectangle {
                                 width: parent.width;
                                 height: parent.height;
-                                interactive: false;
-                                viewport-width: (root.left-view-mode == 0 || root.left-view-mode == 3)
+                                clip: true;
+                                background: transparent;
+                                property <length> content-width: (root.left-view-mode == 0 || root.left-view-mode == 3)
                                     ? Math.max(
                                         self.width,
                                         260px
@@ -2102,25 +2058,21 @@ export component ManifoldWindow inherits Window {
                                             + (root.left-col-permissions ? 116px : 0px)
                                     )
                                     : (root.left-view-mode == 2
-                                        ? Math.max(self.width, 460px)
+                                        ? Math.max(self.width, root.miller-col-width * 2 + 280px)
                                         : Math.max(self.width, 360px));
-                                viewport-height: Math.min(
-                                    9600px,
-                                    (root.left-view-mode == 0 || root.left-view-mode == 3)
-                                        ? Math.max(self.height, root.left-rows.length * (29px + Math.max(0px, root.font-size-delta * 2.0)) + 20px)
-                                        : (root.left-view-mode == 1
-                                            ? Math.max(self.height, root.left-icon-triples.length * (138px + Math.max(0px, root.font-size-delta * 4.0)) + 28px)
-                                            : Math.max(self.height, Math.max(root.left-parent-rows.length, root.left-rows.length) * (29px + Math.max(0px, root.font-size-delta * 2.0)) + 20px))
-                                );
+                                changed height => {
+                                    root.pane-viewport-resized(false, self.height / 1px);
+                                }
 
-                                VerticalLayout {
-                                    alignment: start;
-
-                                    // Blank / Empty Directory or Search Result Action Card
-                                    if root.left-rows.length == 0 : VerticalLayout {
-                                        alignment: center;
-                                        padding-top: 56px;
-                                        spacing: 12px;
+                                // Blank / Empty Directory or Search Result Action Card
+                                if root.left-rows.length == 0 : VerticalLayout {
+                                    x: 0px;
+                                    y: 0px;
+                                    width: parent.width;
+                                    height: self.preferred-height;
+                                    alignment: center;
+                                    padding-top: 56px;
+                                    spacing: 12px;
                                         HorizontalLayout {
                                             alignment: center;
                                             Rectangle {
@@ -2200,11 +2152,19 @@ export component ManifoldWindow inherits Window {
                                     }
 
                                     // Mode 0 (List View) & Mode 3 (Tree View): Standardized 26px FileRow Table
-                                    if root.left-view-mode == 0 || root.left-view-mode == 3 : VerticalLayout {
+                                    if root.left-rows.length > 0 && (root.left-view-mode == 0 || root.left-view-mode == 3) : VerticalLayout {
+                                        x: Math.clamp(
+                                            root.left-scroll-x,
+                                            Math.min(0px, parent.width - l-viewport.content-width),
+                                            0px
+                                        );
+                                        y: root.left-sub-row-offset;
+                                        width: l-viewport.content-width;
+                                        height: self.preferred-height;
                                         alignment: start;
                                         padding-left: 6px;
                                         padding-right: 6px;
-                                        padding-top: 4px;
+                                        padding-top: 0px;
                                         spacing: 1px;
                                         for row[r-idx] in root.left-rows : FileRow {
                                             row_index: root.left-virtual-top-row + r-idx;
@@ -2280,15 +2240,11 @@ export component ManifoldWindow inherits Window {
                                                 );
                                             }
                                             row-drag-moved(abs_x, abs_y) => {
-                                                root.drag-left-pane-w = l-flick.width;
-                                                root.drag-left-scroll-y = l-flick.viewport-y;
-                                                root.drag-right-scroll-y = root.right-scroll-y;
+                                                root.drag-left-pane-w = l-viewport.width;
                                                 root.update-drag-cursor(false, root.left-virtual-top-row + r-idx, abs_x, abs_y);
                                             }
                                             row-drag-ended(abs_x, abs_y) => {
-                                                root.drag-left-pane-w = l-flick.width;
-                                                root.drag-left-scroll-y = l-flick.viewport-y;
-                                                root.drag-right-scroll-y = root.right-scroll-y;
+                                                root.drag-left-pane-w = l-viewport.width;
                                                 root.finish-drag-drop(false, root.left-virtual-top-row + r-idx, abs_x, abs_y);
                                             }
                                             row-drag-to-other-pane => {
@@ -2299,16 +2255,33 @@ export component ManifoldWindow inherits Window {
                                             toggle-expand => {
                                                 root.toggle-expand-folder(false, root.left-virtual-top-row + r-idx);
                                             }
-                                            wheel-scroll(dy) => {
-                                                root.scroll-pane-by-delta(false, dy);
+                                            wheel-scroll(dx, dy) => {
+                                                root.scroll-pane-by-delta(
+                                                    false,
+                                                    dx,
+                                                    dy,
+                                                    l-viewport.width - l-viewport.content-width,
+                                                    l-viewport.height
+                                                );
                                             }
                                         }
                                     }
 
                                     // Mode 1: 3-Column Icon Grid
-                                    if root.left-view-mode == 1 : VerticalLayout {
+                                    if root.left-rows.length > 0 && root.left-view-mode == 1 : VerticalLayout {
+                                        x: Math.clamp(
+                                            root.left-scroll-x,
+                                            Math.min(0px, parent.width - l-viewport.content-width),
+                                            0px
+                                        );
+                                        y: root.left-sub-row-offset;
+                                        width: l-viewport.content-width;
+                                        height: self.preferred-height;
                                         alignment: start;
-                                        padding: 12px;
+                                        padding-left: 12px;
+                                        padding-right: 12px;
+                                        padding-top: 0px;
+                                        padding-bottom: 0px;
                                         spacing: 10px;
                                         for triple in root.left-icon-triples : HorizontalLayout {
                                             spacing: 10px;
@@ -2335,20 +2308,20 @@ export component ManifoldWindow inherits Window {
                                                 cell-hovered(abs_x, abs_y) => { root.hover-file-row(false, triple.idx-0, abs_x, abs_y); }
                                                 cell-unhovered => { root.hover-leave-file-row(false, triple.idx-0); }
                                                 cell-drag-moved(abs_x, abs_y) => {
-                                                    root.drag-left-pane-w = l-flick.width;
-                                                    root.drag-left-scroll-y = l-flick.viewport-y;
+                                                    root.drag-left-pane-w = l-viewport.width;
                                                     root.update-drag-cursor(false, triple.idx-0, abs_x, abs_y);
                                                 }
                                                 cell-drag-ended(abs_x, abs_y) => {
-                                                    root.drag-left-pane-w = l-flick.width;
-                                                    root.drag-left-scroll-y = l-flick.viewport-y;
+                                                    root.drag-left-pane-w = l-viewport.width;
                                                     root.finish-drag-drop(false, triple.idx-0, abs_x, abs_y);
                                                 }
-                                                wheel-scroll(dy) => {
-                                                    l-flick.viewport-y = Math.clamp(
-                                                        l-flick.viewport-y + dy,
-                                                        Math.min(0px, l-flick.height - l-flick.viewport-height),
-                                                        0px
+                                                wheel-scroll(dx, dy) => {
+                                                    root.scroll-pane-by-delta(
+                                                        false,
+                                                        dx,
+                                                        dy,
+                                                        l-viewport.width - l-viewport.content-width,
+                                                        l-viewport.height
                                                     );
                                                 }
                                             }
@@ -2376,20 +2349,20 @@ export component ManifoldWindow inherits Window {
                                                 cell-hovered(abs_x, abs_y) => { root.hover-file-row(false, triple.idx-1, abs_x, abs_y); }
                                                 cell-unhovered => { root.hover-leave-file-row(false, triple.idx-1); }
                                                 cell-drag-moved(abs_x, abs_y) => {
-                                                    root.drag-left-pane-w = l-flick.width;
-                                                    root.drag-left-scroll-y = l-flick.viewport-y;
+                                                    root.drag-left-pane-w = l-viewport.width;
                                                     root.update-drag-cursor(false, triple.idx-1, abs_x, abs_y);
                                                 }
                                                 cell-drag-ended(abs_x, abs_y) => {
-                                                    root.drag-left-pane-w = l-flick.width;
-                                                    root.drag-left-scroll-y = l-flick.viewport-y;
+                                                    root.drag-left-pane-w = l-viewport.width;
                                                     root.finish-drag-drop(false, triple.idx-1, abs_x, abs_y);
                                                 }
-                                                wheel-scroll(dy) => {
-                                                    l-flick.viewport-y = Math.clamp(
-                                                        l-flick.viewport-y + dy,
-                                                        Math.min(0px, l-flick.height - l-flick.viewport-height),
-                                                        0px
+                                                wheel-scroll(dx, dy) => {
+                                                    root.scroll-pane-by-delta(
+                                                        false,
+                                                        dx,
+                                                        dy,
+                                                        l-viewport.width - l-viewport.content-width,
+                                                        l-viewport.height
                                                     );
                                                 }
                                             }
@@ -2417,20 +2390,20 @@ export component ManifoldWindow inherits Window {
                                                 cell-hovered(abs_x, abs_y) => { root.hover-file-row(false, triple.idx-2, abs_x, abs_y); }
                                                 cell-unhovered => { root.hover-leave-file-row(false, triple.idx-2); }
                                                 cell-drag-moved(abs_x, abs_y) => {
-                                                    root.drag-left-pane-w = l-flick.width;
-                                                    root.drag-left-scroll-y = l-flick.viewport-y;
+                                                    root.drag-left-pane-w = l-viewport.width;
                                                     root.update-drag-cursor(false, triple.idx-2, abs_x, abs_y);
                                                 }
                                                 cell-drag-ended(abs_x, abs_y) => {
-                                                    root.drag-left-pane-w = l-flick.width;
-                                                    root.drag-left-scroll-y = l-flick.viewport-y;
+                                                    root.drag-left-pane-w = l-viewport.width;
                                                     root.finish-drag-drop(false, triple.idx-2, abs_x, abs_y);
                                                 }
-                                                wheel-scroll(dy) => {
-                                                    l-flick.viewport-y = Math.clamp(
-                                                        l-flick.viewport-y + dy,
-                                                        Math.min(0px, l-flick.height - l-flick.viewport-height),
-                                                        0px
+                                                wheel-scroll(dx, dy) => {
+                                                    root.scroll-pane-by-delta(
+                                                        false,
+                                                        dx,
+                                                        dy,
+                                                        l-viewport.width - l-viewport.content-width,
+                                                        l-viewport.height
                                                     );
                                                 }
                                             }
@@ -2439,106 +2412,157 @@ export component ManifoldWindow inherits Window {
                                     }
 
                                     // Mode 2: 3-Column Miller Columns View (Parent | Current Directory | Live Preview & Media Metadata)
-                                    if root.left-view-mode == 2 : HorizontalLayout {
+                                    if root.left-rows.length > 0 && root.left-view-mode == 2 : HorizontalLayout {
+                                        x: Math.clamp(
+                                            root.left-scroll-x,
+                                            Math.min(0px, parent.width - l-viewport.content-width),
+                                            0px
+                                        );
+                                        y: 0px;
+                                        width: l-viewport.content-width;
+                                        height: parent.height;
                                         spacing: 4px;
-                                        VerticalLayout {
-                                            alignment: start;
+                                        Rectangle {
                                             width: root.miller-col-width;
-                                            for p-row[p-idx] in root.left-parent-rows : Rectangle {
-                                                height: 26px;
-                                                border-radius: 4px;
-                                                background: p-row.is-selected
-                                                    ? root.theme-bg-hover
-                                                    : (p-row.has-color-tag ? p-row.color-tag-tint : transparent);
-                                                HorizontalLayout {
-                                                    padding-left: 8px;
-                                                    padding-right: 8px;
-                                                    spacing: 8px;
-                                                    Rectangle {
-                                                        width: 18px;
-                                                        background: transparent;
-                                                        if !p-row.is-dir && p-row.has-thumbnail : Image {
-                                                            x: 0px;
-                                                            y: (parent.height - 18px) / 2;
-                                                            width: 18px;
-                                                            height: 18px;
-                                                            image-fit: contain;
-                                                            source: p-row.thumbnail;
-                                                        }
-                                                        if p-row.is-dir || !p-row.has-thumbnail : LucideIcon {
-                                                            x: 0px;
-                                                            y: (parent.height - self.height) / 2;
-                                                            icon-size: 15px;
-                                                            kind: p-row.is-dir
-                                                                ? "folder"
-                                                                : (p-row.ext-badge == "APP"
-                                                                    ? "applications"
-                                                                    : (p-row.is-image
-                                                                        ? "image"
-                                                                        : ((p-row.ext-badge == "ZIP" || p-row.ext-badge == "TAR" || p-row.ext-badge == "GZ" || p-row.ext-badge == "ISO")
-                                                                            ? "archive"
-                                                                            : ((p-row.ext-badge == "MP3" || p-row.ext-badge == "FLAC" || p-row.ext-badge == "WAV" || p-row.ext-badge == "M4A" || p-row.ext-badge == "OGG" || p-row.ext-badge == "AAC")
-                                                                                ? "music"
-                                                                                : ((p-row.ext-badge == "MP4" || p-row.ext-badge == "MKV" || p-row.ext-badge == "MOV" || p-row.ext-badge == "AVI" || p-row.ext-badge == "WEBM")
-                                                                                    ? "movies"
-                                                                                    : (p-row.is-executable ? "terminal" : "documents"))))));
-                                                            icon-color: p-row.has-color-tag
-                                                                ? p-row.color-tag-brush
-                                                                : ((p-row.is-dir || p-row.ext-badge == "APP")
-                                                                    ? #38B6FF
-                                                                    : (p-row.ext-badge == "PDF"
-                                                                        ? #FF5F56
-                                                                        : (p-row.is-image ? #6E92B8 : #A0A0AB)));
-                                                            fill-color: p-row.is-dir
-                                                                ? (p-row.has-color-tag ? p-row.color-tag-brush : #4CC2FF)
-                                                                : transparent;
-                                                        }
-                                                    }
-                                                    Text {
-                                                        text: p-row.name;
-                                                        color: root.theme-text-primary;
-                                                        font-size: 12px + root.font-size-delta;
-                                                        font-weight: root.ui-font-bold ? 700 : 500;
-                                                        horizontal-stretch: 1;
-                                                        overflow: elide;
-                                                        vertical-alignment: center;
-                                                    }
-                                                    if p-row.has-color-tag : Rectangle {
-                                                        width: 7px;
-                                                        height: 7px;
-                                                        y: (parent.height - self.height) / 2;
-                                                        border-radius: 3.5px;
-                                                        background: p-row.color-tag-brush;
-                                                    }
-                                                    if p-row.is-dir : LucideIcon {
-                                                        y: (parent.height - self.height) / 2;
-                                                        icon-size: 12px;
-                                                        kind: "chevron-right";
-                                                        icon-color: root.theme-text-muted;
-                                                    }
+                                            height: parent.height;
+                                            clip: true;
+                                            background: transparent;
+                                            TouchArea {
+                                                scroll-event(ev) => {
+                                                    root.left-parent-scroll-y = Math.clamp(
+                                                        root.left-parent-scroll-y + ev.delta-y,
+                                                        Math.min(0px, l-viewport.height - (root.left-parent-rows.length * 26px + 8px)),
+                                                        0px
+                                                    );
+                                                    return accept;
                                                 }
-                                                TouchArea {
-                                                    clicked => { root.open-parent-row(false, p-idx); }
-                                                    scroll-event(ev) => {
-                                                        l-flick.viewport-y = Math.clamp(
-                                                            l-flick.viewport-y + ev.delta-y,
-                                                            Math.min(0px, l-flick.height - l-flick.viewport-height),
-                                                            0px
-                                                        );
-                                                        return accept;
+                                            }
+                                            VerticalLayout {
+                                                x: 0px;
+                                                y: Math.clamp(
+                                                    root.left-parent-scroll-y,
+                                                    Math.min(0px, parent.height - (root.left-parent-rows.length * 26px + 8px)),
+                                                    0px
+                                                );
+                                                width: parent.width;
+                                                height: self.preferred-height;
+                                                alignment: start;
+                                                for p-row[p-idx] in root.left-parent-rows : Rectangle {
+                                                    height: 26px;
+                                                    border-radius: 4px;
+                                                    background: p-row.is-selected
+                                                        ? root.theme-bg-hover
+                                                        : (p-row.has-color-tag ? p-row.color-tag-tint : transparent);
+                                                    HorizontalLayout {
+                                                        padding-left: 8px;
+                                                        padding-right: 8px;
+                                                        spacing: 8px;
+                                                        Rectangle {
+                                                            width: 18px;
+                                                            background: transparent;
+                                                            if !p-row.is-dir && p-row.has-thumbnail : Image {
+                                                                x: 0px;
+                                                                y: (parent.height - 18px) / 2;
+                                                                width: 18px;
+                                                                height: 18px;
+                                                                image-fit: contain;
+                                                                source: p-row.thumbnail;
+                                                            }
+                                                            if p-row.is-dir || !p-row.has-thumbnail : LucideIcon {
+                                                                x: 0px;
+                                                                y: (parent.height - self.height) / 2;
+                                                                icon-size: 15px;
+                                                                kind: p-row.is-dir
+                                                                    ? "folder"
+                                                                    : (p-row.ext-badge == "APP"
+                                                                        ? "applications"
+                                                                        : (p-row.is-image
+                                                                            ? "image"
+                                                                            : ((p-row.ext-badge == "ZIP" || p-row.ext-badge == "TAR" || p-row.ext-badge == "GZ" || p-row.ext-badge == "ISO")
+                                                                                ? "archive"
+                                                                                : ((p-row.ext-badge == "MP3" || p-row.ext-badge == "FLAC" || p-row.ext-badge == "WAV" || p-row.ext-badge == "M4A" || p-row.ext-badge == "OGG" || p-row.ext-badge == "AAC")
+                                                                                    ? "music"
+                                                                                    : ((p-row.ext-badge == "MP4" || p-row.ext-badge == "MKV" || p-row.ext-badge == "MOV" || p-row.ext-badge == "AVI" || p-row.ext-badge == "WEBM")
+                                                                                        ? "movies"
+                                                                                        : (p-row.is-executable ? "terminal" : "documents"))))));
+                                                                icon-color: p-row.has-color-tag
+                                                                    ? p-row.color-tag-brush
+                                                                    : ((p-row.is-dir || p-row.ext-badge == "APP")
+                                                                        ? #38B6FF
+                                                                        : (p-row.ext-badge == "PDF"
+                                                                            ? #FF5F56
+                                                                            : (p-row.is-image ? #6E92B8 : #A0A0AB)));
+                                                                fill-color: p-row.is-dir
+                                                                    ? (p-row.has-color-tag ? p-row.color-tag-brush : #4CC2FF)
+                                                                    : transparent;
+                                                            }
+                                                        }
+                                                        Text {
+                                                            text: p-row.name;
+                                                            color: root.theme-text-primary;
+                                                            font-size: 12px + root.font-size-delta;
+                                                            font-weight: root.ui-font-bold ? 700 : 500;
+                                                            horizontal-stretch: 1;
+                                                            overflow: elide;
+                                                            vertical-alignment: center;
+                                                        }
+                                                        if p-row.has-color-tag : Rectangle {
+                                                            width: 7px;
+                                                            height: 7px;
+                                                            y: (parent.height - self.height) / 2;
+                                                            border-radius: 3.5px;
+                                                            background: p-row.color-tag-brush;
+                                                        }
+                                                        if p-row.is-dir : LucideIcon {
+                                                            y: (parent.height - self.height) / 2;
+                                                            icon-size: 12px;
+                                                            kind: "chevron-right";
+                                                            icon-color: root.theme-text-muted;
+                                                        }
+                                                    }
+                                                    TouchArea {
+                                                        clicked => { root.open-parent-row(false, p-idx); }
+                                                        scroll-event(ev) => {
+                                                            root.left-parent-scroll-y = Math.clamp(
+                                                                root.left-parent-scroll-y + ev.delta-y,
+                                                                Math.min(0px, l-viewport.height - (root.left-parent-rows.length * 26px + 8px)),
+                                                                0px
+                                                            );
+                                                            return accept;
+                                                        }
                                                     }
                                                 }
                                             }
                                         }
-                                        VerticalLayout {
-                                            alignment: start;
+                                        Rectangle {
                                             horizontal-stretch: 1;
-                                            for c-row[c-idx] in root.left-rows : Rectangle {
-                                                height: 26px;
-                                                border-radius: 4px;
-                                                border-width: root.drag-hover-left-row == c-idx ? 1px : 0px;
-                                                border-color: root.drag-hover-left-row == c-idx ? root.theme-accent : transparent;
-                                                background: root.drag-hover-left-row == c-idx
+                                            height: parent.height;
+                                            clip: true;
+                                            background: transparent;
+                                            TouchArea {
+                                                scroll-event(ev) => {
+                                                    root.scroll-pane-by-delta(
+                                                        false,
+                                                        ev.delta-x,
+                                                        ev.delta-y,
+                                                        l-viewport.width - l-viewport.content-width,
+                                                        l-viewport.height
+                                                    );
+                                                    return accept;
+                                                }
+                                            }
+                                            VerticalLayout {
+                                                x: 0px;
+                                                y: root.left-sub-row-offset;
+                                                width: parent.width;
+                                                height: self.preferred-height;
+                                                alignment: start;
+                                                for c-row[c-idx] in root.left-rows : Rectangle {
+                                                    height: 26px;
+                                                    border-radius: 4px;
+                                                    border-width: root.drag-hover-left-row == (root.left-virtual-top-row + c-idx) ? 1px : 0px;
+                                                    border-color: root.drag-hover-left-row == (root.left-virtual-top-row + c-idx) ? root.theme-accent : transparent;
+                                                    background: root.drag-hover-left-row == (root.left-virtual-top-row + c-idx)
                                                     ? #0D52BF38
                                                     : (c-row.is-selected
                                                         ? ((!root.right-pane-active || !root.dual-pane-mode) ? root.theme-accent : #2E323B)
@@ -2652,7 +2676,7 @@ export component ManifoldWindow inherits Window {
                                                         if !root.col-suppress-click {
                                                             root.select-file-row-mod(
                                                                 false,
-                                                                c-idx,
+                                                                root.left-virtual-top-row + c-idx,
                                                                 root.col-down-shift,
                                                                 root.col-down-cmd
                                                             );
@@ -2663,18 +2687,17 @@ export component ManifoldWindow inherits Window {
                                                     }
                                                     double-clicked => {
                                                         root.show-hover-preview = false;
-                                                        root.open-file-row(false, c-idx);
+                                                        root.open-file-row(false, root.left-virtual-top-row + c-idx);
                                                     }
                                                     moved => {
                                                         if self.pressed && !root.col-down-shift && !root.col-down-cmd && (Math.abs(self.mouse-x - self.pressed-x) > 14px || Math.abs(self.mouse-y - self.pressed-y) > 14px) {
                                                             root.show-hover-preview = false;
                                                             root.col-drag-active = true;
                                                             root.col-suppress-click = true;
-                                                            root.drag-left-pane-w = l-flick.width;
-                                                            root.drag-left-scroll-y = l-flick.viewport-y;
+                                                            root.drag-left-pane-w = l-viewport.width;
                                                             root.update-drag-cursor(
                                                                 false,
-                                                                c-idx,
+                                                                root.left-virtual-top-row + c-idx,
                                                                 self.absolute-position.x + self.mouse-x,
                                                                 self.absolute-position.y + self.mouse-y
                                                             );
@@ -2684,19 +2707,19 @@ export component ManifoldWindow inherits Window {
                                                         if self.has-hover && !self.pressed && !root.col-drag-active {
                                                             root.hover-file-row(
                                                                 false,
-                                                                c-idx,
+                                                                root.left-virtual-top-row + c-idx,
                                                                 self.absolute-position.x + self.mouse-x,
                                                                 self.absolute-position.y + self.mouse-y
                                                             );
                                                         } else if !self.has-hover {
-                                                            root.hover-leave-file-row(false, c-idx);
+                                                            root.hover-leave-file-row(false, root.left-virtual-top-row + c-idx);
                                                         }
                                                     }
                                                     pointer-event(ev) => {
                                                         if ev.kind == PointerEventKind.move && !self.pressed && !root.col-drag-active {
                                                             root.hover-file-row(
                                                                 false,
-                                                                c-idx,
+                                                                root.left-virtual-top-row + c-idx,
                                                                 self.absolute-position.x + self.mouse-x,
                                                                 self.absolute-position.y + self.mouse-y
                                                             );
@@ -2712,11 +2735,10 @@ export component ManifoldWindow inherits Window {
                                                         if ev.kind == PointerEventKind.up || ev.kind == PointerEventKind.cancel {
                                                             if root.col-drag-active {
                                                                 root.col-drag-active = false;
-                                                                root.drag-left-pane-w = l-flick.width;
-                                                                root.drag-left-scroll-y = l-flick.viewport-y;
+                                                                root.drag-left-pane-w = l-viewport.width;
                                                                 root.finish-drag-drop(
                                                                     false,
-                                                                    c-idx,
+                                                                    root.left-virtual-top-row + c-idx,
                                                                     self.absolute-position.x + self.mouse-x,
                                                                     self.absolute-position.y + self.mouse-y
                                                                 );
@@ -2732,21 +2754,24 @@ export component ManifoldWindow inherits Window {
                                                             root.col-suppress-click = true;
                                                             root.open-context-menu-for-row(
                                                                 false,
-                                                                c-idx,
+                                                                root.left-virtual-top-row + c-idx,
                                                                 self.absolute-position.x + self.mouse-x,
                                                                 self.absolute-position.y + self.mouse-y
                                                             );
                                                         }
                                                     }
                                                     scroll-event(ev) => {
-                                                        l-flick.viewport-y = Math.clamp(
-                                                            l-flick.viewport-y + ev.delta-y,
-                                                            Math.min(0px, l-flick.height - l-flick.viewport-height),
-                                                            0px
+                                                        root.scroll-pane-by-delta(
+                                                            false,
+                                                            ev.delta-x,
+                                                            ev.delta-y,
+                                                            l-viewport.width - l-viewport.content-width,
+                                                            l-viewport.height
                                                         );
                                                         return accept;
                                                     }
                                                 }
+                                            }
                                             }
                                         }
 
@@ -2875,12 +2900,15 @@ export component ManifoldWindow inherits Window {
                                             }
                                         }
                                     }
-                                }
                             }
 
                             // Miller Columns draggable vertical divider clipped to viewport height
                             if root.left-view-mode == 2 : Rectangle {
-                                x: root.miller-col-width + l-flick.viewport-x;
+                                x: root.miller-col-width + Math.clamp(
+                                    root.left-scroll-x,
+                                    Math.min(0px, l-viewport.width - l-viewport.content-width),
+                                    0px
+                                );
                                 y: 0px;
                                 width: 4px;
                                 height: parent.height;
@@ -2906,12 +2934,12 @@ export component ManifoldWindow inherits Window {
                             }
 
                             // Interactive Mouse-Usable Vertical Scrollbar for Left Pane
-                            if l-flick.viewport-height > l-flick.height || root.left-total-rows > root.left-rows.length : Rectangle {
+                            if root.left-max-scroll-px > 0.5 : Rectangle {
                                 z: 25;
                                 x: parent.width - 12px;
                                 y: 2px;
                                 width: 10px;
-                                height: parent.height - (l-flick.viewport-width > l-flick.width ? 14px : 4px);
+                                height: parent.height - (l-viewport.content-width > l-viewport.width ? 14px : 4px);
                                 border-radius: 5px;
                                 background: l-vbar-touch.has-hover || l-vbar-touch.pressed ? #141417DD : #16161888;
 
@@ -2922,12 +2950,16 @@ export component ManifoldWindow inherits Window {
                                     background: l-vbar-touch.pressed
                                         ? root.theme-accent
                                         : (l-vbar-touch.has-hover ? #8E8E98 : #52525E);
-                                    height: (root.left-view-mode == 0 || root.left-view-mode == 3) && root.left-total-rows > root.left-rows.length
-                                        ? Math.max(28px, parent.height * (root.left-rows.length / Math.max(1.0, root.left-total-rows * 1.0)))
-                                        : Math.max(28px, parent.height * (l-flick.height / l-flick.viewport-height));
-                                    y: (root.left-view-mode == 0 || root.left-view-mode == 3) && root.left-total-rows > root.left-rows.length
-                                        ? (parent.height - self.height) * (root.left-virtual-top-row / Math.max(1.0, (root.left-total-rows - root.left-rows.length) * 1.0))
-                                        : (parent.height - self.height) * (-l-flick.viewport-y / Math.max(1px, l-flick.viewport-height - l-flick.height));
+                                    height: Math.clamp(
+                                        parent.height * ((l-viewport.height / 1px) / Math.max(1.0, root.left-total-content-px)),
+                                        28px,
+                                        parent.height
+                                    );
+                                    y: (parent.height - self.height) * Math.clamp(
+                                        root.left-scroll-y-px / Math.max(1.0, root.left-max-scroll-px),
+                                        0.0,
+                                        1.0
+                                    );
                                 }
 
                                 l-vbar-touch := TouchArea {
@@ -2935,65 +2967,49 @@ export component ManifoldWindow inherits Window {
                                     pointer-event(ev) => {
                                         if ev.button == PointerEventButton.left && ev.kind == PointerEventKind.down {
                                             root.activate-pane(false);
-                                            if (root.left-view-mode == 0 || root.left-view-mode == 3) && root.left-total-rows > root.left-rows.length {
-                                                root.set-virtual-scroll-row(
-                                                    false,
-                                                    Math.clamp(
-                                                        Math.round(
-                                                            ((self.mouse-y - l-vthumb.height / 2) / Math.max(1px, self.height - l-vthumb.height))
-                                                                * Math.max(1, root.left-total-rows - root.left-rows.length)
-                                                        ),
-                                                        0,
-                                                        Math.max(0, root.left-total-rows - root.left-rows.length)
-                                                    )
-                                                );
-                                            } else {
-                                                l-flick.viewport-y = Math.clamp(
-                                                    -((self.mouse-y - l-vthumb.height / 2) / Math.max(1px, self.height - l-vthumb.height))
-                                                        * (l-flick.viewport-height - l-flick.height),
-                                                    Math.min(0px, l-flick.height - l-flick.viewport-height),
-                                                    0px
-                                                );
-                                            }
+                                            root.set-pane-scroll-ratio(
+                                                false,
+                                                Math.clamp(
+                                                    (self.mouse-y - l-vthumb.height / 2) / Math.max(1px, self.height - l-vthumb.height),
+                                                    0.0,
+                                                    1.0
+                                                ),
+                                                l-viewport.height / 1px
+                                            );
                                         }
                                     }
                                     moved => {
                                         if self.pressed {
-                                            if (root.left-view-mode == 0 || root.left-view-mode == 3) && root.left-total-rows > root.left-rows.length {
-                                                root.set-virtual-scroll-row(
-                                                    false,
-                                                    Math.clamp(
-                                                        Math.round(
-                                                            ((self.mouse-y - l-vthumb.height / 2) / Math.max(1px, self.height - l-vthumb.height))
-                                                                * Math.max(1, root.left-total-rows - root.left-rows.length)
-                                                        ),
-                                                        0,
-                                                        Math.max(0, root.left-total-rows - root.left-rows.length)
-                                                    )
-                                                );
-                                            } else {
-                                                l-flick.viewport-y = Math.clamp(
-                                                    -((self.mouse-y - l-vthumb.height / 2) / Math.max(1px, self.height - l-vthumb.height))
-                                                        * (l-flick.viewport-height - l-flick.height),
-                                                    Math.min(0px, l-flick.height - l-flick.viewport-height),
-                                                    0px
-                                                );
-                                            }
+                                            root.set-pane-scroll-ratio(
+                                                false,
+                                                Math.clamp(
+                                                    (self.mouse-y - l-vthumb.height / 2) / Math.max(1px, self.height - l-vthumb.height),
+                                                    0.0,
+                                                    1.0
+                                                ),
+                                                l-viewport.height / 1px
+                                            );
                                         }
                                     }
                                     scroll-event(ev) => {
-                                        root.scroll-pane-by-delta(false, ev.delta-y);
+                                        root.scroll-pane-by-delta(
+                                            false,
+                                            ev.delta-x,
+                                            ev.delta-y,
+                                            l-viewport.width - l-viewport.content-width,
+                                            l-viewport.height
+                                        );
                                         return accept;
                                     }
                                 }
                             }
 
                             // Interactive Mouse-Usable Horizontal Scrollbar for Left Pane
-                            if l-flick.viewport-width > l-flick.width : Rectangle {
+                            if l-viewport.content-width > l-viewport.width : Rectangle {
                                 z: 25;
                                 x: 2px;
                                 y: parent.height - 12px;
-                                width: parent.width - (l-flick.viewport-height > l-flick.height ? 14px : 4px);
+                                width: parent.width - (root.left-max-scroll-px > 0.5 ? 14px : 4px);
                                 height: 10px;
                                 border-radius: 5px;
                                 background: l-hbar-touch.has-hover || l-hbar-touch.pressed ? #141417DD : #16161888;
@@ -3005,8 +3021,14 @@ export component ManifoldWindow inherits Window {
                                     background: l-hbar-touch.pressed
                                         ? root.theme-accent
                                         : (l-hbar-touch.has-hover ? #8E8E98 : #52525E);
-                                    width: Math.max(28px, parent.width * (l-flick.width / l-flick.viewport-width));
-                                    x: (parent.width - self.width) * (-l-flick.viewport-x / Math.max(1px, l-flick.viewport-width - l-flick.width));
+                                    width: Math.max(28px, parent.width * (l-viewport.width / l-viewport.content-width));
+                                    x: (parent.width - self.width) * (
+                                        -Math.clamp(
+                                            root.left-scroll-x,
+                                            Math.min(0px, l-viewport.width - l-viewport.content-width),
+                                            0px
+                                        ) / Math.max(1px, l-viewport.content-width - l-viewport.width)
+                                    );
                                 }
 
                                 l-hbar-touch := TouchArea {
@@ -3014,20 +3036,20 @@ export component ManifoldWindow inherits Window {
                                     pointer-event(ev) => {
                                         if ev.button == PointerEventButton.left && ev.kind == PointerEventKind.down {
                                             root.activate-pane(false);
-                                            l-flick.viewport-x = Math.clamp(
+                                            root.left-scroll-x = Math.clamp(
                                                 -((self.mouse-x - l-hthumb.width / 2) / Math.max(1px, self.width - l-hthumb.width))
-                                                    * (l-flick.viewport-width - l-flick.width),
-                                                Math.min(0px, l-flick.width - l-flick.viewport-width),
+                                                    * (l-viewport.content-width - l-viewport.width),
+                                                Math.min(0px, l-viewport.width - l-viewport.content-width),
                                                 0px
                                             );
                                         }
                                     }
                                     moved => {
                                         if self.pressed {
-                                            l-flick.viewport-x = Math.clamp(
+                                            root.left-scroll-x = Math.clamp(
                                                 -((self.mouse-x - l-hthumb.width / 2) / Math.max(1px, self.width - l-hthumb.width))
-                                                    * (l-flick.viewport-width - l-flick.width),
-                                                Math.min(0px, l-flick.width - l-flick.viewport-width),
+                                                    * (l-viewport.content-width - l-viewport.width),
+                                                Math.min(0px, l-viewport.width - l-viewport.content-width),
                                                 0px
                                             );
                                         }
@@ -3845,11 +3867,12 @@ export component ManifoldWindow inherits Window {
                                     }
                                 }
                                 scroll-event(ev) => {
-                                    root.scroll-pane-by-delta(true, ev.delta-y);
-                                    r-flick.viewport-x = Math.clamp(
-                                        r-flick.viewport-x + ev.delta-x,
-                                        Math.min(0px, r-flick.width - r-flick.viewport-width),
-                                        0px
+                                    root.scroll-pane-by-delta(
+                                        true,
+                                        ev.delta-x,
+                                        ev.delta-y,
+                                        r-viewport.width - r-viewport.content-width,
+                                        r-viewport.height
                                     );
                                     return accept;
                                 }
@@ -3938,12 +3961,12 @@ export component ManifoldWindow inherits Window {
                                 }
                             }
 
-                            r-flick := Flickable {
+                            r-viewport := Rectangle {
                                 width: parent.width;
                                 height: parent.height;
-                                interactive: false;
-                                viewport-y <=> root.right-scroll-y;
-                                viewport-width: (root.right-view-mode == 0 || root.right-view-mode == 3)
+                                clip: true;
+                                background: transparent;
+                                property <length> content-width: (root.right-view-mode == 0 || root.right-view-mode == 3)
                                     ? Math.max(
                                         self.width,
                                         260px
@@ -3959,23 +3982,25 @@ export component ManifoldWindow inherits Window {
                                     : (root.right-view-mode == 2
                                         ? Math.max(self.width, root.miller-col-width * 2 + 280px)
                                         : Math.max(self.width, 360px));
-                                viewport-height: Math.min(
-                                    9600px,
-                                    (root.right-view-mode == 0 || root.right-view-mode == 3)
-                                        ? Math.max(self.height, root.right-rows.length * (29px + Math.max(0px, root.font-size-delta * 2.0)) + 20px)
-                                        : (root.right-view-mode == 1
-                                            ? Math.max(self.height, root.right-icon-triples.length * (138px + Math.max(0px, root.font-size-delta * 4.0)) + 28px)
-                                            : Math.max(self.height, Math.max(root.right-parent-rows.length, root.right-rows.length) * (29px + Math.max(0px, root.font-size-delta * 2.0)) + 20px))
-                                );
+                                changed height => {
+                                    root.reported-right-viewport-height = self.height;
+                                    root.pane-viewport-resized(true, self.height / 1px);
+                                }
 
-                                VerticalLayout {
+                                if root.right-rows.length > 0 && (root.right-view-mode == 0 || root.right-view-mode == 3) : VerticalLayout {
+                                    x: Math.clamp(
+                                        root.right-scroll-x,
+                                        Math.min(0px, parent.width - r-viewport.content-width),
+                                        0px
+                                    );
+                                    y: root.right-sub-row-offset;
+                                    width: r-viewport.content-width;
+                                    height: self.preferred-height;
                                     alignment: start;
-                                    if root.right-view-mode == 0 || root.right-view-mode == 3 : VerticalLayout {
-                                        alignment: start;
-                                        padding-left: 6px;
-                                        padding-right: 6px;
-                                        padding-top: 4px;
-                                        spacing: 1px;
+                                    padding-left: 6px;
+                                    padding-right: 6px;
+                                    padding-top: 0px;
+                                    spacing: 1px;
                                         for row[r-idx] in root.right-rows : FileRow {
                                             row_index: root.right-virtual-top-row + r-idx;
                                             file_name: row.name;
@@ -4055,15 +4080,11 @@ export component ManifoldWindow inherits Window {
                                                 root.shift-drag-select(true, root.right-virtual-top-row + r-idx + Math.round((my - 13px) / 27px));
                                             }
                                             row-drag-moved(abs_x, abs_y) => {
-                                                root.drag-left-pane-w = l-flick.width;
-                                                root.drag-left-scroll-y = l-flick.viewport-y;
-                                                root.drag-right-scroll-y = r-flick.viewport-y;
+                                                root.drag-left-pane-w = l-viewport.width;
                                                 root.update-drag-cursor(true, root.right-virtual-top-row + r-idx, abs_x, abs_y);
                                             }
                                             row-drag-ended(abs_x, abs_y) => {
-                                                root.drag-left-pane-w = l-flick.width;
-                                                root.drag-left-scroll-y = l-flick.viewport-y;
-                                                root.drag-right-scroll-y = r-flick.viewport-y;
+                                                root.drag-left-pane-w = l-viewport.width;
                                                 root.finish-drag-drop(true, root.right-virtual-top-row + r-idx, abs_x, abs_y);
                                             }
                                             row-drag-to-other-pane => {
@@ -4072,16 +4093,33 @@ export component ManifoldWindow inherits Window {
                                             toggle-expand => {
                                                 root.toggle-expand-folder(true, root.right-virtual-top-row + r-idx);
                                             }
-                                            wheel-scroll(dy) => {
+                                            wheel-scroll(dx, dy) => {
                                                 root.show-hover-preview = false;
-                                                root.scroll-pane-by-delta(true, dy);
+                                                root.scroll-pane-by-delta(
+                                                    true,
+                                                    dx,
+                                                    dy,
+                                                    r-viewport.width - r-viewport.content-width,
+                                                    r-viewport.height
+                                                );
                                             }
                                         }
                                     }
 
-                                    if root.right-view-mode == 1 : VerticalLayout {
+                                    if root.right-rows.length > 0 && root.right-view-mode == 1 : VerticalLayout {
+                                        x: Math.clamp(
+                                            root.right-scroll-x,
+                                            Math.min(0px, parent.width - r-viewport.content-width),
+                                            0px
+                                        );
+                                        y: root.right-sub-row-offset;
+                                        width: r-viewport.content-width;
+                                        height: self.preferred-height;
                                         alignment: start;
-                                        padding: 12px;
+                                        padding-left: 12px;
+                                        padding-right: 12px;
+                                        padding-top: 0px;
+                                        padding-bottom: 0px;
                                         spacing: 10px;
                                         for triple in root.right-icon-triples : HorizontalLayout {
                                             spacing: 10px;
@@ -4115,23 +4153,21 @@ export component ManifoldWindow inherits Window {
                                                     root.hover-leave-file-row(true, triple.idx-0);
                                                 }
                                                 cell-drag-moved(abs_x, abs_y) => {
-                                                    root.drag-left-pane-w = l-flick.width;
-                                                    root.drag-left-scroll-y = l-flick.viewport-y;
-                                                    root.drag-right-scroll-y = r-flick.viewport-y;
+                                                    root.drag-left-pane-w = l-viewport.width;
                                                     root.update-drag-cursor(true, triple.idx-0, abs_x, abs_y);
                                                 }
                                                 cell-drag-ended(abs_x, abs_y) => {
-                                                    root.drag-left-pane-w = l-flick.width;
-                                                    root.drag-left-scroll-y = l-flick.viewport-y;
-                                                    root.drag-right-scroll-y = r-flick.viewport-y;
+                                                    root.drag-left-pane-w = l-viewport.width;
                                                     root.finish-drag-drop(true, triple.idx-0, abs_x, abs_y);
                                                 }
-                                                wheel-scroll(dy) => {
+                                                wheel-scroll(dx, dy) => {
                                                     root.show-hover-preview = false;
-                                                    r-flick.viewport-y = Math.clamp(
-                                                        r-flick.viewport-y + dy,
-                                                        Math.min(0px, r-flick.height - r-flick.viewport-height),
-                                                        0px
+                                                    root.scroll-pane-by-delta(
+                                                        true,
+                                                        dx,
+                                                        dy,
+                                                        r-viewport.width - r-viewport.content-width,
+                                                        r-viewport.height
                                                     );
                                                 }
                                             }
@@ -4166,23 +4202,21 @@ export component ManifoldWindow inherits Window {
                                                     root.hover-leave-file-row(true, triple.idx-1);
                                                 }
                                                 cell-drag-moved(abs_x, abs_y) => {
-                                                    root.drag-left-pane-w = l-flick.width;
-                                                    root.drag-left-scroll-y = l-flick.viewport-y;
-                                                    root.drag-right-scroll-y = r-flick.viewport-y;
+                                                    root.drag-left-pane-w = l-viewport.width;
                                                     root.update-drag-cursor(true, triple.idx-1, abs_x, abs_y);
                                                 }
                                                 cell-drag-ended(abs_x, abs_y) => {
-                                                    root.drag-left-pane-w = l-flick.width;
-                                                    root.drag-left-scroll-y = l-flick.viewport-y;
-                                                    root.drag-right-scroll-y = r-flick.viewport-y;
+                                                    root.drag-left-pane-w = l-viewport.width;
                                                     root.finish-drag-drop(true, triple.idx-1, abs_x, abs_y);
                                                 }
-                                                wheel-scroll(dy) => {
+                                                wheel-scroll(dx, dy) => {
                                                     root.show-hover-preview = false;
-                                                    r-flick.viewport-y = Math.clamp(
-                                                        r-flick.viewport-y + dy,
-                                                        Math.min(0px, r-flick.height - r-flick.viewport-height),
-                                                        0px
+                                                    root.scroll-pane-by-delta(
+                                                        true,
+                                                        dx,
+                                                        dy,
+                                                        r-viewport.width - r-viewport.content-width,
+                                                        r-viewport.height
                                                     );
                                                 }
                                             }
@@ -4217,23 +4251,21 @@ export component ManifoldWindow inherits Window {
                                                     root.hover-leave-file-row(true, triple.idx-2);
                                                 }
                                                 cell-drag-moved(abs_x, abs_y) => {
-                                                    root.drag-left-pane-w = l-flick.width;
-                                                    root.drag-left-scroll-y = l-flick.viewport-y;
-                                                    root.drag-right-scroll-y = r-flick.viewport-y;
+                                                    root.drag-left-pane-w = l-viewport.width;
                                                     root.update-drag-cursor(true, triple.idx-2, abs_x, abs_y);
                                                 }
                                                 cell-drag-ended(abs_x, abs_y) => {
-                                                    root.drag-left-pane-w = l-flick.width;
-                                                    root.drag-left-scroll-y = l-flick.viewport-y;
-                                                    root.drag-right-scroll-y = r-flick.viewport-y;
+                                                    root.drag-left-pane-w = l-viewport.width;
                                                     root.finish-drag-drop(true, triple.idx-2, abs_x, abs_y);
                                                 }
-                                                wheel-scroll(dy) => {
+                                                wheel-scroll(dx, dy) => {
                                                     root.show-hover-preview = false;
-                                                    r-flick.viewport-y = Math.clamp(
-                                                        r-flick.viewport-y + dy,
-                                                        Math.min(0px, r-flick.height - r-flick.viewport-height),
-                                                        0px
+                                                    root.scroll-pane-by-delta(
+                                                        true,
+                                                        dx,
+                                                        dy,
+                                                        r-viewport.width - r-viewport.content-width,
+                                                        r-viewport.height
                                                     );
                                                 }
                                             }
@@ -4241,107 +4273,158 @@ export component ManifoldWindow inherits Window {
                                         }
                                     }
 
-                                    if root.right-view-mode == 2 : HorizontalLayout {
+                                    if root.right-rows.length > 0 && root.right-view-mode == 2 : HorizontalLayout {
+                                        x: Math.clamp(
+                                            root.right-scroll-x,
+                                            Math.min(0px, parent.width - r-viewport.content-width),
+                                            0px
+                                        );
+                                        y: 0px;
+                                        width: r-viewport.content-width;
+                                        height: parent.height;
                                         spacing: 4px;
-                                        VerticalLayout {
-                                            alignment: start;
+                                        Rectangle {
                                             width: root.miller-col-width;
-                                            for p-row[p-idx] in root.right-parent-rows : Rectangle {
-                                                height: 26px;
-                                                border-radius: 4px;
-                                                background: p-row.is-selected
-                                                    ? root.theme-bg-hover
-                                                    : (p-row.has-color-tag ? p-row.color-tag-tint : transparent);
-                                                HorizontalLayout {
-                                                    padding-left: 8px;
-                                                    padding-right: 8px;
-                                                    spacing: 8px;
-                                                    Rectangle {
-                                                        width: 18px;
-                                                        background: transparent;
-                                                        if !p-row.is-dir && p-row.has-thumbnail : Image {
-                                                            x: 0px;
-                                                            y: (parent.height - 18px) / 2;
-                                                            width: 18px;
-                                                            height: 18px;
-                                                            image-fit: contain;
-                                                            source: p-row.thumbnail;
-                                                        }
-                                                        if p-row.is-dir || !p-row.has-thumbnail : LucideIcon {
-                                                            x: 0px;
-                                                            y: (parent.height - self.height) / 2;
-                                                            icon-size: 15px;
-                                                            kind: p-row.is-dir
-                                                                ? "folder"
-                                                                : (p-row.ext-badge == "APP"
-                                                                    ? "applications"
-                                                                    : (p-row.is-image
-                                                                        ? "image"
-                                                                        : ((p-row.ext-badge == "ZIP" || p-row.ext-badge == "TAR" || p-row.ext-badge == "GZ" || p-row.ext-badge == "ISO")
-                                                                            ? "archive"
-                                                                            : ((p-row.ext-badge == "MP3" || p-row.ext-badge == "FLAC" || p-row.ext-badge == "WAV" || p-row.ext-badge == "M4A" || p-row.ext-badge == "OGG" || p-row.ext-badge == "AAC")
-                                                                                ? "music"
-                                                                                : ((p-row.ext-badge == "MP4" || p-row.ext-badge == "MKV" || p-row.ext-badge == "MOV" || p-row.ext-badge == "AVI" || p-row.ext-badge == "WEBM")
-                                                                                    ? "movies"
-                                                                                    : (p-row.is-executable ? "terminal" : "documents"))))));
-                                                            icon-color: p-row.has-color-tag
-                                                                ? p-row.color-tag-brush
-                                                                : ((p-row.is-dir || p-row.ext-badge == "APP")
-                                                                    ? #38B6FF
-                                                                    : (p-row.ext-badge == "PDF"
-                                                                        ? #FF5F56
-                                                                        : (p-row.is-image ? #6E92B8 : #A0A0AB)));
-                                                            fill-color: p-row.is-dir
-                                                                ? (p-row.has-color-tag ? p-row.color-tag-brush : #4CC2FF)
-                                                                : transparent;
-                                                        }
-                                                    }
-                                                    Text {
-                                                        text: p-row.name;
-                                                        color: root.theme-text-primary;
-                                                        font-size: 12px + root.font-size-delta;
-                                                        font-family: root.resolved-font-family;
-                                                        font-weight: root.ui-font-bold ? 700 : 500;
-                                                        horizontal-stretch: 1;
-                                                        overflow: elide;
-                                                        vertical-alignment: center;
-                                                    }
-                                                    if p-row.has-color-tag : Rectangle {
-                                                        width: 7px;
-                                                        height: 7px;
-                                                        y: (parent.height - self.height) / 2;
-                                                        border-radius: 3.5px;
-                                                        background: p-row.color-tag-brush;
-                                                    }
-                                                    if p-row.is-dir : LucideIcon {
-                                                        y: (parent.height - self.height) / 2;
-                                                        icon-size: 12px;
-                                                        kind: "chevron-right";
-                                                        icon-color: root.theme-text-muted;
-                                                    }
+                                            height: parent.height;
+                                            clip: true;
+                                            background: transparent;
+                                            TouchArea {
+                                                scroll-event(ev) => {
+                                                    root.right-parent-scroll-y = Math.clamp(
+                                                        root.right-parent-scroll-y + ev.delta-y,
+                                                        Math.min(0px, r-viewport.height - (root.right-parent-rows.length * 26px + 8px)),
+                                                        0px
+                                                    );
+                                                    return accept;
                                                 }
-                                                TouchArea {
-                                                    clicked => { root.open-parent-row(true, p-idx); }
-                                                    scroll-event(ev) => {
-                                                        r-flick.viewport-y = Math.clamp(
-                                                            r-flick.viewport-y + ev.delta-y,
-                                                            Math.min(0px, r-flick.height - r-flick.viewport-height),
-                                                            0px
-                                                        );
-                                                        return accept;
+                                            }
+                                            VerticalLayout {
+                                                x: 0px;
+                                                y: Math.clamp(
+                                                    root.right-parent-scroll-y,
+                                                    Math.min(0px, parent.height - (root.right-parent-rows.length * 26px + 8px)),
+                                                    0px
+                                                );
+                                                width: parent.width;
+                                                height: self.preferred-height;
+                                                alignment: start;
+                                                for p-row[p-idx] in root.right-parent-rows : Rectangle {
+                                                    height: 26px;
+                                                    border-radius: 4px;
+                                                    background: p-row.is-selected
+                                                        ? root.theme-bg-hover
+                                                        : (p-row.has-color-tag ? p-row.color-tag-tint : transparent);
+                                                    HorizontalLayout {
+                                                        padding-left: 8px;
+                                                        padding-right: 8px;
+                                                        spacing: 8px;
+                                                        Rectangle {
+                                                            width: 18px;
+                                                            background: transparent;
+                                                            if !p-row.is-dir && p-row.has-thumbnail : Image {
+                                                                x: 0px;
+                                                                y: (parent.height - 18px) / 2;
+                                                                width: 18px;
+                                                                height: 18px;
+                                                                image-fit: contain;
+                                                                source: p-row.thumbnail;
+                                                            }
+                                                            if p-row.is-dir || !p-row.has-thumbnail : LucideIcon {
+                                                                x: 0px;
+                                                                y: (parent.height - self.height) / 2;
+                                                                icon-size: 15px;
+                                                                kind: p-row.is-dir
+                                                                    ? "folder"
+                                                                    : (p-row.ext-badge == "APP"
+                                                                        ? "applications"
+                                                                        : (p-row.is-image
+                                                                            ? "image"
+                                                                            : ((p-row.ext-badge == "ZIP" || p-row.ext-badge == "TAR" || p-row.ext-badge == "GZ" || p-row.ext-badge == "ISO")
+                                                                                ? "archive"
+                                                                                : ((p-row.ext-badge == "MP3" || p-row.ext-badge == "FLAC" || p-row.ext-badge == "WAV" || p-row.ext-badge == "M4A" || p-row.ext-badge == "OGG" || p-row.ext-badge == "AAC")
+                                                                                    ? "music"
+                                                                                    : ((p-row.ext-badge == "MP4" || p-row.ext-badge == "MKV" || p-row.ext-badge == "MOV" || p-row.ext-badge == "AVI" || p-row.ext-badge == "WEBM")
+                                                                                        ? "movies"
+                                                                                        : (p-row.is-executable ? "terminal" : "documents"))))));
+                                                                icon-color: p-row.has-color-tag
+                                                                    ? p-row.color-tag-brush
+                                                                    : ((p-row.is-dir || p-row.ext-badge == "APP")
+                                                                        ? #38B6FF
+                                                                        : (p-row.ext-badge == "PDF"
+                                                                            ? #FF5F56
+                                                                            : (p-row.is-image ? #6E92B8 : #A0A0AB)));
+                                                                fill-color: p-row.is-dir
+                                                                    ? (p-row.has-color-tag ? p-row.color-tag-brush : #4CC2FF)
+                                                                    : transparent;
+                                                            }
+                                                        }
+                                                        Text {
+                                                            text: p-row.name;
+                                                            color: root.theme-text-primary;
+                                                            font-size: 12px + root.font-size-delta;
+                                                            font-family: root.resolved-font-family;
+                                                            font-weight: root.ui-font-bold ? 700 : 500;
+                                                            horizontal-stretch: 1;
+                                                            overflow: elide;
+                                                            vertical-alignment: center;
+                                                        }
+                                                        if p-row.has-color-tag : Rectangle {
+                                                            width: 7px;
+                                                            height: 7px;
+                                                            y: (parent.height - self.height) / 2;
+                                                            border-radius: 3.5px;
+                                                            background: p-row.color-tag-brush;
+                                                        }
+                                                        if p-row.is-dir : LucideIcon {
+                                                            y: (parent.height - self.height) / 2;
+                                                            icon-size: 12px;
+                                                            kind: "chevron-right";
+                                                            icon-color: root.theme-text-muted;
+                                                        }
+                                                    }
+                                                    TouchArea {
+                                                        clicked => { root.open-parent-row(true, p-idx); }
+                                                        scroll-event(ev) => {
+                                                            root.right-parent-scroll-y = Math.clamp(
+                                                                root.right-parent-scroll-y + ev.delta-y,
+                                                                Math.min(0px, r-viewport.height - (root.right-parent-rows.length * 26px + 8px)),
+                                                                0px
+                                                            );
+                                                            return accept;
+                                                        }
                                                     }
                                                 }
                                             }
                                         }
-                                        VerticalLayout {
-                                            alignment: start;
+                                        Rectangle {
                                             width: root.miller-col-width + 40px;
-                                            for c-row[c-idx] in root.right-rows : Rectangle {
-                                                height: 26px;
-                                                border-radius: 4px;
-                                                border-width: root.drag-hover-right-row == c-idx ? 1px : 0px;
-                                                border-color: root.drag-hover-right-row == c-idx ? root.theme-accent : transparent;
-                                                background: root.drag-hover-right-row == c-idx
+                                            height: parent.height;
+                                            clip: true;
+                                            background: transparent;
+                                            TouchArea {
+                                                scroll-event(ev) => {
+                                                    root.scroll-pane-by-delta(
+                                                        true,
+                                                        ev.delta-x,
+                                                        ev.delta-y,
+                                                        r-viewport.width - r-viewport.content-width,
+                                                        r-viewport.height
+                                                    );
+                                                    return accept;
+                                                }
+                                            }
+                                            VerticalLayout {
+                                                x: 0px;
+                                                y: root.right-sub-row-offset;
+                                                width: parent.width;
+                                                height: self.preferred-height;
+                                                alignment: start;
+                                                for c-row[c-idx] in root.right-rows : Rectangle {
+                                                    height: 26px;
+                                                    border-radius: 4px;
+                                                    border-width: root.drag-hover-right-row == (root.right-virtual-top-row + c-idx) ? 1px : 0px;
+                                                    border-color: root.drag-hover-right-row == (root.right-virtual-top-row + c-idx) ? root.theme-accent : transparent;
+                                                    background: root.drag-hover-right-row == (root.right-virtual-top-row + c-idx)
                                                     ? #0D52BF38
                                                     : (c-row.is-selected
                                                         ? (root.right-pane-active ? root.theme-accent : #2E323B)
@@ -4456,7 +4539,7 @@ export component ManifoldWindow inherits Window {
                                                         if !root.col-suppress-click {
                                                             root.select-file-row-mod(
                                                                 true,
-                                                                c-idx,
+                                                                root.right-virtual-top-row + c-idx,
                                                                 root.col-down-shift,
                                                                 root.col-down-cmd
                                                             );
@@ -4467,19 +4550,17 @@ export component ManifoldWindow inherits Window {
                                                     }
                                                     double-clicked => {
                                                         root.show-hover-preview = false;
-                                                        root.open-file-row(true, c-idx);
+                                                        root.open-file-row(true, root.right-virtual-top-row + c-idx);
                                                     }
                                                     moved => {
                                                         if self.pressed && !root.col-down-shift && !root.col-down-cmd && (Math.abs(self.mouse-x - self.pressed-x) > 14px || Math.abs(self.mouse-y - self.pressed-y) > 14px) {
                                                             root.show-hover-preview = false;
                                                             root.col-drag-active = true;
                                                             root.col-suppress-click = true;
-                                                            root.drag-left-pane-w = l-flick.width;
-                                                            root.drag-left-scroll-y = l-flick.viewport-y;
-                                                            root.drag-right-scroll-y = r-flick.viewport-y;
+                                                            root.drag-left-pane-w = l-viewport.width;
                                                             root.update-drag-cursor(
                                                                 true,
-                                                                c-idx,
+                                                                root.right-virtual-top-row + c-idx,
                                                                 self.absolute-position.x + self.mouse-x,
                                                                 self.absolute-position.y + self.mouse-y
                                                             );
@@ -4489,19 +4570,19 @@ export component ManifoldWindow inherits Window {
                                                         if self.has-hover && !self.pressed && !root.col-drag-active {
                                                             root.hover-file-row(
                                                                 true,
-                                                                c-idx,
+                                                                root.right-virtual-top-row + c-idx,
                                                                 self.absolute-position.x + self.mouse-x,
                                                                 self.absolute-position.y + self.mouse-y
                                                             );
                                                         } else if !self.has-hover {
-                                                            root.hover-leave-file-row(true, c-idx);
+                                                            root.hover-leave-file-row(true, root.right-virtual-top-row + c-idx);
                                                         }
                                                     }
                                                     pointer-event(ev) => {
                                                         if ev.kind == PointerEventKind.move && !self.pressed && !root.col-drag-active {
                                                             root.hover-file-row(
                                                                 true,
-                                                                c-idx,
+                                                                root.right-virtual-top-row + c-idx,
                                                                 self.absolute-position.x + self.mouse-x,
                                                                 self.absolute-position.y + self.mouse-y
                                                             );
@@ -4517,12 +4598,10 @@ export component ManifoldWindow inherits Window {
                                                         if ev.kind == PointerEventKind.up || ev.kind == PointerEventKind.cancel {
                                                             if root.col-drag-active {
                                                                 root.col-drag-active = false;
-                                                                root.drag-left-pane-w = l-flick.width;
-                                                                root.drag-left-scroll-y = l-flick.viewport-y;
-                                                                root.drag-right-scroll-y = r-flick.viewport-y;
+                                                                root.drag-left-pane-w = l-viewport.width;
                                                                 root.finish-drag-drop(
                                                                     true,
-                                                                    c-idx,
+                                                                    root.right-virtual-top-row + c-idx,
                                                                     self.absolute-position.x + self.mouse-x,
                                                                     self.absolute-position.y + self.mouse-y
                                                                 );
@@ -4538,7 +4617,7 @@ export component ManifoldWindow inherits Window {
                                                             root.col-suppress-click = true;
                                                             root.open-context-menu-for-row(
                                                                 true,
-                                                                c-idx,
+                                                                root.right-virtual-top-row + c-idx,
                                                                 self.absolute-position.x + self.mouse-x,
                                                                 self.absolute-position.y + self.mouse-y
                                                             );
@@ -4546,14 +4625,17 @@ export component ManifoldWindow inherits Window {
                                                     }
                                                     scroll-event(ev) => {
                                                         root.show-hover-preview = false;
-                                                        r-flick.viewport-y = Math.clamp(
-                                                            r-flick.viewport-y + ev.delta-y,
-                                                            Math.min(0px, r-flick.height - r-flick.viewport-height),
-                                                            0px
+                                                        root.scroll-pane-by-delta(
+                                                            true,
+                                                            ev.delta-x,
+                                                            ev.delta-y,
+                                                            r-viewport.width - r-viewport.content-width,
+                                                            r-viewport.height
                                                         );
                                                         return accept;
                                                     }
                                                 }
+                                            }
                                             }
                                         }
 
@@ -4684,12 +4766,15 @@ export component ManifoldWindow inherits Window {
                                             }
                                         }
                                     }
-                                }
                             }
 
                             if root.right-view-mode == 2 : Rectangle {
                                 z: 15;
-                                x: root.miller-col-width + r-flick.viewport-x;
+                                x: root.miller-col-width + Math.clamp(
+                                    root.right-scroll-x,
+                                    Math.min(0px, r-viewport.width - r-viewport.content-width),
+                                    0px
+                                );
                                 y: 0px;
                                 width: 5px;
                                 height: parent.height;
@@ -4721,12 +4806,12 @@ export component ManifoldWindow inherits Window {
                             }
 
                             // Interactive Mouse-Usable Vertical Scrollbar for Right Pane
-                            if r-flick.viewport-height > r-flick.height || root.right-total-rows > root.right-rows.length : Rectangle {
+                            if root.right-max-scroll-px > 0.5 : Rectangle {
                                 z: 25;
                                 x: parent.width - 12px;
                                 y: 2px;
                                 width: 10px;
-                                height: parent.height - (r-flick.viewport-width > r-flick.width ? 14px : 4px);
+                                height: parent.height - (r-viewport.content-width > r-viewport.width ? 14px : 4px);
                                 border-radius: 5px;
                                 background: r-vbar-touch.has-hover || r-vbar-touch.pressed ? #141417DD : #16161888;
 
@@ -4737,12 +4822,16 @@ export component ManifoldWindow inherits Window {
                                     background: r-vbar-touch.pressed
                                         ? root.theme-accent
                                         : (r-vbar-touch.has-hover ? #8E8E98 : #52525E);
-                                    height: (root.right-view-mode == 0 || root.right-view-mode == 3) && root.right-total-rows > root.right-rows.length
-                                        ? Math.max(28px, parent.height * (root.right-rows.length / Math.max(1.0, root.right-total-rows * 1.0)))
-                                        : Math.max(28px, parent.height * (r-flick.height / r-flick.viewport-height));
-                                    y: (root.right-view-mode == 0 || root.right-view-mode == 3) && root.right-total-rows > root.right-rows.length
-                                        ? (parent.height - self.height) * (root.right-virtual-top-row / Math.max(1.0, (root.right-total-rows - root.right-rows.length) * 1.0))
-                                        : (parent.height - self.height) * (-r-flick.viewport-y / Math.max(1px, r-flick.viewport-height - r-flick.height));
+                                    height: Math.clamp(
+                                        parent.height * ((r-viewport.height / 1px) / Math.max(1.0, root.right-total-content-px)),
+                                        28px,
+                                        parent.height
+                                    );
+                                    y: (parent.height - self.height) * Math.clamp(
+                                        root.right-scroll-y-px / Math.max(1.0, root.right-max-scroll-px),
+                                        0.0,
+                                        1.0
+                                    );
                                 }
 
                                 r-vbar-touch := TouchArea {
@@ -4750,65 +4839,49 @@ export component ManifoldWindow inherits Window {
                                     pointer-event(ev) => {
                                         if ev.button == PointerEventButton.left && ev.kind == PointerEventKind.down {
                                             root.activate-pane(true);
-                                            if (root.right-view-mode == 0 || root.right-view-mode == 3) && root.right-total-rows > root.right-rows.length {
-                                                root.set-virtual-scroll-row(
-                                                    true,
-                                                    Math.clamp(
-                                                        Math.round(
-                                                            ((self.mouse-y - r-vthumb.height / 2) / Math.max(1px, self.height - r-vthumb.height))
-                                                                * Math.max(1, root.right-total-rows - root.right-rows.length)
-                                                        ),
-                                                        0,
-                                                        Math.max(0, root.right-total-rows - root.right-rows.length)
-                                                    )
-                                                );
-                                            } else {
-                                                r-flick.viewport-y = Math.clamp(
-                                                    -((self.mouse-y - r-vthumb.height / 2) / Math.max(1px, self.height - r-vthumb.height))
-                                                        * (r-flick.viewport-height - r-flick.height),
-                                                    Math.min(0px, r-flick.height - r-flick.viewport-height),
-                                                    0px
-                                                );
-                                            }
+                                            root.set-pane-scroll-ratio(
+                                                true,
+                                                Math.clamp(
+                                                    (self.mouse-y - r-vthumb.height / 2) / Math.max(1px, self.height - r-vthumb.height),
+                                                    0.0,
+                                                    1.0
+                                                ),
+                                                r-viewport.height / 1px
+                                            );
                                         }
                                     }
                                     moved => {
                                         if self.pressed {
-                                            if (root.right-view-mode == 0 || root.right-view-mode == 3) && root.right-total-rows > root.right-rows.length {
-                                                root.set-virtual-scroll-row(
-                                                    true,
-                                                    Math.clamp(
-                                                        Math.round(
-                                                            ((self.mouse-y - r-vthumb.height / 2) / Math.max(1px, self.height - r-vthumb.height))
-                                                                * Math.max(1, root.right-total-rows - root.right-rows.length)
-                                                        ),
-                                                        0,
-                                                        Math.max(0, root.right-total-rows - root.right-rows.length)
-                                                    )
-                                                );
-                                            } else {
-                                                r-flick.viewport-y = Math.clamp(
-                                                    -((self.mouse-y - r-vthumb.height / 2) / Math.max(1px, self.height - r-vthumb.height))
-                                                        * (r-flick.viewport-height - r-flick.height),
-                                                    Math.min(0px, r-flick.height - r-flick.viewport-height),
-                                                    0px
-                                                );
-                                            }
+                                            root.set-pane-scroll-ratio(
+                                                true,
+                                                Math.clamp(
+                                                    (self.mouse-y - r-vthumb.height / 2) / Math.max(1px, self.height - r-vthumb.height),
+                                                    0.0,
+                                                    1.0
+                                                ),
+                                                r-viewport.height / 1px
+                                            );
                                         }
                                     }
                                     scroll-event(ev) => {
-                                        root.scroll-pane-by-delta(true, ev.delta-y);
+                                        root.scroll-pane-by-delta(
+                                            true,
+                                            ev.delta-x,
+                                            ev.delta-y,
+                                            r-viewport.width - r-viewport.content-width,
+                                            r-viewport.height
+                                        );
                                         return accept;
                                     }
                                 }
                             }
 
                             // Interactive Mouse-Usable Horizontal Scrollbar for Right Pane
-                            if r-flick.viewport-width > r-flick.width : Rectangle {
+                            if r-viewport.content-width > r-viewport.width : Rectangle {
                                 z: 25;
                                 x: 2px;
                                 y: parent.height - 12px;
-                                width: parent.width - (r-flick.viewport-height > r-flick.height ? 14px : 4px);
+                                width: parent.width - (root.right-max-scroll-px > 0.5 ? 14px : 4px);
                                 height: 10px;
                                 border-radius: 5px;
                                 background: r-hbar-touch.has-hover || r-hbar-touch.pressed ? #141417DD : #16161888;
@@ -4820,8 +4893,14 @@ export component ManifoldWindow inherits Window {
                                     background: r-hbar-touch.pressed
                                         ? root.theme-accent
                                         : (r-hbar-touch.has-hover ? #8E8E98 : #52525E);
-                                    width: Math.max(28px, parent.width * (r-flick.width / r-flick.viewport-width));
-                                    x: (parent.width - self.width) * (-r-flick.viewport-x / Math.max(1px, r-flick.viewport-width - r-flick.width));
+                                    width: Math.max(28px, parent.width * (r-viewport.width / r-viewport.content-width));
+                                    x: (parent.width - self.width) * (
+                                        -Math.clamp(
+                                            root.right-scroll-x,
+                                            Math.min(0px, r-viewport.width - r-viewport.content-width),
+                                            0px
+                                        ) / Math.max(1px, r-viewport.content-width - r-viewport.width)
+                                    );
                                 }
 
                                 r-hbar-touch := TouchArea {
@@ -4829,20 +4908,20 @@ export component ManifoldWindow inherits Window {
                                     pointer-event(ev) => {
                                         if ev.button == PointerEventButton.left && ev.kind == PointerEventKind.down {
                                             root.activate-pane(true);
-                                            r-flick.viewport-x = Math.clamp(
+                                            root.right-scroll-x = Math.clamp(
                                                 -((self.mouse-x - r-hthumb.width / 2) / Math.max(1px, self.width - r-hthumb.width))
-                                                    * (r-flick.viewport-width - r-flick.width),
-                                                Math.min(0px, r-flick.width - r-flick.viewport-width),
+                                                    * (r-viewport.content-width - r-viewport.width),
+                                                Math.min(0px, r-viewport.width - r-viewport.content-width),
                                                 0px
                                             );
                                         }
                                     }
                                     moved => {
                                         if self.pressed {
-                                            r-flick.viewport-x = Math.clamp(
+                                            root.right-scroll-x = Math.clamp(
                                                 -((self.mouse-x - r-hthumb.width / 2) / Math.max(1px, self.width - r-hthumb.width))
-                                                    * (r-flick.viewport-width - r-flick.width),
-                                                Math.min(0px, r-flick.width - r-flick.viewport-width),
+                                                    * (r-viewport.content-width - r-viewport.width),
+                                                Math.min(0px, r-viewport.width - r-viewport.content-width),
                                                 0px
                                             );
                                         }
