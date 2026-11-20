@@ -36,13 +36,15 @@ rm -rf /Applications/Manifold.app && mv /tmp/Manifold.app /Applications/
 open /Applications/Manifold.app
 ```
 
-**Homebrew Tap:**
+**Homebrew:**
 ```bash
-brew tap dimitribellini/manifold https://github.com/dimitribellini/manifold
+brew tap dimitribellini/tap
+brew trust --cask dimitribellini/tap/manifold
 brew install --cask manifold
 ```
+*(Replacing a manual install? Add `--force`. Future updates: `brew upgrade --cask manifold`.)*
 
-> **macOS Gatekeeper Note:** Manifold is currently ad-hoc signed without an Apple Developer ID. If you download the `.tar.gz` via a web browser and macOS shows *"Apple could not verify 'Manifold' is free of malware"*, click **Done**, then open **System Settings → Privacy & Security → Open Anyway**, or install using the Terminal `curl` command above.
+> **macOS Gatekeeper Note:** Manifold is ad-hoc signed (no Apple Developer ID yet). If macOS shows *"Apple could not verify 'Manifold'"*, click **Done**, then open **System Settings → Privacy & Security → Open Anyway**, or install using the Terminal `curl` command above.
 
 ### Linux (x86_64 AppImage)
 ```bash
