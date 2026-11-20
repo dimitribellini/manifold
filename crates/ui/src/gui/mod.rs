@@ -387,6 +387,8 @@ struct GuiRuntime {
     latest_update: Option<ReleaseUpdateInfo>,
     update_checking: bool,
     update_command_copied: bool,
+    update_status_kind: String,
+    update_status_text: String,
 }
 
 impl GuiRuntime {
@@ -606,6 +608,8 @@ impl GuiRuntime {
             latest_update: None,
             update_checking: false,
             update_command_copied: false,
+            update_status_kind: String::new(),
+            update_status_text: String::new(),
         };
         runtime.reload_pane_entries(false);
         runtime.reload_pane_entries(true);
@@ -5009,10 +5013,22 @@ fn build_icon_triples(rows: &[FileRowSlint], virtual_top: usize) -> Vec<IconGrid
 
 fn sync_update_info_to_window(w: &ManifoldWindow, rt: &GuiRuntime) {
     let hint = build_update_hint_for_os(std::env::consts::OS);
+    let status_kind = if rt.update_checking {
+        "checking"
+    } else {
+        rt.update_status_kind.as_str()
+    };
+    let status_text = if rt.update_checking {
+        "Contacting GitHub Releases…"
+    } else {
+        rt.update_status_text.as_str()
+    };
     let info = match &rt.latest_update {
         Some(u) => UpdateInfoSlint {
             available: true,
             checking: rt.update_checking,
+            status_kind: status_kind.into(),
+            status_text: status_text.into(),
             latest_version: u.display_version.clone().into(),
             notes: u.notes.clone().into(),
             command: u.upgrade_command.clone().into(),
@@ -5022,6 +5038,8 @@ fn sync_update_info_to_window(w: &ManifoldWindow, rt: &GuiRuntime) {
         None => UpdateInfoSlint {
             available: false,
             checking: rt.update_checking,
+            status_kind: status_kind.into(),
+            status_text: status_text.into(),
             latest_version: SharedString::default(),
             notes: SharedString::default(),
             command: SharedString::default(),
@@ -5037,6 +5055,9 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
     let window = ManifoldWindow::new().map_err(|e| e.to_string())?;
     window.set_app_version_label(current_app_version_label().into());
     let rt = Rc::new(RefCell::new(GuiRuntime::new(initial_state)));
+    if std::env::var_os("MANIFOLD_DISABLE_UPDATE_CHECK").as_deref() != Some("1".as_ref()) {
+        rt.borrow_mut().update_checking = true;
+    }
     sync_update_info_to_window(&window, &rt.borrow());
     spawn_update_check(rt.borrow().update_tx.clone(), false);
 
@@ -5048,20 +5069,27 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
             let mut guard = rt.borrow_mut();
             match action.as_str() {
                 "check" => {
-                    if guard.update_checking {
-                        return;
+                    guard.update_command_copied = false;
+                    if !guard.update_checking {
+                        guard.update_checking = true;
+                        guard.update_status_kind = "checking".to_string();
+                        guard.update_status_text = "Contacting GitHub Releases…".to_string();
+                        let tx = guard.update_tx.clone();
+                        spawn_update_check(tx, true);
                     }
-                    guard.update_checking = true;
                     if let Some(w) = win_weak.upgrade() {
                         sync_update_info_to_window(&w, &guard);
+                        w.set_show_app_menu(false);
+                        w.set_show_about_modal(false);
+                        w.set_show_update_modal(true);
                     }
-                    let tx = guard.update_tx.clone();
-                    spawn_update_check(tx, true);
                 }
                 "open_modal" => {
                     guard.update_command_copied = false;
                     if let Some(w) = win_weak.upgrade() {
                         sync_update_info_to_window(&w, &guard);
+                        w.set_show_app_menu(false);
+                        w.set_show_about_modal(false);
                         w.set_show_update_modal(true);
                     }
                 }
@@ -8803,6 +8831,9 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                         let log_msg =
                             format!("[UPDATE] Available: {} ({})", info.tag_name, info.html_url);
                         guard.logs.push(log_msg);
+                        guard.update_status_kind = "available".to_string();
+                        guard.update_status_text =
+                            format!("Manifold {} is available.", info.display_version);
                         guard.latest_update = Some(info);
                         if upd_ev.manual {
                             guard.update_command_copied = false;
@@ -8813,21 +8844,33 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                         }
                     }
                     UpdateCheckResult::UpToDate { current, latest } => {
+                        guard.latest_update = None;
+                        guard.update_status_kind = "up_to_date".to_string();
+                        let head = format!(
+                            "You are already running the latest version of Manifold ({current}"
+                        );
+                        guard.update_status_text =
+                            format!("{head}; latest GitHub release: {latest}).");
                         sync_update_info_to_window(&w, &guard);
-                        if upd_ev.manual {
-                            let msg = format!("Manifold {current} is up to date ({latest}).");
+                        if upd_ev.manual && !w.get_show_update_modal() {
+                            let msg = guard.update_status_text.clone();
                             guard.show_toast("success", msg);
                             w.set_status_banner_text(guard.status_banner_text.as_str().into());
                             w.set_status_banner_is_error(guard.status_banner_is_error);
                         }
                     }
                     UpdateCheckResult::Failed(err) => {
+                        guard.update_status_kind = "error".to_string();
+                        guard.update_status_text = format!("Could not check for updates: {err}");
                         sync_update_info_to_window(&w, &guard);
                         if upd_ev.manual {
                             guard.logs.push(format!("[UPDATE_ERR] {err}"));
-                            guard.show_toast("error", format!("Update check failed: {err}"));
-                            w.set_status_banner_text(guard.status_banner_text.as_str().into());
-                            w.set_status_banner_is_error(guard.status_banner_is_error);
+                            if !w.get_show_update_modal() {
+                                let msg = guard.update_status_text.clone();
+                                guard.show_toast("error", msg);
+                                w.set_status_banner_text(guard.status_banner_text.as_str().into());
+                                w.set_status_banner_is_error(guard.status_banner_is_error);
+                            }
                         }
                     }
                 }

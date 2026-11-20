@@ -38,7 +38,7 @@ open /Applications/Manifold.app
 
 **Homebrew Tap:**
 ```bash
-brew tap dimitribellini/tap
+brew tap dimitribellini/manifold https://github.com/dimitribellini/manifold
 brew install --cask manifold
 ```
 

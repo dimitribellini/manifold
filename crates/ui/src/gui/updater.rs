@@ -173,6 +173,60 @@ pub(super) fn parse_github_latest_release_json(
     }))
 }
 
+pub(super) fn parse_release_tag_from_redirect_url(url: &str) -> Option<String> {
+    let prefix = "https://github.com/dimitribellini/manifold/releases/tag/";
+    let rest = url.trim().strip_prefix(prefix)?;
+    let tag = rest.split(['?', '#', '/']).next().unwrap_or("").trim();
+    if tag.is_empty() {
+        None
+    } else {
+        Some(tag.to_string())
+    }
+}
+
+fn check_latest_release_via_redirect(
+    curl_bin: &str,
+    cur_ver: &str,
+    os: &str,
+) -> Option<UpdateCheckResult> {
+    let null_sink = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    let out = Command::new(curl_bin)
+        .args([
+            "-fsSL",
+            "--connect-timeout",
+            "5",
+            "--max-time",
+            "10",
+            "-o",
+            null_sink,
+            "-w",
+            "%{url_effective}",
+            GITHUB_RELEASES_FALLBACK_URL,
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let eff_url = String::from_utf8_lossy(&out.stdout);
+    let tag = parse_release_tag_from_redirect_url(&eff_url)?;
+    let display_version = format_app_version_label(&tag);
+    if !is_newer_version(cur_ver, &tag) {
+        return Some(UpdateCheckResult::UpToDate {
+            current: format_app_version_label(cur_ver),
+            latest: display_version,
+        });
+    }
+    Some(UpdateCheckResult::UpdateAvailable(ReleaseUpdateInfo {
+        html_url: format!("https://github.com/dimitribellini/manifold/releases/tag/{tag}"),
+        tag_name: tag,
+        display_version,
+        notes: format_release_notes(""),
+        upgrade_command: build_upgrade_command_for_os(os),
+    }))
+}
+
 pub(super) fn spawn_update_check(tx: mpsc::Sender<UpdateCheckEvent>, manual: bool) {
     if !manual && std::env::var_os("MANIFOLD_DISABLE_UPDATE_CHECK").as_deref() == Some("1".as_ref())
     {
@@ -181,14 +235,20 @@ pub(super) fn spawn_update_check(tx: mpsc::Sender<UpdateCheckEvent>, manual: boo
     std::thread::spawn(move || {
         let cur_ver = option_env!("APP_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"));
         let os = std::env::consts::OS;
-        let curl_bin = if cfg!(windows) { "curl.exe" } else { "curl" };
+        let curl_bin = if cfg!(windows) {
+            "curl.exe"
+        } else if cfg!(target_os = "macos") {
+            "/usr/bin/curl"
+        } else {
+            "curl"
+        };
         let output = Command::new(curl_bin)
             .args([
                 "-fsSL",
                 "--connect-timeout",
-                "4",
+                "5",
                 "--max-time",
-                "8",
+                "10",
                 "-H",
                 "Accept: application/vnd.github+json",
                 "-H",
@@ -200,8 +260,10 @@ pub(super) fn spawn_update_check(tx: mpsc::Sender<UpdateCheckEvent>, manual: boo
         let result = match output {
             Ok(out) if out.status.success() => {
                 let body = String::from_utf8_lossy(&out.stdout);
-                parse_github_latest_release_json(&body, cur_ver, os)
-                    .unwrap_or_else(UpdateCheckResult::Failed)
+                parse_github_latest_release_json(&body, cur_ver, os).unwrap_or_else(|err| {
+                    check_latest_release_via_redirect(curl_bin, cur_ver, os)
+                        .unwrap_or(UpdateCheckResult::Failed(err))
+                })
             }
             Ok(out) => {
                 let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
@@ -210,9 +272,11 @@ pub(super) fn spawn_update_check(tx: mpsc::Sender<UpdateCheckEvent>, manual: boo
                 } else {
                     err
                 };
-                UpdateCheckResult::Failed(msg)
+                check_latest_release_via_redirect(curl_bin, cur_ver, os)
+                    .unwrap_or(UpdateCheckResult::Failed(msg))
             }
-            Err(err) => UpdateCheckResult::Failed(format!("curl unavailable: {err}")),
+            Err(err) => check_latest_release_via_redirect(curl_bin, cur_ver, os)
+                .unwrap_or_else(|| UpdateCheckResult::Failed(format!("curl unavailable: {err}"))),
         };
         let _ = tx.send(UpdateCheckEvent { manual, result });
     });

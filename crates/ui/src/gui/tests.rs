@@ -1076,6 +1076,27 @@ fn test_update_semver_comparison_and_github_release_parser() {
     }"#;
     let res4 = parse_github_latest_release_json(draft_json, "0.7.5", "macos").unwrap();
     assert!(matches!(res4, UpdateCheckResult::UpToDate { .. }));
+
+    assert_eq!(
+        parse_release_tag_from_redirect_url(
+            "https://github.com/dimitribellini/manifold/releases/tag/v0.7.6"
+        ),
+        Some("v0.7.6".to_string())
+    );
+    assert_eq!(
+        parse_release_tag_from_redirect_url(
+            "https://github.com/dimitribellini/manifold/releases/tag/v0.7.7?foo=1"
+        ),
+        Some("v0.7.7".to_string())
+    );
+    assert_eq!(
+        parse_release_tag_from_redirect_url("https://github.com/dimitribellini/manifold/releases"),
+        None
+    );
+    assert_eq!(
+        parse_release_tag_from_redirect_url("https://evil.example.com/releases/tag/v9.9.9"),
+        None
+    );
 }
 
 #[test]
