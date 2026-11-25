@@ -57,6 +57,8 @@ export component ManifoldWindow inherits Window {
     private property <bool> col-down-cmd: false;
     private property <bool> col-drag-active: false;
     private property <bool> col-suppress-click: false;
+    private property <bool> col-drag-force-move: false;
+    private property <bool> col-drag-force-copy: false;
 
     // Theme & Typography Preferences (Manifold Main Menu -> Preferences)
     in-out property <string> theme-name: "Dark Zinc";
@@ -113,6 +115,8 @@ export component ManifoldWindow inherits Window {
     in-out property <string> right-filter-query: "";
     in-out property <bool> left-search-running: false;
     in-out property <bool> right-search-running: false;
+    in-out property <bool> left-dir-loading: false;
+    in-out property <bool> right-dir-loading: false;
     in-out property <int> left-virtual-top-row: 0;
     in-out property <int> left-total-rows: 0;
     in-out property <length> left-sub-row-offset: 4px;
@@ -288,6 +292,7 @@ export component ManifoldWindow inherits Window {
     in-out property <length> drag-ghost-y: 0px;
     in-out property <string> drag-ghost-label: "";
     in-out property <string> drag-target-hint: "";
+    in-out property <bool> drag-is-move: false;
     in-out property <int> drag-hover-sidebar-idx: -1;
     in-out property <int> drag-hover-left-tab: -1;
     in-out property <int> drag-hover-right-tab: -1;
@@ -401,6 +406,7 @@ export component ManifoldWindow inherits Window {
     in-out property <bool> context-can-show-enclosing: false;
     in-out property <bool> context-is-blank: false;
     in-out property <int> context-selected-count: 1;
+    in-out property <[OpenWithAppSlint]> context-open-with-apps: [];
     in-out property <bool> current-folder-is-favorite: false;
 
     // Sidebar Object Right-Click Context Menu (Devices / Connections / Favorites)
@@ -419,9 +425,13 @@ export component ManifoldWindow inherits Window {
     in-out property <bool> show-open-with-modal: false;
     in-out property <string> open-with-target-name: "";
     in-out property <string> open-with-target-path: "";
+    in-out property <string> open-with-target-ext: "";
     in-out property <[OpenWithAppSlint]> open-with-apps: [];
     in-out property <int> open-with-selected-idx: 0;
     in-out property <string> open-with-custom-cmd: "";
+    in-out property <string> open-with-filter: "";
+    in-out property <bool> open-with-always-use: false;
+    in-out property <bool> open-with-has-custom-default: false;
 
     in-out property <bool> has-clipboard-item: false;
     in-out property <string> status-banner-text: "";
@@ -534,18 +544,21 @@ export component ManifoldWindow inherits Window {
     callback shift-drag-select(bool, int);
     callback open-file-row(bool, int);
     callback toggle-expand-folder(bool, int);
-    callback update-drag-cursor(bool, int, length, length);
-    callback finish-drag-drop(bool, int, length, length);
+    callback update-drag-cursor(bool, int, length, length, bool, bool);
+    callback finish-drag-drop(bool, int, length, length, bool, bool);
     callback drag-drop-row-to-other-pane(bool, int);
     callback drop-row-on-tab(bool, int, bool, int);
     callback open-context-menu-for-row(bool, int, length, length);
     callback open-blank-context-menu(bool, length, length);
     callback execute-context-action(string);
+    callback open-with-quick-app(string);
     callback open-new-folder-modal();
     callback open-new-file-modal();
     callback open-rename-modal();
     callback confirm-input-modal(string);
-    callback confirm-open-with(string);
+    callback confirm-open-with(string, bool);
+    callback filter-open-with-apps(string);
+    callback reset-open-with-default();
     callback delete-selected-item();
     callback permanent-delete-selected-item();
     callback confirm-delete-modal();
@@ -1722,10 +1735,12 @@ export component ManifoldWindow inherits Window {
                                         padding-left: 4px;
                                         alignment: start;
                                         Text {
-                                            text: root.left-search-running && root.left-filter-query != ""
-                                                ? ("Searching subfolders… • " + root.left-status-subtitle)
-                                                : root.left-status-subtitle;
-                                            color: root.left-search-running && root.left-filter-query != "" ? #6E92B8 : #8E8E98;
+                                            text: root.left-dir-loading
+                                                ? ("Loading folder… • " + root.left-status-subtitle)
+                                                : (root.left-search-running && root.left-filter-query != ""
+                                                    ? ("Searching subfolders… • " + root.left-status-subtitle)
+                                                    : root.left-status-subtitle);
+                                            color: (root.left-dir-loading || (root.left-search-running && root.left-filter-query != "")) ? #6E92B8 : #8E8E98;
                                             font-size: 12px + root.font-size-delta * 0.75;
                                             font-weight: 500;
                                             vertical-alignment: center;
@@ -2144,34 +2159,40 @@ export component ManifoldWindow inherits Window {
                                                     x: 12px;
                                                     y: 12px;
                                                     icon-size: 24px;
-                                                    kind: root.left-filter-query != "" ? "search" : "folder";
+                                                    kind: root.left-dir-loading
+                                                        ? "refresh"
+                                                        : (root.left-filter-query != "" ? "search" : "folder");
                                                     icon-color: #38B6FF;
-                                                    fill-color: root.left-filter-query != "" ? transparent : #4CC2FF55;
+                                                    fill-color: (root.left-dir-loading || root.left-filter-query != "") ? transparent : #4CC2FF55;
                                                 }
                                             }
                                         }
                                         Text {
-                                            text: root.left-filter-query != ""
-                                                ? (root.left-search-running
-                                                    ? "Searching subfolders…"
-                                                    : "No matching items found")
-                                                : "Folder is Empty";
+                                            text: root.left-dir-loading
+                                                ? "Loading folder…"
+                                                : (root.left-filter-query != ""
+                                                    ? (root.left-search-running
+                                                        ? "Searching subfolders…"
+                                                        : "No matching items found")
+                                                    : "Folder is Empty");
                                             color: root.theme-text-primary;
                                             font-size: 13.5px + root.font-size-delta;
                                             font-weight: 700;
                                             horizontal-alignment: center;
                                         }
                                         Text {
-                                            text: root.left-filter-query != ""
-                                                ? (root.left-search-running
-                                                    ? "Scanning downstream directories for matching files and folders…"
-                                                    : ("No files or folders matched \"" + root.left-filter-query + "\" in this directory or its subfolders."))
-                                                : "Click anywhere or use the actions below to create items or paste.";
+                                            text: root.left-dir-loading
+                                                ? "Reading directory contents in the background…"
+                                                : (root.left-filter-query != ""
+                                                    ? (root.left-search-running
+                                                        ? "Scanning downstream directories for matching files and folders…"
+                                                        : ("No files or folders matched \"" + root.left-filter-query + "\" in this directory or its subfolders."))
+                                                    : "Click anywhere or use the actions below to create items or paste.");
                                             color: root.theme-text-muted;
                                             font-size: 11.5px + root.font-size-delta;
                                             horizontal-alignment: center;
                                         }
-                                        HorizontalLayout {
+                                        if !root.left-dir-loading : HorizontalLayout {
                                             alignment: center;
                                             spacing: 8px;
                                             if root.left-filter-query != "" : ToolbarButton {
@@ -2297,13 +2318,13 @@ export component ManifoldWindow inherits Window {
                                                     root.left-virtual-top-row + r-idx + Math.round((my - 14px) / (29px + Math.max(0px, root.font-size-delta * 2.0)))
                                                 );
                                             }
-                                            row-drag-moved(abs_x, abs_y) => {
+                                            row-drag-moved(abs_x, abs_y, fm, fc) => {
                                                 root.drag-left-pane-w = l-viewport.width;
-                                                root.update-drag-cursor(false, root.left-virtual-top-row + r-idx, abs_x, abs_y);
+                                                root.update-drag-cursor(false, root.left-virtual-top-row + r-idx, abs_x, abs_y, fm, fc);
                                             }
-                                            row-drag-ended(abs_x, abs_y) => {
+                                            row-drag-ended(abs_x, abs_y, fm, fc) => {
                                                 root.drag-left-pane-w = l-viewport.width;
-                                                root.finish-drag-drop(false, root.left-virtual-top-row + r-idx, abs_x, abs_y);
+                                                root.finish-drag-drop(false, root.left-virtual-top-row + r-idx, abs_x, abs_y, fm, fc);
                                             }
                                             row-drag-to-other-pane => {
                                                 if root.dual-pane-mode {
@@ -2365,13 +2386,13 @@ export component ManifoldWindow inherits Window {
                                                 }
                                                 cell-hovered(abs_x, abs_y) => { root.hover-file-row(false, triple.idx-0, abs_x, abs_y); }
                                                 cell-unhovered => { root.hover-leave-file-row(false, triple.idx-0); }
-                                                cell-drag-moved(abs_x, abs_y) => {
+                                                cell-drag-moved(abs_x, abs_y, fm, fc) => {
                                                     root.drag-left-pane-w = l-viewport.width;
-                                                    root.update-drag-cursor(false, triple.idx-0, abs_x, abs_y);
+                                                    root.update-drag-cursor(false, triple.idx-0, abs_x, abs_y, fm, fc);
                                                 }
-                                                cell-drag-ended(abs_x, abs_y) => {
+                                                cell-drag-ended(abs_x, abs_y, fm, fc) => {
                                                     root.drag-left-pane-w = l-viewport.width;
-                                                    root.finish-drag-drop(false, triple.idx-0, abs_x, abs_y);
+                                                    root.finish-drag-drop(false, triple.idx-0, abs_x, abs_y, fm, fc);
                                                 }
                                                 wheel-scroll(dx, dy) => {
                                                     root.scroll-pane-by-delta(
@@ -2406,13 +2427,13 @@ export component ManifoldWindow inherits Window {
                                                 }
                                                 cell-hovered(abs_x, abs_y) => { root.hover-file-row(false, triple.idx-1, abs_x, abs_y); }
                                                 cell-unhovered => { root.hover-leave-file-row(false, triple.idx-1); }
-                                                cell-drag-moved(abs_x, abs_y) => {
+                                                cell-drag-moved(abs_x, abs_y, fm, fc) => {
                                                     root.drag-left-pane-w = l-viewport.width;
-                                                    root.update-drag-cursor(false, triple.idx-1, abs_x, abs_y);
+                                                    root.update-drag-cursor(false, triple.idx-1, abs_x, abs_y, fm, fc);
                                                 }
-                                                cell-drag-ended(abs_x, abs_y) => {
+                                                cell-drag-ended(abs_x, abs_y, fm, fc) => {
                                                     root.drag-left-pane-w = l-viewport.width;
-                                                    root.finish-drag-drop(false, triple.idx-1, abs_x, abs_y);
+                                                    root.finish-drag-drop(false, triple.idx-1, abs_x, abs_y, fm, fc);
                                                 }
                                                 wheel-scroll(dx, dy) => {
                                                     root.scroll-pane-by-delta(
@@ -2447,13 +2468,13 @@ export component ManifoldWindow inherits Window {
                                                 }
                                                 cell-hovered(abs_x, abs_y) => { root.hover-file-row(false, triple.idx-2, abs_x, abs_y); }
                                                 cell-unhovered => { root.hover-leave-file-row(false, triple.idx-2); }
-                                                cell-drag-moved(abs_x, abs_y) => {
+                                                cell-drag-moved(abs_x, abs_y, fm, fc) => {
                                                     root.drag-left-pane-w = l-viewport.width;
-                                                    root.update-drag-cursor(false, triple.idx-2, abs_x, abs_y);
+                                                    root.update-drag-cursor(false, triple.idx-2, abs_x, abs_y, fm, fc);
                                                 }
-                                                cell-drag-ended(abs_x, abs_y) => {
+                                                cell-drag-ended(abs_x, abs_y, fm, fc) => {
                                                     root.drag-left-pane-w = l-viewport.width;
-                                                    root.finish-drag-drop(false, triple.idx-2, abs_x, abs_y);
+                                                    root.finish-drag-drop(false, triple.idx-2, abs_x, abs_y, fm, fc);
                                                 }
                                                 wheel-scroll(dx, dy) => {
                                                     root.scroll-pane-by-delta(
@@ -2748,7 +2769,7 @@ export component ManifoldWindow inherits Window {
                                                         root.open-file-row(false, root.left-virtual-top-row + c-idx);
                                                     }
                                                     moved => {
-                                                        if self.pressed && !root.col-down-shift && !root.col-down-cmd && (Math.abs(self.mouse-x - self.pressed-x) > 14px || Math.abs(self.mouse-y - self.pressed-y) > 14px) {
+                                                        if self.pressed && !root.col-down-shift && (Math.abs(self.mouse-x - self.pressed-x) > 14px || Math.abs(self.mouse-y - self.pressed-y) > 14px) {
                                                             root.show-hover-preview = false;
                                                             root.col-drag-active = true;
                                                             root.col-suppress-click = true;
@@ -2757,7 +2778,9 @@ export component ManifoldWindow inherits Window {
                                                                 false,
                                                                 root.left-virtual-top-row + c-idx,
                                                                 self.absolute-position.x + self.mouse-x,
-                                                                self.absolute-position.y + self.mouse-y
+                                                                self.absolute-position.y + self.mouse-y,
+                                                                root.col-drag-force-move,
+                                                                root.col-drag-force-copy
                                                             );
                                                         }
                                                     }
@@ -2782,11 +2805,17 @@ export component ManifoldWindow inherits Window {
                                                                 self.absolute-position.y + self.mouse-y
                                                             );
                                                         }
+                                                        if ev.kind == PointerEventKind.move && self.pressed {
+                                                            root.col-drag-force-move = ev.modifiers.control || ev.modifiers.meta;
+                                                            root.col-drag-force-copy = ev.modifiers.alt;
+                                                        }
                                                         if ev.button == PointerEventButton.left && ev.kind == PointerEventKind.down {
                                                             root.show-hover-preview = false;
                                                             key-router.focus();
                                                             root.col-down-shift = ev.modifiers.shift;
                                                             root.col-down-cmd = ev.modifiers.control || ev.modifiers.meta;
+                                                            root.col-drag-force-move = root.col-down-cmd;
+                                                            root.col-drag-force-copy = ev.modifiers.alt;
                                                             root.col-drag-active = false;
                                                             root.col-suppress-click = false;
                                                         }
@@ -2794,17 +2823,23 @@ export component ManifoldWindow inherits Window {
                                                             if root.col-drag-active {
                                                                 root.col-drag-active = false;
                                                                 root.drag-left-pane-w = l-viewport.width;
+                                                                root.col-drag-force-move = ev.modifiers.control || ev.modifiers.meta;
+                                                                root.col-drag-force-copy = ev.modifiers.alt;
                                                                 root.finish-drag-drop(
                                                                     false,
                                                                     root.left-virtual-top-row + c-idx,
                                                                     self.absolute-position.x + self.mouse-x,
-                                                                    self.absolute-position.y + self.mouse-y
+                                                                    self.absolute-position.y + self.mouse-y,
+                                                                    root.col-drag-force-move,
+                                                                    root.col-drag-force-copy
                                                                 );
                                                             }
                                                             if ev.kind == PointerEventKind.cancel {
                                                                 root.col-suppress-click = false;
                                                                 root.col-down-shift = false;
                                                                 root.col-down-cmd = false;
+                                                                root.col-drag-force-move = false;
+                                                                root.col-drag-force-copy = false;
                                                             }
                                                         }
                                                         if ev.button == PointerEventButton.right && ev.kind == PointerEventKind.down {
@@ -3560,10 +3595,12 @@ export component ManifoldWindow inherits Window {
                                         padding-left: 4px;
                                         alignment: start;
                                         Text {
-                                            text: root.right-search-running && root.right-filter-query != ""
-                                                ? ("Searching subfolders… • " + root.right-status-subtitle)
-                                                : root.right-status-subtitle;
-                                            color: root.right-search-running && root.right-filter-query != "" ? #6E92B8 : #8E8E98;
+                                            text: root.right-dir-loading
+                                                ? ("Loading folder… • " + root.right-status-subtitle)
+                                                : (root.right-search-running && root.right-filter-query != ""
+                                                    ? ("Searching subfolders… • " + root.right-status-subtitle)
+                                                    : root.right-status-subtitle);
+                                            color: (root.right-dir-loading || (root.right-search-running && root.right-filter-query != "")) ? #6E92B8 : #8E8E98;
                                             font-size: 12px + root.font-size-delta * 0.75;
                                             font-weight: 500;
                                             vertical-alignment: center;
@@ -3959,15 +3996,19 @@ export component ManifoldWindow inherits Window {
                                         LucideIcon {
                                             y: (parent.height - self.height) / 2;
                                             icon-size: 16px;
-                                            kind: root.right-filter-query != "" ? "search" : "folder";
+                                            kind: root.right-dir-loading
+                                                ? "refresh"
+                                                : (root.right-filter-query != "" ? "search" : "folder");
                                             icon-color: root.theme-text-secondary;
                                         }
                                         Text {
-                                            text: root.right-filter-query != ""
-                                                ? (root.right-search-running
-                                                    ? "Searching subfolders…"
-                                                    : "No matching items found")
-                                                : "Folder is empty — Click to create or paste";
+                                            text: root.right-dir-loading
+                                                ? "Loading folder in the background…"
+                                                : (root.right-filter-query != ""
+                                                    ? (root.right-search-running
+                                                        ? "Searching subfolders…"
+                                                        : "No matching items found")
+                                                    : "Folder is empty — Click to create or paste");
                                             color: root.theme-text-secondary;
                                             font-size: 12px + root.ui-font-size-delta * 1px;
                                             font-family: root.ui-font-family;
@@ -3976,7 +4017,7 @@ export component ManifoldWindow inherits Window {
                                         }
                                     }
 
-                                    HorizontalLayout {
+                                    if !root.right-dir-loading : HorizontalLayout {
                                         spacing: 8px;
                                         alignment: center;
 
@@ -4137,13 +4178,13 @@ export component ManifoldWindow inherits Window {
                                             row-shift-drag(my) => {
                                                 root.shift-drag-select(true, root.right-virtual-top-row + r-idx + Math.round((my - 13px) / 27px));
                                             }
-                                            row-drag-moved(abs_x, abs_y) => {
+                                            row-drag-moved(abs_x, abs_y, fm, fc) => {
                                                 root.drag-left-pane-w = l-viewport.width;
-                                                root.update-drag-cursor(true, root.right-virtual-top-row + r-idx, abs_x, abs_y);
+                                                root.update-drag-cursor(true, root.right-virtual-top-row + r-idx, abs_x, abs_y, fm, fc);
                                             }
-                                            row-drag-ended(abs_x, abs_y) => {
+                                            row-drag-ended(abs_x, abs_y, fm, fc) => {
                                                 root.drag-left-pane-w = l-viewport.width;
-                                                root.finish-drag-drop(true, root.right-virtual-top-row + r-idx, abs_x, abs_y);
+                                                root.finish-drag-drop(true, root.right-virtual-top-row + r-idx, abs_x, abs_y, fm, fc);
                                             }
                                             row-drag-to-other-pane => {
                                                 root.drag-drop-row-to-other-pane(true, root.right-virtual-top-row + r-idx);
@@ -4210,13 +4251,13 @@ export component ManifoldWindow inherits Window {
                                                 cell-unhovered => {
                                                     root.hover-leave-file-row(true, triple.idx-0);
                                                 }
-                                                cell-drag-moved(abs_x, abs_y) => {
+                                                cell-drag-moved(abs_x, abs_y, fm, fc) => {
                                                     root.drag-left-pane-w = l-viewport.width;
-                                                    root.update-drag-cursor(true, triple.idx-0, abs_x, abs_y);
+                                                    root.update-drag-cursor(true, triple.idx-0, abs_x, abs_y, fm, fc);
                                                 }
-                                                cell-drag-ended(abs_x, abs_y) => {
+                                                cell-drag-ended(abs_x, abs_y, fm, fc) => {
                                                     root.drag-left-pane-w = l-viewport.width;
-                                                    root.finish-drag-drop(true, triple.idx-0, abs_x, abs_y);
+                                                    root.finish-drag-drop(true, triple.idx-0, abs_x, abs_y, fm, fc);
                                                 }
                                                 wheel-scroll(dx, dy) => {
                                                     root.show-hover-preview = false;
@@ -4259,13 +4300,13 @@ export component ManifoldWindow inherits Window {
                                                 cell-unhovered => {
                                                     root.hover-leave-file-row(true, triple.idx-1);
                                                 }
-                                                cell-drag-moved(abs_x, abs_y) => {
+                                                cell-drag-moved(abs_x, abs_y, fm, fc) => {
                                                     root.drag-left-pane-w = l-viewport.width;
-                                                    root.update-drag-cursor(true, triple.idx-1, abs_x, abs_y);
+                                                    root.update-drag-cursor(true, triple.idx-1, abs_x, abs_y, fm, fc);
                                                 }
-                                                cell-drag-ended(abs_x, abs_y) => {
+                                                cell-drag-ended(abs_x, abs_y, fm, fc) => {
                                                     root.drag-left-pane-w = l-viewport.width;
-                                                    root.finish-drag-drop(true, triple.idx-1, abs_x, abs_y);
+                                                    root.finish-drag-drop(true, triple.idx-1, abs_x, abs_y, fm, fc);
                                                 }
                                                 wheel-scroll(dx, dy) => {
                                                     root.show-hover-preview = false;
@@ -4308,13 +4349,13 @@ export component ManifoldWindow inherits Window {
                                                 cell-unhovered => {
                                                     root.hover-leave-file-row(true, triple.idx-2);
                                                 }
-                                                cell-drag-moved(abs_x, abs_y) => {
+                                                cell-drag-moved(abs_x, abs_y, fm, fc) => {
                                                     root.drag-left-pane-w = l-viewport.width;
-                                                    root.update-drag-cursor(true, triple.idx-2, abs_x, abs_y);
+                                                    root.update-drag-cursor(true, triple.idx-2, abs_x, abs_y, fm, fc);
                                                 }
-                                                cell-drag-ended(abs_x, abs_y) => {
+                                                cell-drag-ended(abs_x, abs_y, fm, fc) => {
                                                     root.drag-left-pane-w = l-viewport.width;
-                                                    root.finish-drag-drop(true, triple.idx-2, abs_x, abs_y);
+                                                    root.finish-drag-drop(true, triple.idx-2, abs_x, abs_y, fm, fc);
                                                 }
                                                 wheel-scroll(dx, dy) => {
                                                     root.show-hover-preview = false;
@@ -4611,7 +4652,7 @@ export component ManifoldWindow inherits Window {
                                                         root.open-file-row(true, root.right-virtual-top-row + c-idx);
                                                     }
                                                     moved => {
-                                                        if self.pressed && !root.col-down-shift && !root.col-down-cmd && (Math.abs(self.mouse-x - self.pressed-x) > 14px || Math.abs(self.mouse-y - self.pressed-y) > 14px) {
+                                                        if self.pressed && !root.col-down-shift && (Math.abs(self.mouse-x - self.pressed-x) > 14px || Math.abs(self.mouse-y - self.pressed-y) > 14px) {
                                                             root.show-hover-preview = false;
                                                             root.col-drag-active = true;
                                                             root.col-suppress-click = true;
@@ -4620,7 +4661,9 @@ export component ManifoldWindow inherits Window {
                                                                 true,
                                                                 root.right-virtual-top-row + c-idx,
                                                                 self.absolute-position.x + self.mouse-x,
-                                                                self.absolute-position.y + self.mouse-y
+                                                                self.absolute-position.y + self.mouse-y,
+                                                                root.col-drag-force-move,
+                                                                root.col-drag-force-copy
                                                             );
                                                         }
                                                     }
@@ -4645,11 +4688,17 @@ export component ManifoldWindow inherits Window {
                                                                 self.absolute-position.y + self.mouse-y
                                                             );
                                                         }
+                                                        if ev.kind == PointerEventKind.move && self.pressed {
+                                                            root.col-drag-force-move = ev.modifiers.control || ev.modifiers.meta;
+                                                            root.col-drag-force-copy = ev.modifiers.alt;
+                                                        }
                                                         if ev.button == PointerEventButton.left && ev.kind == PointerEventKind.down {
                                                             root.show-hover-preview = false;
                                                             key-router.focus();
                                                             root.col-down-shift = ev.modifiers.shift;
                                                             root.col-down-cmd = ev.modifiers.control || ev.modifiers.meta;
+                                                            root.col-drag-force-move = root.col-down-cmd;
+                                                            root.col-drag-force-copy = ev.modifiers.alt;
                                                             root.col-drag-active = false;
                                                             root.col-suppress-click = false;
                                                         }
@@ -4657,17 +4706,23 @@ export component ManifoldWindow inherits Window {
                                                             if root.col-drag-active {
                                                                 root.col-drag-active = false;
                                                                 root.drag-left-pane-w = l-viewport.width;
+                                                                root.col-drag-force-move = ev.modifiers.control || ev.modifiers.meta;
+                                                                root.col-drag-force-copy = ev.modifiers.alt;
                                                                 root.finish-drag-drop(
                                                                     true,
                                                                     root.right-virtual-top-row + c-idx,
                                                                     self.absolute-position.x + self.mouse-x,
-                                                                    self.absolute-position.y + self.mouse-y
+                                                                    self.absolute-position.y + self.mouse-y,
+                                                                    root.col-drag-force-move,
+                                                                    root.col-drag-force-copy
                                                                 );
                                                             }
                                                             if ev.kind == PointerEventKind.cancel {
                                                                 root.col-suppress-click = false;
                                                                 root.col-down-shift = false;
                                                                 root.col-down-cmd = false;
+                                                                root.col-drag-force-move = false;
+                                                                root.col-drag-force-copy = false;
                                                             }
                                                         }
                                                         if ev.button == PointerEventButton.right && ev.kind == PointerEventKind.down {
@@ -5139,6 +5194,7 @@ export component ManifoldWindow inherits Window {
         context-is-blank: root.context-is-blank;
         context-menu-x: root.context-menu-x;
         context-menu-y: root.context-menu-y;
+        context-open-with-apps: root.context-open-with-apps;
         context-selected-count: root.context-selected-count;
         context-target-is-app-bundle: root.context-target-is-app-bundle;
         context-target-is-archive: root.context-target-is-archive;
@@ -5158,6 +5214,7 @@ export component ManifoldWindow inherits Window {
         drag-ghost-label: root.drag-ghost-label;
         drag-ghost-x: root.drag-ghost-x;
         drag-ghost-y: root.drag-ghost-y;
+        drag-is-move: root.drag-is-move;
         drag-tab-grab-offset-x: root.drag-tab-grab-offset-x;
         drag-tab-grab-offset-y: root.drag-tab-grab-offset-y;
         drag-tab-icon: root.drag-tab-icon;
@@ -5203,8 +5260,12 @@ export component ManifoldWindow inherits Window {
         is-dragging-tab: root.is-dragging-tab;
         left-pane-width: root.left-pane-width;
         open-with-apps: root.open-with-apps;
+        open-with-always-use <=> root.open-with-always-use;
         open-with-custom-cmd <=> root.open-with-custom-cmd;
+        open-with-filter <=> root.open-with-filter;
+        open-with-has-custom-default: root.open-with-has-custom-default;
         open-with-selected-idx <=> root.open-with-selected-idx;
+        open-with-target-ext: root.open-with-target-ext;
         open-with-target-name: root.open-with-target-name;
         pref-max-bandwidth-mbps: root.pref-max-bandwidth-mbps;
         preview-minion-x <=> root.preview-minion-x;
@@ -5310,11 +5371,12 @@ export component ManifoldWindow inherits Window {
         confirm-connect-dialog => { root.confirm-connect-dialog(); }
         confirm-delete-modal => { root.confirm-delete-modal(); }
         confirm-input-modal(a0) => { root.confirm-input-modal(a0); }
-        confirm-open-with(a0) => { root.confirm-open-with(a0); }
+        confirm-open-with(a0, a1) => { root.confirm-open-with(a0, a1); }
         delete-batch-rename-favorite(a0) => { root.delete-batch-rename-favorite(a0); }
         execute-context-action(a0) => { root.execute-context-action(a0); }
         execute-sidebar-context-action(a0) => { root.execute-sidebar-context-action(a0); }
         execute-sync-plan => { root.execute-sync-plan(); }
+        filter-open-with-apps(a0) => { root.filter-open-with-apps(a0); }
         focus-key-router => { key-router.focus(); }
         navigate-to-breadcrumb(a0, a1) => { root.navigate-to-breadcrumb(a0, a1); }
         open-connect-dialog => { root.open-connect-dialog(); }
@@ -5323,8 +5385,10 @@ export component ManifoldWindow inherits Window {
         open-sync-modal => { root.open-sync-modal(); }
         open-terminal => { root.open-terminal(); }
         open-terminal-here => { root.open-terminal-here(); }
+        open-with-quick-app(a0) => { root.open-with-quick-app(a0); }
         remove-batch-rename-rule(a0) => { root.remove-batch-rename-rule(a0); }
         reset-batch-rename-rules => { root.reset-batch-rename-rules(); }
+        reset-open-with-default => { root.reset-open-with-default(); }
         resolve-conflict(a0) => { root.resolve-conflict(a0); }
         save-batch-rename-favorite => { root.save-batch-rename-favorite(); }
         select-connect-color(a0) => { root.select-connect-color(a0); }

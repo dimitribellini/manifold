@@ -301,6 +301,46 @@ pub(super) fn compute_local_dir_fingerprint(dir_path: &str) -> Option<u64> {
     Some(acc ^ count.rotate_left(32))
 }
 
+pub(super) fn compute_dir_fingerprint_from_meta(entries: &[FileMetadata]) -> u64 {
+    let mut count = 0u64;
+    let mut acc = 0x9E37_79B9_7F4A_7C15_u64;
+    for entry in entries {
+        count = count.wrapping_add(1);
+        let mut h = 0xcbf2_9ce4_8422_2325_u64;
+        for &b in entry.name.as_bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+        if !entry.is_dir {
+            if let Some(sz) = entry.size {
+                h ^= sz;
+                h = h.wrapping_mul(0x0100_0000_01b3);
+            }
+        } else {
+            h ^= 0x5555_AAAA_5555_AAAA;
+        }
+        if let Some(mtime) = entry.modified {
+            if let Ok(dur) = mtime.duration_since(std::time::UNIX_EPOCH) {
+                let secs_rot = dur.as_secs().rotate_left(16);
+                let nanos = u64::from(dur.subsec_nanos());
+                h ^= secs_rot ^ nanos;
+                h = h.wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+        acc = acc.wrapping_add(h);
+    }
+    acc ^ count.rotate_left(32)
+}
+
+pub(super) fn local_dir_mtime_secs_nanos(dir_path: &str) -> Option<(u64, u32)> {
+    if split_remote_uri(dir_path).is_some() || split_archive_uri(dir_path).is_some() {
+        return None;
+    }
+    let mtime = std::fs::metadata(dir_path).ok()?.modified().ok()?;
+    let dur = mtime.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some((dur.as_secs(), dur.subsec_nanos()))
+}
+
 pub(super) fn window_logical_bounds(w: &ManifoldWindow) -> (f32, f32, f32) {
     let scale = w.window().scale_factor().max(1.0);
     let phys = w.window().size();
@@ -311,6 +351,7 @@ pub(super) fn window_logical_bounds(w: &ManifoldWindow) -> (f32, f32, f32) {
 
 pub(super) fn clear_window_drag_overlay(w: &ManifoldWindow) {
     w.set_is_dragging_row(false);
+    w.set_drag_is_move(false);
     w.set_drag_ghost_label("".into());
     w.set_drag_target_hint("".into());
     w.set_drag_hover_sidebar_idx(-1);
@@ -388,6 +429,34 @@ pub(super) fn sanitize_click_modifiers(
     is_cmd: bool,
 ) -> (bool, bool) {
     (is_shift, is_cmd)
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn query_os_drag_modifiers(
+    slint_force_move: bool,
+    slint_force_copy: bool,
+) -> (bool, bool) {
+    type MsgRetUsize = unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> usize;
+    let flags = unsafe {
+        let ev_cls = objc_getClass(c"NSEvent".as_ptr());
+        if ev_cls.is_null() {
+            return (slint_force_move, slint_force_copy);
+        }
+        let msg_usize: MsgRetUsize = std::mem::transmute(objc_msgSend as *const ());
+        msg_usize(ev_cls, sel_registerName(c"modifierFlags".as_ptr()))
+    };
+    let os_move = (flags & ((1 << 18) | (1 << 20))) != 0;
+    let os_copy = (flags & (1 << 19)) != 0;
+    let _ = (slint_force_move, slint_force_copy);
+    (os_move, os_copy)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(super) fn query_os_drag_modifiers(
+    slint_force_move: bool,
+    slint_force_copy: bool,
+) -> (bool, bool) {
+    (slint_force_move, slint_force_copy)
 }
 
 #[cfg(target_os = "macos")]

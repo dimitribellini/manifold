@@ -1070,6 +1070,8 @@ pub struct AppPreferences {
     pub max_bandwidth_mbps: u32,
     #[serde(default)]
     pub batch_rename_favorites: Vec<BatchRenameFavoritePreset>,
+    #[serde(default)]
+    pub default_open_with_apps: HashMap<String, String>,
 }
 
 impl Default for AppPreferences {
@@ -1089,6 +1091,7 @@ impl Default for AppPreferences {
             folder_view_options: HashMap::new(),
             max_bandwidth_mbps: 0,
             batch_rename_favorites: Vec::new(),
+            default_open_with_apps: HashMap::new(),
         }
     }
 }
@@ -1302,6 +1305,37 @@ impl AppPreferences {
         opts.scope = ViewOptionsScope::AllFolders;
         self.default_view_options = opts;
         self.folder_view_options.remove(&norm);
+    }
+
+    pub fn normalized_file_ext(ext: &str) -> Option<String> {
+        let cleaned = ext.trim().trim_start_matches('.').to_ascii_lowercase();
+        if cleaned.is_empty() {
+            None
+        } else {
+            Some(cleaned)
+        }
+    }
+
+    pub fn default_open_with_for_ext(&self, ext: &str) -> Option<&str> {
+        let key = Self::normalized_file_ext(ext)?;
+        self.default_open_with_apps
+            .get(&key)
+            .map(String::as_str)
+            .filter(|s| !s.trim().is_empty())
+    }
+
+    pub fn set_default_open_with_for_ext(&mut self, ext: &str, app_spec: Option<&str>) {
+        let Some(key) = Self::normalized_file_ext(ext) else {
+            return;
+        };
+        let cleaned = app_spec
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "__DEFAULT__");
+        if let Some(app) = cleaned {
+            self.default_open_with_apps.insert(key, app.to_string());
+        } else {
+            self.default_open_with_apps.remove(&key);
+        }
     }
 }
 
@@ -1568,5 +1602,32 @@ sort_direction = "ascending"
             assert_eq!(dir_mode, 0o700);
         }
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_default_open_with_apps_persistence_and_reset() {
+        let mut prefs = AppPreferences::default();
+        assert_eq!(prefs.default_open_with_for_ext(".PDF"), None);
+
+        prefs.set_default_open_with_for_ext(" .PDF ", Some("/Applications/Preview.app"));
+        prefs.set_default_open_with_for_ext("log", Some("code"));
+        assert_eq!(
+            prefs.default_open_with_for_ext("pdf"),
+            Some("/Applications/Preview.app")
+        );
+        assert_eq!(prefs.default_open_with_for_ext(".log"), Some("code"));
+
+        let raw = prefs.to_toml_string().unwrap();
+        let parsed = AppPreferences::from_toml_str(&raw).unwrap();
+        assert_eq!(
+            parsed.default_open_with_for_ext("PDF"),
+            Some("/Applications/Preview.app")
+        );
+
+        let mut cleared = parsed;
+        cleared.set_default_open_with_for_ext("pdf", Some("__DEFAULT__"));
+        assert_eq!(cleared.default_open_with_for_ext("pdf"), None);
+        cleared.set_default_open_with_for_ext("log", None);
+        assert_eq!(cleared.default_open_with_for_ext("log"), None);
     }
 }

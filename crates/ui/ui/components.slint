@@ -121,6 +121,7 @@ export struct OpenWithAppSlint {
     name: string,
     detail: string,
     icon-kind: string,
+    is-default: bool,
 }
 
 export struct BatchRenameRuleSlint {
@@ -251,6 +252,8 @@ export component LucideIcon inherits Rectangle {
             ? "M 4 5 L 20 5 A 2 2 0 0 1 22 7 L 22 10 A 2 2 0 0 1 20 12 L 4 12 A 2 2 0 0 1 2 10 L 2 7 A 2 2 0 0 1 4 5 Z M 4 14 L 20 14 A 2 2 0 0 1 22 16 L 22 19 A 2 2 0 0 1 20 21 L 4 21 A 2 2 0 0 1 2 19 L 2 16 A 2 2 0 0 1 4 14 Z M 6 8.5 L 7 8.5 M 6 17.5 L 7 17.5"
             : root.kind == "terminal"
             ? "M 4 17 L 10 11 L 4 5 M 12 19 L 20 19"
+            : root.kind == "code"
+            ? "M 16 18 L 22 12 L 16 6 M 8 6 L 2 12 L 8 18"
             : root.kind == "chevron-right"
             ? "M 9 18 L 15 12 L 9 6"
             : root.kind == "chevron-left"
@@ -368,6 +371,7 @@ export component CleanLineEdit inherits Rectangle {
     callback escape-pressed();
 
     public function focus-input() {
+        inner-input.computed-x = 0px;
         inner-input.focus();
         inner-input.select-all();
     }
@@ -385,17 +389,22 @@ export component CleanLineEdit inherits Rectangle {
 
         Rectangle {
             horizontal-stretch: 1;
+            min-width: 0px;
             background: transparent;
+            clip: true;
 
             if root.text == "" && !inner-input.has-focus : Text {
                 text: root.placeholder-text;
                 color: #6E6E77;
                 font-size: root.font-size;
                 vertical-alignment: center;
+                overflow: elide;
             }
 
             inner-input := TextInput {
-                width: 100%;
+                property <length> computed-x: 0px;
+                x: Math.min(0px, Math.max(parent.width - self.width - self.text-cursor-width, self.computed-x));
+                width: Math.max(parent.width - self.text-cursor-width, self.preferred-width);
                 height: 100%;
                 text <=> root.text;
                 input-type: root.input-type;
@@ -403,6 +412,13 @@ export component CleanLineEdit inherits Rectangle {
                 color: #E1E1E6;
                 vertical-alignment: center;
                 single-line: true;
+                cursor-position-changed(cursor-position) => {
+                    if cursor-position.x + self.computed-x < 12px {
+                        self.computed-x = -cursor-position.x + 12px;
+                    } else if cursor-position.x + self.computed-x > parent.width - 12px - self.text-cursor-width {
+                        self.computed-x = parent.width - cursor-position.x - 12px - self.text-cursor-width;
+                    }
+                }
                 edited => {
                     root.edited(self.text);
                 }
@@ -481,6 +497,8 @@ export component FileRow inherits Rectangle {
     private property <bool> down_cmd: false;
     private property <bool> drag_active: false;
     private property <bool> suppress_next_click: false;
+    private property <bool> drag_force_move: false;
+    private property <bool> drag_force_copy: false;
 
     callback row-clicked(bool, bool);
     callback row-double-clicked();
@@ -488,8 +506,8 @@ export component FileRow inherits Rectangle {
     callback row-hovered(length, length);
     callback row-unhovered();
     callback row-shift-drag(length);
-    callback row-drag-moved(length, length);
-    callback row-drag-ended(length, length);
+    callback row-drag-moved(length, length, bool, bool);
+    callback row-drag-ended(length, length, bool, bool);
     callback row-drag-to-other-pane();
     callback toggle-expand();
     callback wheel-scroll(length, length);
@@ -535,12 +553,14 @@ export component FileRow inherits Rectangle {
             root.row-double-clicked();
         }
         moved => {
-            if self.pressed && !root.down_shift && !root.down_cmd && (Math.abs(self.mouse-x - self.pressed-x) > 14px || Math.abs(self.mouse-y - self.pressed-y) > 14px) {
+            if self.pressed && !root.down_shift && (Math.abs(self.mouse-x - self.pressed-x) > 14px || Math.abs(self.mouse-y - self.pressed-y) > 14px) {
                 root.drag_active = true;
                 root.suppress_next_click = true;
                 root.row-drag-moved(
                     self.absolute-position.x + self.mouse-x,
-                    self.absolute-position.y + self.mouse-y
+                    self.absolute-position.y + self.mouse-y,
+                    root.drag_force_move,
+                    root.drag_force_copy
                 );
             }
         }
@@ -561,9 +581,15 @@ export component FileRow inherits Rectangle {
                     self.absolute-position.y + self.mouse-y
                 );
             }
+            if ev.kind == PointerEventKind.move && self.pressed {
+                root.drag_force_move = ev.modifiers.control || ev.modifiers.meta;
+                root.drag_force_copy = ev.modifiers.alt;
+            }
             if ev.button == PointerEventButton.left && ev.kind == PointerEventKind.down {
                 root.down_shift = ev.modifiers.shift;
                 root.down_cmd = ev.modifiers.control || ev.modifiers.meta;
+                root.drag_force_move = root.down_cmd;
+                root.drag_force_copy = ev.modifiers.alt;
                 root.drag_active = false;
                 root.suppress_next_click = false;
             }
@@ -577,14 +603,20 @@ export component FileRow inherits Rectangle {
             }
             if (ev.kind == PointerEventKind.up || ev.kind == PointerEventKind.cancel) && root.drag_active {
                 root.drag_active = false;
+                root.drag_force_move = ev.modifiers.control || ev.modifiers.meta;
+                root.drag_force_copy = ev.modifiers.alt;
                 root.row-drag-ended(
                     self.absolute-position.x + self.mouse-x,
-                    self.absolute-position.y + self.mouse-y
+                    self.absolute-position.y + self.mouse-y,
+                    root.drag_force_move,
+                    root.drag_force_copy
                 );
             }
             if ev.kind == PointerEventKind.cancel {
                 root.down_shift = false;
                 root.down_cmd = false;
+                root.drag_force_move = false;
+                root.drag_force_copy = false;
                 root.suppress_next_click = false;
             }
         }
@@ -1156,12 +1188,16 @@ export component ContextMenuItem inherits Rectangle {
     in property <string> icon-kind: "file";
     in property <string> label;
     in property <string> shortcut-hint: "";
+    in property <bool> has-submenu: false;
+    in property <bool> is-submenu-open: false;
+    in property <bool> is-checked: false;
     callback triggered();
+    callback hovered(length);
 
     height: 28px;
     border-radius: 4px;
     opacity: 1.0;
-    background: touch.has-hover ? #0D52BF : #202024;
+    background: (touch.has-hover || root.is-submenu-open) ? #0D52BF : #202024;
 
     HorizontalLayout {
         padding-left: 10px;
@@ -1176,31 +1212,66 @@ export component ContextMenuItem inherits Rectangle {
                 y: (parent.height - self.height) / 2;
                 icon-size: 15px;
                 kind: root.icon-kind;
-                icon-color: touch.has-hover ? #FFFFFF : #A0A0AB;
+                icon-color: (touch.has-hover || root.is-submenu-open) ? #FFFFFF : #A0A0AB;
             }
         }
 
         Text {
             text: root.label;
-            color: touch.has-hover ? #FFFFFF : #E1E1E6;
+            color: (touch.has-hover || root.is-submenu-open) ? #FFFFFF : #E1E1E6;
             font-size: 13px;
             font-weight: 500;
             horizontal-stretch: 1;
+            min-width: 0px;
             overflow: elide;
             vertical-alignment: center;
         }
 
+        if root.is-checked : Path {
+            y: (parent.height - self.height) / 2;
+            width: 13px;
+            height: 13px;
+            viewbox-width: 24;
+            viewbox-height: 24;
+            fill: transparent;
+            stroke: (touch.has-hover || root.is-submenu-open) ? #FFFFFF : #4CC2FF;
+            stroke-width: 2px;
+            commands: "M 20 6 L 9 17 L 4 12";
+        }
+
         if root.shortcut-hint != "" : Text {
             text: root.shortcut-hint;
-            color: touch.has-hover ? #E1E1E6 : #888892;
+            color: (touch.has-hover || root.is-submenu-open) ? #E1E1E6 : #888892;
             font-size: 11.5px;
             font-family: "monospace";
             vertical-alignment: center;
+        }
+
+        if root.has-submenu : Path {
+            y: (parent.height - self.height) / 2;
+            width: 12px;
+            height: 12px;
+            viewbox-width: 24;
+            viewbox-height: 24;
+            fill: transparent;
+            stroke: (touch.has-hover || root.is-submenu-open) ? #FFFFFF : #888892;
+            stroke-width: 1.8px;
+            commands: "M 9 18 L 15 12 L 9 6";
         }
     }
 
     touch := TouchArea {
         clicked => { root.triggered(); }
+        changed has-hover => {
+            if self.has-hover {
+                root.hovered(self.absolute-position.y);
+            }
+        }
+        pointer-event(ev) => {
+            if ev.kind == PointerEventKind.move && self.has-hover {
+                root.hovered(self.absolute-position.y);
+            }
+        }
     }
 }
 
@@ -1217,13 +1288,15 @@ export component PolaroidCell inherits Rectangle {
     private property <bool> down-cmd: false;
     private property <bool> drag-active: false;
     private property <bool> suppress-next-click: false;
+    private property <bool> drag-force-move: false;
+    private property <bool> drag-force-copy: false;
     callback select-cell(bool, bool);
     callback open-cell();
     callback context-cell(length, length);
     callback cell-hovered(length, length);
     callback cell-unhovered();
-    callback cell-drag-moved(length, length);
-    callback cell-drag-ended(length, length);
+    callback cell-drag-moved(length, length, bool, bool);
+    callback cell-drag-ended(length, length, bool, bool);
     callback wheel-scroll(length, length);
 
     height: 128px + Math.max(0px, root.font-delta * 4.0);
@@ -1409,12 +1482,14 @@ export component PolaroidCell inherits Rectangle {
             root.open-cell();
         }
         moved => {
-            if self.pressed && !root.down-shift && !root.down-cmd && (Math.abs(self.mouse-x - self.pressed-x) > 14px || Math.abs(self.mouse-y - self.pressed-y) > 14px) {
+            if self.pressed && !root.down-shift && (Math.abs(self.mouse-x - self.pressed-x) > 14px || Math.abs(self.mouse-y - self.pressed-y) > 14px) {
                 root.drag-active = true;
                 root.suppress-next-click = true;
                 root.cell-drag-moved(
                     self.absolute-position.x + self.mouse-x,
-                    self.absolute-position.y + self.mouse-y
+                    self.absolute-position.y + self.mouse-y,
+                    root.drag-force-move,
+                    root.drag-force-copy
                 );
             }
         }
@@ -1435,9 +1510,15 @@ export component PolaroidCell inherits Rectangle {
                     self.absolute-position.y + self.mouse-y
                 );
             }
+            if ev.kind == PointerEventKind.move && self.pressed {
+                root.drag-force-move = ev.modifiers.control || ev.modifiers.meta;
+                root.drag-force-copy = ev.modifiers.alt;
+            }
             if ev.button == PointerEventButton.left && ev.kind == PointerEventKind.down {
                 root.down-shift = ev.modifiers.shift;
                 root.down-cmd = ev.modifiers.control || ev.modifiers.meta;
+                root.drag-force-move = root.down-cmd;
+                root.drag-force-copy = ev.modifiers.alt;
                 root.drag-active = false;
                 root.suppress-next-click = false;
             }
@@ -1451,14 +1532,20 @@ export component PolaroidCell inherits Rectangle {
             }
             if (ev.kind == PointerEventKind.up || ev.kind == PointerEventKind.cancel) && root.drag-active {
                 root.drag-active = false;
+                root.drag-force-move = ev.modifiers.control || ev.modifiers.meta;
+                root.drag-force-copy = ev.modifiers.alt;
                 root.cell-drag-ended(
                     self.absolute-position.x + self.mouse-x,
-                    self.absolute-position.y + self.mouse-y
+                    self.absolute-position.y + self.mouse-y,
+                    root.drag-force-move,
+                    root.drag-force-copy
                 );
             }
             if ev.kind == PointerEventKind.cancel {
                 root.down-shift = false;
                 root.down-cmd = false;
+                root.drag-force-move = false;
+                root.drag-force-copy = false;
                 root.suppress-next-click = false;
             }
         }

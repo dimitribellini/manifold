@@ -72,8 +72,8 @@ mod updater;
 
 pub use self::clipboard::{current_app_version_label, format_app_version_label};
 use self::{
-    archive::*, batch_rename::*, clipboard::*, shortcuts::*, sync_modal::*, transfer_worker::*,
-    trash::*, updater::*,
+    archive::*, batch_rename::*, clipboard::*, drag_drop::*, shortcuts::*, sync_modal::*,
+    transfer_worker::*, trash::*, updater::*,
 };
 
 const VIRTUAL_WINDOW_MIN_ROWS: usize = 12;
@@ -271,6 +271,34 @@ enum BgSearchEvent {
     },
 }
 
+struct BgDirLoadEvent {
+    is_right: bool,
+    gen_id: u64,
+    dir_path: String,
+    entries: Vec<FileMetadata>,
+    fingerprint: Option<u64>,
+    mtime: Option<(u64, u32)>,
+    vol_stats: Option<manifold_vfs::VolumeStats>,
+}
+
+struct BgWatchTarget {
+    dir_path: String,
+    prev_mtime: Option<(u64, u32)>,
+    prev_fp: Option<u64>,
+}
+
+struct BgWatchRequest {
+    dirs: Vec<BgWatchTarget>,
+    deep_scan: bool,
+}
+
+struct BgWatchChange {
+    dir_path: String,
+    entries: Vec<FileMetadata>,
+    fingerprint: u64,
+    mtime: Option<(u64, u32)>,
+}
+
 #[derive(Clone)]
 struct PendingBatchTransfer {
     queue: VecDeque<FileMetadata>,
@@ -377,6 +405,21 @@ struct GuiRuntime {
     dir_cache: RefCell<HashMap<String, Vec<FileMetadata>>>,
     dir_size_cache: RefCell<HashMap<String, u64>>,
     dir_fingerprints: RefCell<HashMap<String, u64>>,
+    dir_mtimes: RefCell<HashMap<String, (u64, u32)>>,
+    vol_stats_cache: RefCell<HashMap<String, (manifold_vfs::VolumeStats, Instant)>>,
+    dir_load_tx: mpsc::Sender<BgDirLoadEvent>,
+    dir_load_rx: mpsc::Receiver<BgDirLoadEvent>,
+    left_dir_load_gen: Arc<AtomicU64>,
+    right_dir_load_gen: Arc<AtomicU64>,
+    left_dir_loading: bool,
+    right_dir_loading: bool,
+    watch_req_tx: mpsc::Sender<BgWatchRequest>,
+    watch_res_rx: mpsc::Receiver<Vec<BgWatchChange>>,
+    watch_in_flight: bool,
+    watch_cycle_count: u32,
+    terminal_drawer_open: bool,
+    session_save_tx: mpsc::Sender<SessionState>,
+    open_with_all_apps: Vec<OpenWithAppSlint>,
     fs_poll_tick: u32,
     staging_poll_tick: u32,
     session_save_tick: u32,
@@ -494,7 +537,53 @@ impl GuiRuntime {
         let (search_tx, search_rx) = mpsc::channel();
         let (sync_tx, sync_rx) = mpsc::channel();
         let (dir_size_tx, dir_size_rx) = mpsc::channel();
+        let (dir_load_tx, dir_load_rx) = mpsc::channel();
+        let (watch_req_tx, watch_req_rx) = mpsc::channel::<BgWatchRequest>();
+        let (watch_res_tx, watch_res_rx) = mpsc::channel::<Vec<BgWatchChange>>();
+        let (session_save_tx, session_save_rx) = mpsc::channel::<SessionState>();
         let (update_tx, update_rx) = mpsc::channel();
+
+        let watch_vfs = local_vfs.clone();
+        std::thread::spawn(move || {
+            while let Ok(req) = watch_req_rx.recv() {
+                let mut changes = Vec::new();
+                for target in req.dirs {
+                    let dir_path = target.dir_path;
+                    let prev_mtime = target.prev_mtime;
+                    let prev_fp = target.prev_fp;
+                    let cur_mtime = local_dir_mtime_secs_nanos(&dir_path);
+                    let mtime_diff = cur_mtime != prev_mtime;
+                    if !mtime_diff && !req.deep_scan && prev_fp.is_some() {
+                        continue;
+                    }
+                    let Some(new_fp) = compute_local_dir_fingerprint(&dir_path) else {
+                        continue;
+                    };
+                    if prev_fp != Some(new_fp) {
+                        if let Ok(entries) = watch_vfs.list_directory(&dir_path) {
+                            changes.push(BgWatchChange {
+                                dir_path,
+                                entries,
+                                fingerprint: new_fp,
+                                mtime: cur_mtime,
+                            });
+                        }
+                    }
+                }
+                if watch_res_tx.send(changes).is_err() {
+                    break;
+                }
+            }
+        });
+
+        std::thread::spawn(move || {
+            while let Ok(mut latest) = session_save_rx.recv() {
+                while let Ok(newer) = session_save_rx.try_recv() {
+                    latest = newer;
+                }
+                let _ = latest.save_default();
+            }
+        });
         let init_rate = mbps_to_rate_bps(prefs.max_bandwidth_mbps);
         let shared_limiter = Arc::new(Mutex::new(TokenBucketLimiter::new(init_rate)));
         let staging_dir = manifold_vfs::secure_runtime_subdir("staging").ok();
@@ -598,6 +687,21 @@ impl GuiRuntime {
             dir_cache: RefCell::new(HashMap::new()),
             dir_size_cache: RefCell::new(HashMap::new()),
             dir_fingerprints: RefCell::new(HashMap::new()),
+            dir_mtimes: RefCell::new(HashMap::new()),
+            vol_stats_cache: RefCell::new(HashMap::new()),
+            dir_load_tx,
+            dir_load_rx,
+            left_dir_load_gen: Arc::new(AtomicU64::new(0)),
+            right_dir_load_gen: Arc::new(AtomicU64::new(0)),
+            left_dir_loading: false,
+            right_dir_loading: false,
+            watch_req_tx,
+            watch_res_rx,
+            watch_in_flight: false,
+            watch_cycle_count: 0,
+            terminal_drawer_open: false,
+            session_save_tx,
+            open_with_all_apps: Vec::new(),
             fs_poll_tick: 0,
             staging_poll_tick: 0,
             session_save_tick: 0,
@@ -772,6 +876,7 @@ impl GuiRuntime {
         window.set_terminal_drawer_height(sess.window.terminal_drawer_height.clamp(130.0, 600.0));
         window.set_inspector_tab_index(sess.window.inspector_tab_index.min(1) as i32);
         window.set_show_terminal_drawer(sess.window.terminal_drawer_open);
+        self.terminal_drawer_open = sess.window.terminal_drawer_open;
 
         self.reload_pane_entries(false);
         self.reload_pane_entries(true);
@@ -782,7 +887,7 @@ impl GuiRuntime {
         }
     }
 
-    fn capture_and_save_session(&self, window: &ManifoldWindow) {
+    fn build_session_state(&self, window: &ManifoldWindow) -> SessionState {
         let scale = window.window().scale_factor().max(1.0);
         let phys = window.window().size();
         let raw_w = ((phys.width as f32) / scale).round() as u32;
@@ -859,7 +964,7 @@ impl GuiRuntime {
             })
             .collect();
 
-        let state = SessionState {
+        SessionState {
             window: win_cfg,
             left_pane: PaneSessionConfig {
                 active_tab_index: self.app_state.left_active_tab,
@@ -869,49 +974,101 @@ impl GuiRuntime {
                 active_tab_index: self.app_state.right_active_tab,
                 tabs: right_tabs,
             },
-        };
+        }
+    }
+
+    fn capture_and_save_session(&self, window: &ManifoldWindow) {
+        let state = self.build_session_state(window);
         let _ = state.save_default();
     }
 
-    fn poll_external_directory_changes(&mut self) -> bool {
-        let mut left_changed = false;
-        let mut right_changed = false;
+    fn capture_and_save_session_async(&self, window: &ManifoldWindow) {
+        let state = self.build_session_state(window);
+        let _ = self.session_save_tx.send(state);
+    }
 
-        let left_dir = self.current_pane_path(false);
-        let mut left_watch = vec![left_dir];
+    fn request_bg_external_dir_watch(&mut self) {
+        if self.watch_in_flight {
+            return;
+        }
+        self.watch_cycle_count = self.watch_cycle_count.wrapping_add(1);
+        let deep_scan = self.watch_cycle_count.is_multiple_of(5);
+        let mut watch_paths = vec![self.current_pane_path(false)];
         if let Some(tab) = self.app_state.left_tabs.get(self.app_state.left_active_tab) {
-            left_watch.extend(tab.expanded_folders.iter().cloned());
+            watch_paths.extend(tab.expanded_folders.iter().cloned());
         }
-        for dir in left_watch {
-            if let Some(fp) = compute_local_dir_fingerprint(&dir) {
-                let prev = self.dir_fingerprints.borrow().get(&dir).copied();
-                if prev != Some(fp) {
-                    self.dir_fingerprints.borrow_mut().insert(dir.clone(), fp);
-                    self.dir_cache.borrow_mut().remove(&dir);
-                    left_changed = true;
-                }
-            }
-        }
-
         if self.app_state.dual_pane_enabled {
-            let right_dir = self.current_pane_path(true);
-            let mut right_watch = vec![right_dir];
+            watch_paths.push(self.current_pane_path(true));
             if let Some(tab) = self
                 .app_state
                 .right_tabs
                 .get(self.app_state.right_active_tab)
             {
-                right_watch.extend(tab.expanded_folders.iter().cloned());
+                watch_paths.extend(tab.expanded_folders.iter().cloned());
             }
-            for dir in right_watch {
-                if let Some(fp) = compute_local_dir_fingerprint(&dir) {
-                    let prev = self.dir_fingerprints.borrow().get(&dir).copied();
-                    if prev != Some(fp) {
-                        self.dir_fingerprints.borrow_mut().insert(dir.clone(), fp);
-                        self.dir_cache.borrow_mut().remove(&dir);
-                        right_changed = true;
-                    }
+        }
+        let mut seen = HashSet::new();
+        let mut dirs = Vec::new();
+        for dir in watch_paths {
+            if split_remote_uri(&dir).is_some() || split_archive_uri(&dir).is_some() {
+                continue;
+            }
+            if seen.insert(dir.clone()) {
+                let prev_mtime = self.dir_mtimes.borrow().get(&dir).copied();
+                let prev_fp = self.dir_fingerprints.borrow().get(&dir).copied();
+                dirs.push(BgWatchTarget {
+                    dir_path: dir,
+                    prev_mtime,
+                    prev_fp,
+                });
+            }
+        }
+        if !dirs.is_empty() {
+            let req = BgWatchRequest { dirs, deep_scan };
+            if self.watch_req_tx.send(req).is_ok() {
+                self.watch_in_flight = true;
+            }
+        }
+    }
+
+    fn poll_bg_dir_watch(&mut self) -> bool {
+        let mut left_changed = false;
+        let mut right_changed = false;
+        while let Ok(changes) = self.watch_res_rx.try_recv() {
+            self.watch_in_flight = false;
+            if changes.is_empty() {
+                continue;
+            }
+            let left_dir = self.current_pane_path(false);
+            let right_dir = self.current_pane_path(true);
+            let left_exp: HashSet<String> = self
+                .app_state
+                .left_tabs
+                .get(self.app_state.left_active_tab)
+                .map(|t| t.expanded_folders.iter().cloned().collect())
+                .unwrap_or_default();
+            let right_exp: HashSet<String> = self
+                .app_state
+                .right_tabs
+                .get(self.app_state.right_active_tab)
+                .map(|t| t.expanded_folders.iter().cloned().collect())
+                .unwrap_or_default();
+            for ch in changes {
+                if ch.dir_path == left_dir || left_exp.contains(&ch.dir_path) {
+                    left_changed = true;
                 }
+                if self.app_state.dual_pane_enabled
+                    && (ch.dir_path == right_dir || right_exp.contains(&ch.dir_path))
+                {
+                    right_changed = true;
+                }
+                self.dir_fingerprints
+                    .borrow_mut()
+                    .insert(ch.dir_path.clone(), ch.fingerprint);
+                if let Some(mt) = ch.mtime {
+                    self.dir_mtimes.borrow_mut().insert(ch.dir_path.clone(), mt);
+                }
+                self.dir_cache.borrow_mut().insert(ch.dir_path, ch.entries);
             }
         }
 
@@ -1224,6 +1381,9 @@ impl GuiRuntime {
     }
 
     fn sync_terminal_cwd(&mut self) {
+        if !self.terminal_drawer_open {
+            return;
+        }
         let active_path = self.current_pane_path(self.is_right_effective());
         let remote_pref =
             split_remote_uri(&active_path).map(|(p, _)| p.trim_end_matches('/').to_string());
@@ -1854,8 +2014,74 @@ impl GuiRuntime {
     fn invalidate_dir_cache(&self) {
         self.dir_cache.borrow_mut().clear();
         self.dir_size_cache.borrow_mut().clear();
+        self.dir_fingerprints.borrow_mut().clear();
+        self.dir_mtimes.borrow_mut().clear();
+        self.vol_stats_cache.borrow_mut().clear();
         *self.left_search_key.borrow_mut() = (String::new(), String::new(), false);
         *self.right_search_key.borrow_mut() = (String::new(), String::new(), false);
+    }
+
+    fn invalidate_dir_paths(&self, dirs: &[&str]) {
+        if dirs.is_empty() {
+            return;
+        }
+        let norm_set: HashSet<String> = dirs
+            .iter()
+            .filter(|d| !d.is_empty())
+            .map(|d| {
+                if *d == "/" {
+                    "/".to_string()
+                } else {
+                    d.trim_end_matches('/').to_string()
+                }
+            })
+            .collect();
+        if norm_set.is_empty() {
+            return;
+        }
+        for d in &norm_set {
+            self.dir_cache.borrow_mut().remove(d);
+            self.dir_fingerprints.borrow_mut().remove(d);
+            self.dir_mtimes.borrow_mut().remove(d);
+            self.vol_stats_cache.borrow_mut().remove(d);
+        }
+        self.dir_size_cache.borrow_mut().retain(|k, _| {
+            let kn = if k == "/" {
+                "/".to_string()
+            } else {
+                k.trim_end_matches('/').to_string()
+            };
+            let parent = vfs_parent_dir(&kn).unwrap_or_default();
+            !norm_set.contains(&kn) && !norm_set.contains(&parent)
+        });
+        let l_root = self.left_search_key.borrow().0.clone();
+        if norm_set
+            .iter()
+            .any(|d| l_root == *d || d.starts_with(&l_root))
+        {
+            *self.left_search_key.borrow_mut() = (String::new(), String::new(), false);
+        }
+        let r_root = self.right_search_key.borrow().0.clone();
+        if norm_set
+            .iter()
+            .any(|d| r_root == *d || d.starts_with(&r_root))
+        {
+            *self.right_search_key.borrow_mut() = (String::new(), String::new(), false);
+        }
+    }
+
+    fn invalidate_for_entry_paths(&self, paths: &[&str]) {
+        let mut dirs: Vec<String> = Vec::new();
+        for p in paths {
+            if !p.is_empty() {
+                dirs.push((*p).to_string());
+                if let Some(parent) = vfs_parent_dir(p) {
+                    dirs.push(parent);
+                }
+            }
+        }
+        let refs: Vec<&str> = dirs.iter().map(String::as_str).collect();
+        self.invalidate_dir_paths(&refs);
     }
 
     fn effective_view_options_for_dir(&self, dir_path: &str) -> FolderViewOptions {
@@ -2132,7 +2358,7 @@ impl GuiRuntime {
     }
 
     fn vfs_create_dir(&self, path: &str) -> Result<(), String> {
-        self.invalidate_dir_cache();
+        self.invalidate_for_entry_paths(&[path]);
         if let Some((prefix, remote_sub)) = split_remote_uri(path) {
             let remote = self
                 .remote_backends
@@ -2144,7 +2370,7 @@ impl GuiRuntime {
     }
 
     fn vfs_remove(&self, path: &str, recursive: bool) -> Result<(), String> {
-        self.invalidate_dir_cache();
+        self.invalidate_for_entry_paths(&[path]);
         if let Some((prefix, remote_sub)) = split_remote_uri(path) {
             let remote = self
                 .remote_backends
@@ -2160,7 +2386,7 @@ impl GuiRuntime {
     }
 
     fn vfs_rename(&self, from: &str, to: &str) -> Result<(), String> {
-        self.invalidate_dir_cache();
+        self.invalidate_for_entry_paths(&[from, to]);
         if let (Some((p1, sub1)), Some((p2, sub2))) = (split_remote_uri(from), split_remote_uri(to))
         {
             if p1 == p2 {
@@ -2196,7 +2422,7 @@ impl GuiRuntime {
         if split_archive_uri(path).is_some() {
             return Err("Archive virtual filesystem is read-only".to_string());
         }
-        self.invalidate_dir_cache();
+        self.invalidate_for_entry_paths(&[path]);
         if let Some((prefix, remote_sub)) = split_remote_uri(path) {
             let remote = self
                 .remote_backends
@@ -2215,7 +2441,7 @@ impl GuiRuntime {
         if split_archive_uri(path).is_some() {
             return Err("Archive virtual filesystem is read-only".to_string());
         }
-        self.invalidate_dir_cache();
+        self.invalidate_for_entry_paths(&[path]);
         if let Some((prefix, remote_sub)) = split_remote_uri(path) {
             let remote = self
                 .remote_backends
@@ -2234,7 +2460,7 @@ impl GuiRuntime {
         if split_archive_uri(target).is_some() || split_archive_uri(link_path).is_some() {
             return Err("Cannot create symlinks inside archives".to_string());
         }
-        self.invalidate_dir_cache();
+        self.invalidate_for_entry_paths(&[link_path]);
         if let Some((prefix, link_sub)) = split_remote_uri(link_path) {
             let target_sub = split_remote_uri(target)
                 .filter(|(tp, _)| tp == &prefix)
@@ -2271,7 +2497,7 @@ impl GuiRuntime {
             self.vfs_copy_entry(&meta.path, &dst)?;
             return Ok(dst);
         }
-        self.invalidate_dir_cache();
+        self.invalidate_for_entry_paths(&[&meta.path]);
         duplicate_path_on_disk(&self.local_vfs, meta)
     }
 
@@ -2279,7 +2505,7 @@ impl GuiRuntime {
         if split_archive_uri(dst_path).is_some() {
             return Err("Archive virtual filesystem is read-only".to_string());
         }
-        self.invalidate_dir_cache();
+        self.invalidate_for_entry_paths(&[dst_path]);
         let src_slash = format!("{}/", src_path.trim_end_matches('/'));
         if dst_path == src_path || dst_path.starts_with(&src_slash) {
             return Err("Cannot copy or move a folder into itself".to_string());
@@ -2344,7 +2570,7 @@ impl GuiRuntime {
     }
 
     fn vfs_move_entry(&self, src_path: &str, dst_path: &str) -> Result<(), String> {
-        self.invalidate_dir_cache();
+        self.invalidate_for_entry_paths(&[src_path, dst_path]);
         let src_slash = format!("{}/", src_path.trim_end_matches('/'));
         if dst_path == src_path || dst_path.starts_with(&src_slash) {
             return Err("Cannot move a folder into itself".to_string());
@@ -2693,12 +2919,187 @@ impl GuiRuntime {
         }
         cache.insert(dir_path.to_string(), raw_items.clone());
         drop(cache);
-        if let Some(fp) = compute_local_dir_fingerprint(dir_path) {
-            self.dir_fingerprints
+        let fp = compute_dir_fingerprint_from_meta(&raw_items);
+        self.dir_fingerprints
+            .borrow_mut()
+            .insert(dir_path.to_string(), fp);
+        if let Some(mt) = local_dir_mtime_secs_nanos(dir_path) {
+            self.dir_mtimes
                 .borrow_mut()
-                .insert(dir_path.to_string(), fp);
+                .insert(dir_path.to_string(), mt);
         }
         raw_items
+    }
+
+    fn spawn_bg_dir_load(&mut self, is_right: bool, dir_path: String, mark_loading: bool) {
+        if split_archive_uri(&dir_path).is_some() {
+            if is_right {
+                self.right_dir_loading = false;
+            } else {
+                self.left_dir_loading = false;
+            }
+            return;
+        }
+        let gen_arc = if is_right {
+            self.right_dir_loading = mark_loading;
+            Arc::clone(&self.right_dir_load_gen)
+        } else {
+            self.left_dir_loading = mark_loading;
+            Arc::clone(&self.left_dir_load_gen)
+        };
+        let my_gen = gen_arc.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        let tx = self.dir_load_tx.clone();
+        if let Some((prefix, remote_sub)) = split_remote_uri(&dir_path) {
+            self.ensure_remote_connected(&prefix);
+            let remote_opt = self.remote_backends.get(&prefix).cloned();
+            std::thread::spawn(move || {
+                if gen_arc.load(Ordering::Relaxed) != my_gen {
+                    return;
+                }
+                let entries = if let Some(remote) = remote_opt {
+                    let mut list = remote.list_directory(&remote_sub).unwrap_or_default();
+                    for entry in &mut list {
+                        entry.path = format!("{prefix}{}", entry.path);
+                    }
+                    list
+                } else {
+                    Vec::new()
+                };
+                let _ = tx.send(BgDirLoadEvent {
+                    is_right,
+                    gen_id: my_gen,
+                    dir_path,
+                    entries,
+                    fingerprint: None,
+                    mtime: None,
+                    vol_stats: None,
+                });
+            });
+            return;
+        }
+
+        let local_vfs = self.local_vfs.clone();
+        std::thread::spawn(move || {
+            if gen_arc.load(Ordering::Relaxed) != my_gen {
+                return;
+            }
+            let entries = local_vfs.list_directory(&dir_path).unwrap_or_default();
+            if gen_arc.load(Ordering::Relaxed) != my_gen {
+                return;
+            }
+            let fp = Some(compute_dir_fingerprint_from_meta(&entries));
+            let mtime = local_dir_mtime_secs_nanos(&dir_path);
+            let vol_stats = local_vfs
+                .volume_stats(&dir_path)
+                .or_else(|_| local_vfs.volume_stats("/"))
+                .ok();
+            let _ = tx.send(BgDirLoadEvent {
+                is_right,
+                gen_id: my_gen,
+                dir_path,
+                entries,
+                fingerprint: fp,
+                mtime,
+                vol_stats,
+            });
+        });
+    }
+
+    fn poll_bg_dir_loads(&mut self) -> bool {
+        let mut need_ui_sync = false;
+        while let Ok(ev) = self.dir_load_rx.try_recv() {
+            let cur_gen = if ev.is_right {
+                self.right_dir_load_gen.load(Ordering::Relaxed)
+            } else {
+                self.left_dir_load_gen.load(Ordering::Relaxed)
+            };
+            if ev.gen_id != cur_gen || self.current_pane_path(ev.is_right) != ev.dir_path {
+                continue;
+            }
+            let was_loading = if ev.is_right {
+                let w = self.right_dir_loading;
+                self.right_dir_loading = false;
+                w
+            } else {
+                let w = self.left_dir_loading;
+                self.left_dir_loading = false;
+                w
+            };
+            if let Some(vs) = ev.vol_stats {
+                self.vol_stats_cache
+                    .borrow_mut()
+                    .insert(ev.dir_path.clone(), (vs, Instant::now()));
+            }
+            if let Some(fp) = ev.fingerprint {
+                self.dir_fingerprints
+                    .borrow_mut()
+                    .insert(ev.dir_path.clone(), fp);
+            }
+            if let Some(mt) = ev.mtime {
+                self.dir_mtimes.borrow_mut().insert(ev.dir_path.clone(), mt);
+            }
+            let changed = {
+                let cache = self.dir_cache.borrow();
+                match cache.get(&ev.dir_path) {
+                    Some(prev) => {
+                        prev.len() != ev.entries.len()
+                            || compute_dir_fingerprint_from_meta(prev)
+                                != compute_dir_fingerprint_from_meta(&ev.entries)
+                    }
+                    None => true,
+                }
+            };
+            self.dir_cache
+                .borrow_mut()
+                .insert(ev.dir_path.clone(), ev.entries);
+
+            if was_loading || changed {
+                let sel_paths: HashSet<String> = if ev.is_right {
+                    self.right_selected_indices
+                        .iter()
+                        .filter_map(|&i| self.right_entries.get(i).map(|r| r.meta.path.clone()))
+                        .collect()
+                } else {
+                    self.left_selected_indices
+                        .iter()
+                        .filter_map(|&i| self.left_entries.get(i).map(|r| r.meta.path.clone()))
+                        .collect()
+                };
+                self.reload_pane_entries(ev.is_right);
+                if !sel_paths.is_empty() {
+                    if ev.is_right {
+                        let mut restored = HashSet::new();
+                        for (i, r) in self.right_entries.iter().enumerate() {
+                            if sel_paths.contains(&r.meta.path) {
+                                restored.insert(i);
+                            }
+                        }
+                        if !restored.is_empty() {
+                            let first = restored.iter().copied().min();
+                            self.right_selected_indices = restored;
+                            self.right_selected_idx = first;
+                        }
+                    } else {
+                        let mut restored = HashSet::new();
+                        for (i, r) in self.left_entries.iter().enumerate() {
+                            if sel_paths.contains(&r.meta.path) {
+                                restored.insert(i);
+                            }
+                        }
+                        if !restored.is_empty() {
+                            let first = restored.iter().copied().min();
+                            self.left_selected_indices = restored;
+                            self.left_selected_idx = first;
+                        }
+                    }
+                }
+                need_ui_sync = true;
+            } else if ev.vol_stats.is_some() {
+                self.refresh_headers_and_inspector();
+                need_ui_sync = true;
+            }
+        }
+        need_ui_sync
     }
 
     fn list_sorted_dir(
@@ -3211,29 +3612,46 @@ impl GuiRuntime {
         }
     }
 
+    fn cached_or_fetch_volume_stats(
+        &self,
+        dir_path: &str,
+        allow_sync_syscall: bool,
+    ) -> Option<manifold_vfs::VolumeStats> {
+        if split_remote_uri(dir_path).is_some() || split_archive_uri(dir_path).is_some() {
+            return None;
+        }
+        {
+            let cache = self.vol_stats_cache.borrow();
+            if let Some((vs, at)) = cache.get(dir_path) {
+                if at.elapsed() < Duration::from_secs(10) {
+                    return Some(*vs);
+                }
+            }
+        }
+        if !allow_sync_syscall {
+            return None;
+        }
+        let vs = self
+            .local_vfs
+            .volume_stats(dir_path)
+            .or_else(|_| self.local_vfs.volume_stats("/"))
+            .ok()?;
+        self.vol_stats_cache
+            .borrow_mut()
+            .insert(dir_path.to_string(), (vs, Instant::now()));
+        Some(vs)
+    }
+
     fn refresh_headers_and_inspector(&mut self) {
         let left_path = self.current_pane_path(false);
         let right_path = self.current_pane_path(true);
 
         let root_vol_name = crate::resolve_dynamic_root_label();
-        let left_vol =
-            if split_remote_uri(&left_path).is_some() || split_archive_uri(&left_path).is_some() {
-                None
-            } else {
-                self.local_vfs
-                    .volume_stats(&left_path)
-                    .or_else(|_| self.local_vfs.volume_stats("/"))
-                    .ok()
-            };
-        let r_rem =
-            split_remote_uri(&right_path).is_some() || split_archive_uri(&right_path).is_some();
-        let right_vol = if !self.app_state.dual_pane_enabled || r_rem {
+        let left_vol = self.cached_or_fetch_volume_stats(&left_path, !self.left_dir_loading);
+        let right_vol = if !self.app_state.dual_pane_enabled {
             None
         } else {
-            self.local_vfs
-                .volume_stats(&right_path)
-                .or_else(|_| self.local_vfs.volume_stats("/"))
-                .ok()
+            self.cached_or_fetch_volume_stats(&right_path, !self.right_dir_loading)
         };
 
         let left_sel: Vec<&FileMetadata> = self
@@ -3370,6 +3788,33 @@ impl GuiRuntime {
         Some(local_str)
     }
 
+    fn open_local_file_with_preferred_app(&mut self, local_path: &str) {
+        let ext = Path::new(local_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        if let Some(app_spec) = self
+            .prefs
+            .default_open_with_for_ext(ext)
+            .map(ToString::to_string)
+        {
+            match launch_file_with_app(local_path, &app_spec) {
+                Ok(app_label) => {
+                    let msg = format!("[OPEN] File -> {local_path} (default: {app_label})");
+                    self.logs.push(msg);
+                    return;
+                }
+                Err(err) => {
+                    let msg = format!("[OPEN_WARN] Preferred app '{app_spec}' failed: {err}");
+                    self.logs.push(msg);
+                }
+            }
+        }
+        let msg = format!("[OPEN] File -> {local_path}");
+        self.logs.push(msg);
+        open_with_system_handler(local_path);
+    }
+
     fn open_entry_at(&mut self, is_right: bool, row_idx: Option<usize>) {
         let idx_opt = row_idx.or(if is_right {
             self.right_selected_idx
@@ -3409,7 +3854,7 @@ impl GuiRuntime {
                         let dst = dir.join(safe_name);
                         if std::fs::write(&dst, bytes).is_ok() {
                             let s = dst.to_string_lossy().to_string();
-                            open_with_system_handler(&s);
+                            self.open_local_file_with_preferred_app(&s);
                         }
                     }
                 }
@@ -3419,12 +3864,10 @@ impl GuiRuntime {
             if let Some(staged_path) = self.stage_remote_file_for_edit(&meta) {
                 let msg = format!("[OPEN] Remote file staged -> {staged_path}");
                 self.logs.push(msg);
-                open_with_system_handler(&staged_path);
+                self.open_local_file_with_preferred_app(&staged_path);
             }
         } else {
-            let msg = format!("[OPEN] File -> {}", meta.path);
-            self.logs.push(msg);
-            open_with_system_handler(&meta.path);
+            self.open_local_file_with_preferred_app(&meta.path);
         }
     }
 }
@@ -3468,6 +3911,8 @@ fn sync_window_from_runtime(window: &ManifoldWindow, rt: &mut GuiRuntime) {
 
     let is_task_active = rt.active_task_ticks > 0 || rt.bg_tasks_in_flight > 0;
     window.set_active_folder_title(folder_title.into());
+    window.set_left_dir_loading(rt.left_dir_loading);
+    window.set_right_dir_loading(rt.right_dir_loading);
     window.set_show_hidden_files(show_hidden);
     if window.get_search_query().as_str() != rt.app_state.toolbar.search_query {
         window.set_search_query(rt.app_state.toolbar.search_query.clone().into());
@@ -4097,6 +4542,8 @@ fn sync_selection_and_inspector(window: &ManifoldWindow, rt: &mut GuiRuntime) {
     let l_sub = rt.app_state.left_header.status_subtitle.clone();
     let r_sub = rt.app_state.right_header.status_subtitle.clone();
     window.set_active_folder_title(folder_title.into());
+    window.set_left_dir_loading(rt.left_dir_loading);
+    window.set_right_dir_loading(rt.right_dir_loading);
     window.set_right_pane_active(is_right_active);
     window.set_left_status_subtitle(l_sub.into());
     window.set_right_status_subtitle(r_sub.into());
@@ -5650,6 +6097,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 "terminal" => {
                     let is_right = guard.is_right_effective();
                     guard.navigate_to_path(is_right, target_path.clone());
+                    guard.terminal_drawer_open = true;
                     guard.open_terminal_at_path(&target_path);
                     w.set_show_terminal_drawer(true);
                     w.invoke_focus_terminal_input();
@@ -5809,7 +6257,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
             if !target_path.is_empty() && split_remote_uri(&target_path).is_none() {
                 let _ = guard.local_vfs.set_color_label(&target_path, color);
                 guard.prefs.set_file_color_label(&target_path, color);
-                guard.invalidate_dir_cache();
+                guard.invalidate_for_entry_paths(&[&target_path]);
             }
             let _ = guard.prefs.save_default();
             if let Some(prof) = guard
@@ -5944,7 +6392,56 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 guard.left_selected_indices.insert(0);
             }
             guard.restore_active_tab_scroll(is_right);
-            guard.reload_pane_entries(is_right);
+            let target_path = guard.current_pane_path(is_right);
+            let has_filter = if is_right {
+                guard
+                    .app_state
+                    .right_tabs
+                    .get(guard.app_state.right_active_tab)
+                    .is_some_and(|t| !t.inline_filter.trim().is_empty())
+            } else {
+                guard
+                    .app_state
+                    .left_tabs
+                    .get(guard.app_state.left_active_tab)
+                    .is_some_and(|t| !t.inline_filter.trim().is_empty())
+            };
+            let is_archive = split_archive_uri(&target_path).is_some();
+            let is_cached = guard.dir_cache.borrow().contains_key(&target_path);
+
+            if has_filter || is_archive {
+                if is_right {
+                    guard.right_dir_loading = false;
+                } else {
+                    guard.left_dir_loading = false;
+                }
+                guard.reload_pane_entries(is_right);
+            } else if is_cached {
+                if is_right {
+                    guard.right_dir_loading = false;
+                } else {
+                    guard.left_dir_loading = false;
+                }
+                guard.reload_pane_entries(is_right);
+                guard.spawn_bg_dir_load(is_right, target_path, false);
+            } else {
+                if is_right {
+                    guard.right_entries.clear();
+                    guard.right_parent_entries.clear();
+                    guard.right_selected_indices.clear();
+                    guard.right_selected_idx = None;
+                    guard.right_anchor_idx = None;
+                } else {
+                    guard.left_entries.clear();
+                    guard.left_parent_entries.clear();
+                    guard.left_selected_indices.clear();
+                    guard.left_selected_idx = None;
+                    guard.left_anchor_idx = None;
+                }
+                guard.spawn_bg_dir_load(is_right, target_path, true);
+                guard.sync_terminal_cwd();
+                guard.refresh_headers_and_inspector();
+            }
             guard.sync_selected_sidebar_to_active_dir();
             if let Some(w) = win_weak.upgrade() {
                 w.set_show_tab_preview(true);
@@ -6353,6 +6850,14 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 .map(|m| m.path.clone())
                 .unwrap_or(cur_pane_dir);
             let target_is_fav = guard.is_path_in_favorites(&fav_check_path);
+            let quick_apps = sel_list
+                .first()
+                .map(|m| {
+                    let ext = m.extension.as_deref().unwrap_or("");
+                    let saved_def = guard.prefs.default_open_with_for_ext(ext);
+                    discover_quick_open_with_apps(m, saved_def)
+                })
+                .unwrap_or_default();
             if let Some(w) = win_weak.upgrade() {
                 reset_slint_modifiers(&w);
                 let has_clip =
@@ -6367,6 +6872,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 w.set_context_can_show_enclosing(can_show_enclosing);
                 w.set_context_target_is_favorite(target_is_fav);
                 w.set_context_target_name(target_name.into());
+                w.set_context_open_with_apps(ModelRc::new(VecModel::from(quick_apps)));
                 w.set_context_menu_x(x_pos);
                 w.set_context_menu_y(y_pos);
                 w.set_show_context_menu(true);
@@ -6494,11 +7000,24 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 }
                 "open_with" => {
                     if let (Some(meta), Some(w)) = (sel_meta, win_weak.upgrade()) {
-                        let apps = discover_open_with_apps(&meta);
+                        let ext = meta
+                            .extension
+                            .as_deref()
+                            .and_then(AppPreferences::normalized_file_ext)
+                            .unwrap_or_default();
+                        let saved_def = guard.prefs.default_open_with_for_ext(&ext);
+                        let apps = discover_open_with_apps_with_default(&meta, saved_def);
+                        let sel_idx = apps.iter().position(|a| a.is_default).unwrap_or(0) as i32;
+                        let has_custom = saved_def.is_some();
+                        guard.open_with_all_apps = apps.clone();
                         w.set_open_with_target_name(meta.name.into());
                         w.set_open_with_target_path(meta.path.into());
+                        w.set_open_with_target_ext(ext.into());
+                        w.set_open_with_has_custom_default(has_custom);
+                        w.set_open_with_always_use(false);
+                        w.set_open_with_filter(SharedString::default());
                         w.set_open_with_apps(ModelRc::new(VecModel::from(apps)));
-                        w.set_open_with_selected_idx(0);
+                        w.set_open_with_selected_idx(sel_idx);
                         w.set_open_with_custom_cmd(SharedString::default());
                         w.set_show_open_with_modal(true);
                         return;
@@ -6605,7 +7124,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                         let msg =
                             format!("[NEW-FOLDER-SELECTION] {folder_name} ({moved_count} items)");
                         guard.logs.push(msg);
-                        guard.invalidate_dir_cache();
+                        guard.invalidate_dir_paths(&[&cur_dir]);
                         guard.reload_pane_entries(false);
                         guard.reload_pane_entries(true);
                         guard.select_single_path_or_first(is_right, Some(&new_dir_path));
@@ -6714,7 +7233,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                                 guard.logs.push(log_msg);
                                 let toast = label.clone();
                                 guard.start_tracked_task(&label, &dest_dir, sz, toast, "success");
-                                guard.invalidate_dir_cache();
+                                guard.invalidate_for_entry_paths(&[&dest_dir, &meta.path]);
                                 guard.reload_pane_entries(is_right);
                                 guard.select_single_path_or_first(is_right, Some(&dest_dir));
                             }
@@ -6755,7 +7274,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                         };
                         let toast = label.clone();
                         guard.start_tracked_task(&label, &cur_dir, total_bytes, toast, "success");
-                        guard.invalidate_dir_cache();
+                        guard.invalidate_dir_paths(&[&cur_dir]);
                         guard.reload_pane_entries(is_right);
                         guard.select_single_path_or_first(is_right, Some(&last_dup_path));
                     } else if let Some(err) = last_err {
@@ -6770,7 +7289,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                                 guard.logs.push(format!("[ALIAS] -> {alias_path}"));
                                 let toast = format!("Created symlink for {}", meta.name);
                                 guard.show_toast("success", toast);
-                                guard.invalidate_dir_cache();
+                                guard.invalidate_for_entry_paths(&[&alias_path]);
                                 guard.reload_pane_entries(is_right);
                                 guard.select_single_path_or_first(is_right, Some(&alias_path));
                             }
@@ -6973,7 +7492,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                         guard.logs.push(log_msg);
                         let sz = total_bytes.max(4096);
                         guard.start_tracked_task(&label, &archive_path, sz, label.clone(), "info");
-                        guard.invalidate_dir_cache();
+                        guard.invalidate_for_entry_paths(&[&archive_path]);
                         guard.reload_pane_entries(is_right);
                         guard.select_single_path_or_first(is_right, Some(&archive_path));
                     }
@@ -7023,11 +7542,85 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
         });
     }
 
-    // Open With Application Picker confirmation
+    // Open With Application Picker confirmation, filtering, default reset & quick submenu launch
     {
         let rt = Rc::clone(&rt);
         let win_weak = window.as_weak();
-        window.on_confirm_open_with(move |app_spec| {
+        window.on_filter_open_with_apps(move |query| {
+            let Some(w) = win_weak.upgrade() else {
+                return;
+            };
+            let guard = rt.borrow();
+            let q = query.trim().to_lowercase();
+            let filtered: Vec<OpenWithAppSlint> = if q.is_empty() {
+                guard.open_with_all_apps.clone()
+            } else {
+                guard
+                    .open_with_all_apps
+                    .iter()
+                    .filter(|a| {
+                        let name_m = a.name.to_lowercase().contains(&q);
+                        name_m || a.detail.to_lowercase().contains(&q)
+                    })
+                    .cloned()
+                    .collect()
+            };
+            let def_pos = filtered.iter().position(|a| a.is_default);
+            let sel = def_pos.unwrap_or(0) as i32;
+            w.set_open_with_apps(ModelRc::new(VecModel::from(filtered)));
+            w.set_open_with_selected_idx(sel);
+        });
+    }
+    {
+        let rt = Rc::clone(&rt);
+        let win_weak = window.as_weak();
+        window.on_reset_open_with_default(move || {
+            let Some(w) = win_weak.upgrade() else {
+                return;
+            };
+            let mut guard = rt.borrow_mut();
+            let ext = w.get_open_with_target_ext().to_string();
+            if !ext.is_empty() {
+                guard.prefs.set_default_open_with_for_ext(&ext, None);
+                let _ = guard.prefs.save_default();
+                let target_path = w.get_open_with_target_path().to_string();
+                let target_name = w.get_open_with_target_name().to_string();
+                let tmp_meta = FileMetadata {
+                    name: target_name,
+                    path: target_path,
+                    extension: Some(ext.clone()),
+                    kind: "Document".to_string(),
+                    size: None,
+                    is_dir: false,
+                    is_symlink: false,
+                    is_hidden: false,
+                    is_locked: false,
+                    hide_extension: false,
+                    color_label: ColorLabel::None,
+                    modified: None,
+                    created: None,
+                    added: None,
+                    permissions: 0o644,
+                    owner: None,
+                    group: None,
+                };
+                let apps = discover_open_with_apps_with_default(&tmp_meta, None);
+                guard.open_with_all_apps = apps.clone();
+                w.set_open_with_has_custom_default(false);
+                w.set_open_with_always_use(false);
+                w.set_open_with_filter(SharedString::default());
+                w.set_open_with_apps(ModelRc::new(VecModel::from(apps)));
+                w.set_open_with_selected_idx(0);
+                let toast = format!("Reset default app for .{ext} to System Default");
+                guard.show_toast("info", toast);
+                sync_window_from_runtime(&w, &mut guard);
+            }
+        });
+    }
+    {
+        let rt = Rc::clone(&rt);
+        let win_weak = window.as_weak();
+        window.on_confirm_open_with(move |app_spec, always_use| {
             let Some(w) = win_weak.upgrade() else {
                 return;
             };
@@ -7037,7 +7630,14 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 return;
             }
             let target = w.get_open_with_target_path().to_string();
+            let target_ext = w.get_open_with_target_ext().to_string();
             let mut guard = rt.borrow_mut();
+            if always_use && !target_ext.is_empty() {
+                guard
+                    .prefs
+                    .set_default_open_with_for_ext(&target_ext, Some(trimmed));
+                let _ = guard.prefs.save_default();
+            }
             let local_target = if split_remote_uri(&target).is_some() {
                 let mut staged = None;
                 if let Some(meta) = guard.selected_metadata().cloned() {
@@ -7051,7 +7651,11 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 Ok(app_label) => {
                     let log = format!("[OPEN_WITH] Opened {local_target} with {app_label}");
                     guard.logs.push(log);
-                    let toast = format!("Opened with {app_label}");
+                    let toast = if always_use && !target_ext.is_empty() {
+                        format!("Opened with {app_label} (default for .{target_ext})")
+                    } else {
+                        format!("Opened with {app_label}")
+                    };
                     guard.show_toast("info", toast);
                 }
                 Err(err) => {
@@ -7061,6 +7665,44 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 }
             }
             sync_window_from_runtime(&w, &mut guard);
+        });
+    }
+    {
+        let rt = Rc::clone(&rt);
+        let win_weak = window.as_weak();
+        window.on_open_with_quick_app(move |app_spec| {
+            let app_str = app_spec.to_string();
+            let trimmed = app_str.trim();
+            if trimmed.is_empty() {
+                return;
+            }
+            let mut guard = rt.borrow_mut();
+            let Some(meta) = guard.selected_metadata().cloned() else {
+                return;
+            };
+            let local_target = if split_remote_uri(&meta.path).is_some() {
+                guard
+                    .stage_remote_file_for_edit(&meta)
+                    .unwrap_or_else(|| meta.path.clone())
+            } else {
+                meta.path.clone()
+            };
+            match launch_file_with_app(&local_target, trimmed) {
+                Ok(app_label) => {
+                    let log = format!("[OPEN_WITH] Opened {local_target} with {app_label}");
+                    guard.logs.push(log);
+                    guard.show_toast("info", format!("Opened with {app_label}"));
+                }
+                Err(err) => {
+                    guard
+                        .logs
+                        .push(format!("[OPEN_WITH] Failed ({trimmed}): {err}"));
+                    guard.show_toast("error", err);
+                }
+            }
+            if let Some(w) = win_weak.upgrade() {
+                sync_window_from_runtime(&w, &mut guard);
+            }
         });
     }
 
@@ -7148,8 +7790,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 };
                 let dst_label = if permanent { "Removed" } else { "Trash" };
                 guard.start_tracked_task(&label, dst_label, total_bytes, label.clone(), "delete");
-                let _ = cur_dir;
-                guard.invalidate_dir_cache();
+                guard.invalidate_dir_paths(&[&cur_dir]);
                 guard.reload_pane_entries(false);
                 guard.reload_pane_entries(true);
                 guard.select_single_path_or_first(is_right, None);
@@ -7209,10 +7850,11 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
     {
         let rt = Rc::clone(&rt);
         let win_weak = window.as_weak();
-        window.on_update_drag_cursor(move |from_right, row_idx, abs_x, abs_y| {
+        window.on_update_drag_cursor(move |from_right, row_idx, abs_x, abs_y, fm, fc| {
             let Some(w) = win_weak.upgrade() else {
                 return;
             };
+            let (os_move, os_copy) = query_os_drag_modifiers(fm, fc);
             let mut guard = rt.borrow_mut();
             if guard.native_os_drag_handed_off || !is_primary_mouse_button_pressed() {
                 drop(guard);
@@ -7233,8 +7875,11 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 w.get_drag_right_scroll_y(),
             );
             let bounds = window_logical_bounds(&w);
-            let is_mac = cfg!(target_os = "macos");
-            let res = guard.resolve_drop_target_for_os(from_right, &items, coords, bounds, is_mac);
+            let opts = DragDropOptions {
+                allow_external_os_drop: cfg!(target_os = "macos"),
+                modifier_mode: DragModifierMode::from_flags(os_move, os_copy),
+            };
+            let res = guard.resolve_drop_target_for_os(from_right, &items, coords, bounds, opts);
             if res.dst_dir.as_deref() == Some("__EXTERNAL_OS_DROP__") {
                 let local_paths = guard.prepare_local_paths_for_external_drag(&items);
                 copy_files_to_os_clipboard(&local_paths);
@@ -7257,6 +7902,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 format!("{} items", items.len())
             };
             w.set_is_dragging_row(true);
+            w.set_drag_is_move(res.is_move);
             w.set_drag_ghost_x(abs_x);
             w.set_drag_ghost_y(abs_y);
             w.set_drag_ghost_label(ghost_label.into());
@@ -7273,12 +7919,13 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
     {
         let rt = Rc::clone(&rt);
         let win_weak = window.as_weak();
-        window.on_finish_drag_drop(move |from_right, row_idx, abs_x, abs_y| {
+        window.on_finish_drag_drop(move |from_right, row_idx, abs_x, abs_y, fm, fc| {
             let Some(w) = win_weak.upgrade() else {
                 return;
             };
             clear_window_drag_overlay(&w);
 
+            let (os_move, os_copy) = query_os_drag_modifiers(fm, fc);
             let mut guard = rt.borrow_mut();
             if guard.native_os_drag_handed_off {
                 guard.native_os_drag_handed_off = false;
@@ -7297,8 +7944,11 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 w.get_drag_right_scroll_y(),
             );
             let bounds = window_logical_bounds(&w);
-            let is_mac = cfg!(target_os = "macos");
-            let res = guard.resolve_drop_target_for_os(from_right, &items, coords, bounds, is_mac);
+            let opts = DragDropOptions {
+                allow_external_os_drop: cfg!(target_os = "macos"),
+                modifier_mode: DragModifierMode::from_flags(os_move, os_copy),
+            };
+            let res = guard.resolve_drop_target_for_os(from_right, &items, coords, bounds, opts);
             if let Some(dst_dir) = res.dst_dir {
                 guard.execute_drop_target(&items, &dst_dir, res.is_move);
                 sync_window_from_runtime(&w, &mut guard);
@@ -7602,7 +8252,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                     .logs
                     .push(format!("[PERM] {} -> {sym} ({oct})", meta.name));
                 let is_right = guard.is_right_effective();
-                guard.invalidate_dir_cache();
+                guard.invalidate_for_entry_paths(&[&meta.path]);
                 guard.reload_pane_entries(is_right);
                 if let Some(w) = win_weak.upgrade() {
                     sync_window_from_runtime(&w, &mut guard);
@@ -7661,7 +8311,8 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                     format!("Tagged {} items as {tag_name}", selected_list.len())
                 };
                 guard.show_toast("info", toast_msg);
-                guard.invalidate_dir_cache();
+                let cur_dir = guard.current_pane_path(is_right);
+                guard.invalidate_dir_paths(&[&cur_dir]);
                 guard.reload_pane_entries(is_right);
                 if let Some(w) = win_weak.upgrade() {
                     sync_window_from_runtime(&w, &mut guard);
@@ -7680,7 +8331,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 let next = !meta.hide_extension;
                 let _ = guard.local_vfs.set_hide_extension(&meta.path, next);
                 let is_right = guard.is_right_effective();
-                guard.invalidate_dir_cache();
+                guard.invalidate_for_entry_paths(&[&meta.path]);
                 guard.reload_pane_entries(is_right);
                 if let Some(w) = win_weak.upgrade() {
                     sync_window_from_runtime(&w, &mut guard);
@@ -7699,7 +8350,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 let next = !meta.is_locked;
                 let _ = guard.local_vfs.set_locked(&meta.path, next);
                 let is_right = guard.is_right_effective();
-                guard.invalidate_dir_cache();
+                guard.invalidate_for_entry_paths(&[&meta.path]);
                 guard.reload_pane_entries(is_right);
                 if let Some(w) = win_weak.upgrade() {
                     sync_window_from_runtime(&w, &mut guard);
@@ -7765,7 +8416,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                     };
                     let toast = label.clone();
                     guard.start_tracked_task(&label, &cur_dir, total_bytes, toast, "success");
-                    guard.invalidate_dir_cache();
+                    guard.invalidate_dir_paths(&[&cur_dir]);
                     guard.reload_pane_entries(false);
                     if let Some(w) = win_weak.upgrade() {
                         sync_window_from_runtime(&w, &mut guard);
@@ -8311,10 +8962,13 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
         let win_weak = window.as_weak();
         window.on_open_terminal(move || {
             let mut guard = rt.borrow_mut();
-            guard.sync_terminal_cwd();
-            let _ = guard.poll_pty_output();
             if let Some(w) = win_weak.upgrade() {
                 let next = !w.get_show_terminal_drawer();
+                guard.terminal_drawer_open = next;
+                if next {
+                    guard.sync_terminal_cwd();
+                    let _ = guard.poll_pty_output();
+                }
                 w.set_show_terminal_drawer(next);
                 sync_window_from_runtime(&w, &mut guard);
                 if next {
@@ -8482,6 +9136,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 .filter(|m| m.is_dir)
                 .map(|m| m.path.clone())
                 .unwrap_or_else(|| guard.current_pane_path(is_right));
+            guard.terminal_drawer_open = true;
             guard.open_terminal_at_path(&sel_dir);
             let _ = guard.poll_pty_output();
             let msg = format!("[TERM] Opened integrated bottom terminal at {sel_dir}");
@@ -8808,7 +9463,10 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
             }
             let mut need_transfer_sync = false;
             let mut need_full_sync = guard.poll_search_events();
-            if guard.poll_bg_dir_sizes() || guard.drain_thumb_queue() {
+            if guard.poll_bg_dir_loads() || guard.poll_bg_dir_sizes() || guard.drain_thumb_queue() {
+                need_full_sync = true;
+            }
+            if guard.poll_bg_dir_watch() {
                 need_full_sync = true;
             }
             if !need_full_sync {
@@ -9088,13 +9746,12 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
             }
 
             guard.fs_poll_tick = guard.fs_poll_tick.wrapping_add(1);
-            if guard.fs_poll_tick.is_multiple_of(16)
+            if guard.fs_poll_tick.is_multiple_of(32)
                 && guard.bg_tasks_in_flight == 0
                 && !w.get_is_dragging_row()
                 && !w.get_show_conflict_modal()
-                && guard.poll_external_directory_changes()
             {
-                need_full_sync = true;
+                guard.request_bg_external_dir_watch();
             }
 
             guard.session_save_tick = guard.session_save_tick.wrapping_add(1);
@@ -9102,7 +9759,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 && !need_full_sync
             {
                 guard.session_dirty = false;
-                guard.capture_and_save_session(&w);
+                guard.capture_and_save_session_async(&w);
             }
 
             if need_full_sync {

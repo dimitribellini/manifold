@@ -70,6 +70,7 @@ pub(super) fn handle_keyboard_shortcut(
         if !had_overlay {
             if w.get_show_terminal_drawer() {
                 w.set_show_terminal_drawer(false);
+                rt.borrow_mut().terminal_drawer_open = false;
             } else if !w.get_search_query().is_empty() {
                 let is_right = rt.borrow().is_right_effective();
                 w.set_search_query(SharedString::default());
@@ -601,19 +602,33 @@ pub(super) fn push_unique_open_with_app(
     name: &str,
     detail: &str,
     icon_kind: &str,
+    saved_default: Option<&str>,
 ) {
     if out.iter().any(|a| a.id.as_str() == id) {
         return;
     }
+    let is_def = match saved_default {
+        Some(def) => def.eq_ignore_ascii_case(id) || def.eq_ignore_ascii_case(name),
+        None => id == "__DEFAULT__",
+    };
     out.push(OpenWithAppSlint {
         id: id.into(),
         name: name.into(),
         detail: detail.into(),
         icon_kind: icon_kind.into(),
+        is_default: is_def,
     });
 }
 
+#[cfg(test)]
 pub(super) fn discover_open_with_apps(meta: &FileMetadata) -> Vec<OpenWithAppSlint> {
+    discover_open_with_apps_with_default(meta, None)
+}
+
+pub(super) fn discover_open_with_apps_with_default(
+    meta: &FileMetadata,
+    saved_default: Option<&str>,
+) -> Vec<OpenWithAppSlint> {
     let mut apps = Vec::new();
     let default_detail = if cfg!(target_os = "macos") {
         "System LaunchServices default handler (/usr/bin/open)"
@@ -627,7 +642,8 @@ pub(super) fn discover_open_with_apps(meta: &FileMetadata) -> Vec<OpenWithAppSli
         "__DEFAULT__",
         "System Default Application",
         default_detail,
-        "external-link",
+        "external",
+        saved_default,
     );
 
     let ext = meta
@@ -723,27 +739,46 @@ pub(super) fn discover_open_with_apps(meta: &FileMetadata) -> Vec<OpenWithAppSli
         }
         for (bundle_path, label, icon) in mac_candidates {
             if std::path::Path::new(bundle_path).exists() {
-                push_unique_open_with_app(&mut apps, bundle_path, label, bundle_path, icon);
+                push_unique_open_with_app(
+                    &mut apps,
+                    bundle_path,
+                    label,
+                    bundle_path,
+                    icon,
+                    saved_default,
+                );
             }
         }
-        if let Ok(entries) = std::fs::read_dir("/Applications") {
-            let mut extra_apps: Vec<(String, String)> = entries
-                .flatten()
-                .filter_map(|e| {
-                    let path = e.path();
-                    let name = path.file_name()?.to_string_lossy().to_string();
-                    if name.ends_with(".app") {
-                        let label = name.trim_end_matches(".app").to_string();
-                        Some((path.to_string_lossy().to_string(), label))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            extra_apps.sort_by_key(|(_, label)| label.to_lowercase());
-            for (path_str, label) in extra_apps.into_iter().take(18) {
-                push_unique_open_with_app(&mut apps, &path_str, &label, &path_str, "folder");
+        let mut app_dirs = vec![PathBuf::from("/Applications")];
+        if let Ok(home) = std::env::var("HOME") {
+            if !home.trim().is_empty() {
+                app_dirs.push(PathBuf::from(home).join("Applications"));
             }
+        }
+        let mut extra_apps: Vec<(String, String)> = Vec::new();
+        for dir in app_dirs {
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for e in entries.flatten() {
+                    let path = e.path();
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        if name.ends_with(".app") {
+                            let label = name.trim_end_matches(".app").to_string();
+                            extra_apps.push((path.to_string_lossy().to_string(), label));
+                        }
+                    }
+                }
+            }
+        }
+        extra_apps.sort_by_key(|(_, label)| label.to_lowercase());
+        for (path_str, label) in extra_apps.into_iter().take(200) {
+            push_unique_open_with_app(
+                &mut apps,
+                &path_str,
+                &label,
+                &path_str,
+                "folder",
+                saved_default,
+            );
         }
     } else if cfg!(target_os = "windows") {
         let win_bins: [(&str, &str, &str, &str); 5] = [
@@ -774,7 +809,7 @@ pub(super) fn discover_open_with_apps(meta: &FileMetadata) -> Vec<OpenWithAppSli
             ),
         ];
         for (bin, label, detail, icon) in win_bins {
-            push_unique_open_with_app(&mut apps, bin, label, detail, icon);
+            push_unique_open_with_app(&mut apps, bin, label, detail, icon, saved_default);
         }
     } else {
         let linux_bins: [(&str, &str, &str); 18] = [
@@ -802,7 +837,150 @@ pub(super) fn discover_open_with_apps(meta: &FileMetadata) -> Vec<OpenWithAppSli
             for dir in search_dirs {
                 let full = format!("{dir}/{bin}");
                 if std::path::Path::new(&full).exists() {
-                    push_unique_open_with_app(&mut apps, &full, label, &full, icon);
+                    push_unique_open_with_app(&mut apps, &full, label, &full, icon, saved_default);
+                    break;
+                }
+            }
+        }
+    }
+
+    if let Some(def_spec) = saved_default.filter(|s| !s.trim().is_empty()) {
+        if !apps.iter().any(|a| a.is_default) {
+            let label = std::path::Path::new(def_spec)
+                .file_name()
+                .map(|n| n.to_string_lossy().trim_end_matches(".app").to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| def_spec.to_string());
+            apps.insert(
+                1,
+                OpenWithAppSlint {
+                    id: def_spec.into(),
+                    name: label.into(),
+                    detail: def_spec.into(),
+                    icon_kind: "applications".into(),
+                    is_default: true,
+                },
+            );
+        }
+    }
+    apps
+}
+
+pub(super) fn discover_quick_open_with_apps(
+    meta: &FileMetadata,
+    saved_default: Option<&str>,
+) -> Vec<OpenWithAppSlint> {
+    let mut apps = Vec::new();
+    push_unique_open_with_app(
+        &mut apps,
+        "__DEFAULT__",
+        "System Default",
+        "Default handler",
+        "external",
+        saved_default,
+    );
+    if let Some(def_spec) = saved_default.filter(|s| !s.trim().is_empty()) {
+        let label = std::path::Path::new(def_spec)
+            .file_name()
+            .map(|n| n.to_string_lossy().trim_end_matches(".app").to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| def_spec.to_string());
+        push_unique_open_with_app(
+            &mut apps,
+            def_spec,
+            &label,
+            def_spec,
+            "applications",
+            saved_default,
+        );
+    }
+
+    let ext = meta
+        .extension
+        .as_deref()
+        .unwrap_or("")
+        .trim_start_matches('.')
+        .to_lowercase();
+    let is_image = matches!(
+        ext.as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "ico" | "tiff" | "heic"
+    );
+    let is_media = matches!(
+        ext.as_str(),
+        "mp3" | "wav" | "flac" | "m4a" | "ogg" | "aac" | "mp4" | "mov" | "mkv" | "webm" | "avi"
+    );
+    let is_pdf_or_doc = matches!(
+        ext.as_str(),
+        "pdf" | "doc" | "docx" | "rtf" | "odt" | "pages" | "xls" | "xlsx" | "ppt" | "pptx"
+    );
+
+    if cfg!(target_os = "macos") {
+        let mut cands: Vec<(&str, &str, &str)> = Vec::new();
+        if meta.is_dir {
+            cands.push((
+                "/System/Applications/Utilities/Terminal.app",
+                "Terminal",
+                "terminal",
+            ));
+            cands.push((
+                "/Applications/Visual Studio Code.app",
+                "Visual Studio Code",
+                "code",
+            ));
+            cands.push(("/Applications/Zed.app", "Zed", "code"));
+        } else {
+            if is_image || is_pdf_or_doc {
+                cands.push(("/System/Applications/Preview.app", "Preview", "image"));
+            }
+            if is_media {
+                cands.push(("/Applications/VLC.app", "VLC", "movies"));
+                cands.push(("/Applications/IINA.app", "IINA", "movies"));
+                cands.push((
+                    "/System/Applications/QuickTime Player.app",
+                    "QuickTime Player",
+                    "movies",
+                ));
+            }
+            cands.push((
+                "/Applications/Visual Studio Code.app",
+                "Visual Studio Code",
+                "code",
+            ));
+            cands.push(("/Applications/Zed.app", "Zed", "code"));
+            cands.push(("/System/Applications/TextEdit.app", "TextEdit", "documents"));
+        }
+        for (p, lbl, icon) in cands {
+            if apps.len() >= 6 {
+                break;
+            }
+            if std::path::Path::new(p).exists() {
+                push_unique_open_with_app(&mut apps, p, lbl, p, icon, saved_default);
+            }
+        }
+    } else if cfg!(target_os = "windows") {
+        for (bin, lbl, icon) in [
+            ("notepad.exe", "Notepad", "documents"),
+            ("code", "Visual Studio Code", "code"),
+            ("explorer.exe", "Windows Explorer", "folder"),
+        ] {
+            push_unique_open_with_app(&mut apps, bin, lbl, bin, icon, saved_default);
+        }
+    } else {
+        for (bin, lbl, icon) in [
+            ("code", "Visual Studio Code", "code"),
+            ("zed", "Zed Editor", "code"),
+            ("gedit", "GNOME Text Editor", "documents"),
+            ("evince", "Document Viewer", "documents"),
+            ("vlc", "VLC Media Player", "movies"),
+            ("firefox", "Mozilla Firefox", "globe"),
+        ] {
+            if apps.len() >= 6 {
+                break;
+            }
+            for dir in ["/usr/bin", "/usr/local/bin", "/bin", "/snap/bin"] {
+                let full = format!("{dir}/{bin}");
+                if std::path::Path::new(&full).exists() {
+                    push_unique_open_with_app(&mut apps, &full, lbl, &full, icon, saved_default);
                     break;
                 }
             }

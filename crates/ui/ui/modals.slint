@@ -941,6 +941,7 @@ export component WindowOverlays inherits Rectangle {
     in-out property <string> connect-smb-domain;
     in-out property <string> connect-smb-share;
     in-out property <string> connect-username;
+    in property <[OpenWithAppSlint]> context-open-with-apps;
     in property <bool> context-can-show-enclosing;
     in property <bool> context-is-blank;
     in property <length> context-menu-x;
@@ -951,6 +952,8 @@ export component WindowOverlays inherits Rectangle {
     in property <bool> context-target-is-dir;
     in property <bool> context-target-is-favorite;
     in property <string> context-target-name;
+    private property <string> context-active-submenu: "";
+    private property <length> context-submenu-y: 0px;
     in property <bool> current-folder-is-favorite;
     in property <string> delete-modal-message;
     in property <bool> delete-modal-permanent;
@@ -964,6 +967,7 @@ export component WindowOverlays inherits Rectangle {
     in property <string> drag-ghost-label;
     in property <length> drag-ghost-x;
     in property <length> drag-ghost-y;
+    in property <bool> drag-is-move;
     in property <length> drag-tab-grab-offset-x;
     in property <length> drag-tab-grab-offset-y;
     in property <string> drag-tab-icon;
@@ -1009,8 +1013,12 @@ export component WindowOverlays inherits Rectangle {
     in property <bool> is-dragging-tab;
     in property <length> left-pane-width;
     in property <[OpenWithAppSlint]> open-with-apps;
+    in-out property <bool> open-with-always-use;
     in-out property <string> open-with-custom-cmd;
+    in-out property <string> open-with-filter;
+    in property <bool> open-with-has-custom-default;
     in-out property <int> open-with-selected-idx;
+    in property <string> open-with-target-ext;
     in property <string> open-with-target-name;
     in property <int> pref-max-bandwidth-mbps;
     in-out property <length> preview-minion-x;
@@ -1116,11 +1124,12 @@ export component WindowOverlays inherits Rectangle {
     callback confirm-connect-dialog();
     callback confirm-delete-modal();
     callback confirm-input-modal(string);
-    callback confirm-open-with(string);
+    callback confirm-open-with(string, bool);
     callback delete-batch-rename-favorite(int);
     callback execute-context-action(string);
     callback execute-sidebar-context-action(string);
     callback execute-sync-plan();
+    callback filter-open-with-apps(string);
     callback focus-key-router();
     callback navigate-to-breadcrumb(bool, string);
     callback open-connect-dialog();
@@ -1129,9 +1138,11 @@ export component WindowOverlays inherits Rectangle {
     callback open-sync-modal();
     callback open-terminal();
     callback open-terminal-here();
+    callback open-with-quick-app(string);
     callback update-action(string);
     callback remove-batch-rename-rule(int);
     callback reset-batch-rename-rules();
+    callback reset-open-with-default();
     callback resolve-conflict(string);
     callback save-batch-rename-favorite();
     callback select-connect-color(int);
@@ -1230,8 +1241,15 @@ export component WindowOverlays inherits Rectangle {
         height: 100%;
         background: #00000055;
 
+        init => {
+            root.context-active-submenu = "";
+        }
+
         TouchArea {
-            clicked => { root.show-context-menu = false; }
+            clicked => {
+                root.context-active-submenu = "";
+                root.show-context-menu = false;
+            }
         }
 
         // Outer ambient drop shadow (ensures visible elevation even in software renderer)
@@ -1275,29 +1293,28 @@ export component WindowOverlays inherits Rectangle {
                 padding: 6px;
                 spacing: 2px;
 
-                if !root.context-is-blank && root.context-selected-count > 1 : ContextMenuItem {
-                    icon-kind: "folder";
-                    label: "New Folder with Selection";
-                    triggered => {
-                        root.show-context-menu = false;
-                        root.execute-context-action("new_folder_with_selection");
-                    }
-                }
-                if !root.context-is-blank && root.context-selected-count > 1 : Rectangle { height: 1px; background: #323238; }
-
                 if !root.context-is-blank : ContextMenuItem {
                     icon-kind: "external";
                     label: "Open";
                     shortcut-hint: "Enter";
+                    hovered => { root.context-active-submenu = ""; }
                     triggered => {
+                        root.context-active-submenu = "";
                         root.show-context-menu = false;
                         root.execute-context-action("open");
                     }
                 }
                 if !root.context-is-blank : ContextMenuItem {
                     icon-kind: "external";
-                    label: "Open With…";
+                    label: "Open With";
+                    has-submenu: true;
+                    is-submenu-open: root.context-active-submenu == "open_with";
+                    hovered(iy) => {
+                        root.context-submenu-y = iy;
+                        root.context-active-submenu = "open_with";
+                    }
                     triggered => {
+                        root.context-active-submenu = "";
                         root.show-context-menu = false;
                         root.execute-context-action("open_with");
                     }
@@ -1306,18 +1323,19 @@ export component WindowOverlays inherits Rectangle {
                     icon-kind: "plus";
                     label: "Open in New Tab";
                     shortcut-hint: "Ctrl+T";
+                    hovered => { root.context-active-submenu = ""; }
                     triggered => {
+                        root.context-active-submenu = "";
                         root.show-context-menu = false;
                         root.execute-context-action("open_new_tab");
                     }
                 }
-
-                if !root.context-is-blank && (root.context-can-show-enclosing || root.context-target-is-archive || root.context-target-is-app-bundle) : Rectangle { height: 1px; background: #323238; }
-
                 if !root.context-is-blank && root.context-can-show-enclosing : ContextMenuItem {
                     icon-kind: "folder-up";
                     label: "Show in Enclosing Folder";
+                    hovered => { root.context-active-submenu = ""; }
                     triggered => {
+                        root.context-active-submenu = "";
                         root.show-context-menu = false;
                         root.execute-context-action("show_in_enclosing_folder");
                     }
@@ -1325,17 +1343,190 @@ export component WindowOverlays inherits Rectangle {
                 if !root.context-is-blank && root.context-target-is-archive : ContextMenuItem {
                     icon-kind: "archive-contents";
                     label: "Show Archive Contents";
+                    hovered => { root.context-active-submenu = ""; }
                     triggered => {
+                        root.context-active-submenu = "";
                         root.show-context-menu = false;
                         root.execute-context-action("show_archive_contents");
+                    }
+                }
+                if !root.context-is-blank && root.context-target-is-archive : ContextMenuItem {
+                    icon-kind: "archive";
+                    label: "Extract \"" + root.context-target-name + "\" Here";
+                    hovered => { root.context-active-submenu = ""; }
+                    triggered => {
+                        root.context-active-submenu = "";
+                        root.show-context-menu = false;
+                        root.execute-context-action("extract");
                     }
                 }
                 if !root.context-is-blank && root.context-target-is-app-bundle : ContextMenuItem {
                     icon-kind: "archive-contents";
                     label: "Show Package Contents";
+                    hovered => { root.context-active-submenu = ""; }
                     triggered => {
+                        root.context-active-submenu = "";
                         root.show-context-menu = false;
                         root.execute-context-action("show_package_contents");
+                    }
+                }
+
+                if !root.context-is-blank : Rectangle { height: 1px; background: #323238; }
+
+                // Blank-area quick creation & actions
+                if root.context-is-blank : ContextMenuItem {
+                    icon-kind: "folder";
+                    label: "New Folder";
+                    shortcut-hint: "Ctrl+N";
+                    triggered => {
+                        root.show-context-menu = false;
+                        root.execute-context-action("new_folder");
+                    }
+                }
+                if root.context-is-blank : ContextMenuItem {
+                    icon-kind: "file";
+                    label: "New File";
+                    triggered => {
+                        root.show-context-menu = false;
+                        root.execute-context-action("new_file");
+                    }
+                }
+                if root.context-is-blank && root.has-clipboard-item : ContextMenuItem {
+                    icon-kind: "downloads";
+                    label: "Paste Item Here";
+                    shortcut-hint: "Ctrl+V";
+                    triggered => {
+                        root.show-context-menu = false;
+                        root.execute-context-action("paste");
+                    }
+                }
+                if root.context-is-blank : Rectangle { height: 1px; background: #323238; }
+                if root.context-is-blank && !root.context-target-is-favorite : ContextMenuItem {
+                    icon-kind: "star";
+                    label: "Add to Favorites";
+                    triggered => {
+                        root.show-context-menu = false;
+                        root.execute-context-action("add_favorite");
+                    }
+                }
+                if root.context-is-blank && root.context-target-is-favorite : ContextMenuItem {
+                    icon-kind: "eject";
+                    label: "Remove from Favorites";
+                    triggered => {
+                        root.show-context-menu = false;
+                        root.execute-context-action("remove_favorite");
+                    }
+                }
+                if root.context-is-blank : ContextMenuItem {
+                    icon-kind: "terminal";
+                    label: "Open in Bottom Terminal";
+                    triggered => {
+                        root.show-context-menu = false;
+                        root.open-terminal-here();
+                    }
+                }
+                if root.context-is-blank : ContextMenuItem {
+                    icon-kind: "external";
+                    label: "Open in OS File Manager";
+                    triggered => {
+                        root.show-context-menu = false;
+                        root.execute-context-action("reveal_in_finder");
+                    }
+                }
+                if root.context-is-blank : Rectangle { height: 1px; background: #323238; }
+                if root.context-is-blank : ContextMenuItem {
+                    icon-kind: "sliders";
+                    label: "Show View Options";
+                    shortcut-hint: "Ctrl+J";
+                    triggered => {
+                        root.show-context-menu = false;
+                        root.execute-context-action("show_view_options");
+                    }
+                }
+                if root.context-is-blank : ContextMenuItem {
+                    icon-kind: "info";
+                    label: "Get Info";
+                    shortcut-hint: "Ctrl+I";
+                    triggered => {
+                        root.show-context-menu = false;
+                        root.execute-context-action("get_info");
+                    }
+                }
+
+                // Item-selected compact primary menu
+                if !root.context-is-blank : ContextMenuItem {
+                    icon-kind: "scissors";
+                    label: root.context-selected-count > 1
+                        ? ("Cut " + root.context-selected-count + " Items")
+                        : "Cut";
+                    shortcut-hint: "Ctrl+X";
+                    hovered => { root.context-active-submenu = ""; }
+                    triggered => {
+                        root.context-active-submenu = "";
+                        root.show-context-menu = false;
+                        root.execute-context-action("cut");
+                    }
+                }
+                if !root.context-is-blank : ContextMenuItem {
+                    icon-kind: "copy";
+                    label: root.context-selected-count > 1
+                        ? ("Copy " + root.context-selected-count + " Items")
+                        : "Copy";
+                    shortcut-hint: "Ctrl+C";
+                    hovered => { root.context-active-submenu = ""; }
+                    triggered => {
+                        root.context-active-submenu = "";
+                        root.show-context-menu = false;
+                        root.execute-context-action("copy");
+                    }
+                }
+                if !root.context-is-blank && root.has-clipboard-item : ContextMenuItem {
+                    icon-kind: "downloads";
+                    label: "Paste Item Here";
+                    shortcut-hint: "Ctrl+V";
+                    hovered => { root.context-active-submenu = ""; }
+                    triggered => {
+                        root.context-active-submenu = "";
+                        root.show-context-menu = false;
+                        root.execute-context-action("paste");
+                    }
+                }
+
+                if !root.context-is-blank : Rectangle { height: 1px; background: #323238; }
+
+                if !root.context-is-blank : ContextMenuItem {
+                    icon-kind: "edit";
+                    label: root.context-selected-count > 1
+                        ? ("Rename " + root.context-selected-count + " Items…")
+                        : "Rename";
+                    shortcut-hint: "F2";
+                    hovered => { root.context-active-submenu = ""; }
+                    triggered => {
+                        root.context-active-submenu = "";
+                        root.show-context-menu = false;
+                        root.execute-context-action("rename");
+                    }
+                }
+                if !root.context-is-blank : ContextMenuItem {
+                    icon-kind: "copy";
+                    label: "Duplicate";
+                    shortcut-hint: "Ctrl+D";
+                    hovered => { root.context-active-submenu = ""; }
+                    triggered => {
+                        root.context-active-submenu = "";
+                        root.show-context-menu = false;
+                        root.execute-context-action("duplicate");
+                    }
+                }
+                if !root.context-is-blank : ContextMenuItem {
+                    icon-kind: "info";
+                    label: "Get Info";
+                    shortcut-hint: "Ctrl+I";
+                    hovered => { root.context-active-submenu = ""; }
+                    triggered => {
+                        root.context-active-submenu = "";
+                        root.show-context-menu = false;
+                        root.execute-context-action("get_info");
                     }
                 }
 
@@ -1345,180 +1536,40 @@ export component WindowOverlays inherits Rectangle {
                     icon-kind: "trash";
                     label: "Move to Bin";
                     shortcut-hint: "Del";
+                    hovered => { root.context-active-submenu = ""; }
                     triggered => {
+                        root.context-active-submenu = "";
                         root.show-context-menu = false;
                         root.execute-context-action("trash");
                     }
                 }
+
+                if !root.context-is-blank : Rectangle { height: 1px; background: #323238; }
+
                 if !root.context-is-blank : ContextMenuItem {
-                    icon-kind: "close";
-                    label: "Permanent Delete";
-                    shortcut-hint: "Shift+Del";
-                    triggered => {
-                        root.show-context-menu = false;
-                        root.execute-context-action("delete_permanent");
+                    icon-kind: "plus";
+                    label: "New";
+                    has-submenu: true;
+                    is-submenu-open: root.context-active-submenu == "new";
+                    hovered(iy) => {
+                        root.context-submenu-y = iy;
+                        root.context-active-submenu = "new";
                     }
-                }
-
-                Rectangle { height: 1px; background: #323238; }
-
-                ContextMenuItem {
-                    icon-kind: "info";
-                    label: "Get Info";
-                    shortcut-hint: "Ctrl+I";
                     triggered => {
-                        root.show-context-menu = false;
-                        root.execute-context-action("get_info");
+                        root.context-active-submenu = root.context-active-submenu == "new" ? "" : "new";
                     }
                 }
                 if !root.context-is-blank : ContextMenuItem {
-                    icon-kind: "edit";
-                    label: root.context-selected-count > 1
-                        ? ("Rename " + root.context-selected-count + " Items…")
-                        : "Rename";
-                    shortcut-hint: "F2";
-                    triggered => {
-                        root.show-context-menu = false;
-                        root.execute-context-action("rename");
-                    }
-                }
-                ContextMenuItem {
-                    icon-kind: "folder";
-                    label: "New Folder";
-                    shortcut-hint: "Ctrl+N";
-                    triggered => {
-                        root.show-context-menu = false;
-                        root.execute-context-action("new_folder");
-                    }
-                }
-                ContextMenuItem {
-                    icon-kind: "file";
-                    label: "New File";
-                    triggered => {
-                        root.show-context-menu = false;
-                        root.execute-context-action("new_file");
-                    }
-                }
-                if (root.context-target-is-dir || root.context-is-blank) && !root.context-target-is-favorite : ContextMenuItem {
-                    icon-kind: "star";
-                    label: "Add to Favorites";
-                    triggered => {
-                        root.show-context-menu = false;
-                        root.execute-context-action("add_favorite");
-                    }
-                }
-                if (root.context-target-is-dir || root.context-is-blank) && root.context-target-is-favorite : ContextMenuItem {
-                    icon-kind: "eject";
-                    label: "Remove from Favorites";
-                    triggered => {
-                        root.show-context-menu = false;
-                        root.execute-context-action("remove_favorite");
-                    }
-                }
-                if !root.context-is-blank && root.context-target-is-archive : ContextMenuItem {
-                    icon-kind: "archive";
-                    label: "Extract \"" + root.context-target-name + "\" Here";
-                    triggered => {
-                        root.show-context-menu = false;
-                        root.execute-context-action("extract");
-                    }
-                }
-                if !root.context-is-blank && !root.context-target-is-archive : ContextMenuItem {
-                    icon-kind: "archive";
-                    label: root.context-selected-count > 1
-                        ? ("Compress " + root.context-selected-count + " Items")
-                        : ("Compress \"" + root.context-target-name + "\"");
-                    triggered => {
-                        root.show-context-menu = false;
-                        root.execute-context-action("compress");
-                    }
-                }
-                if !root.context-is-blank : ContextMenuItem {
-                    icon-kind: "copy";
-                    label: "Duplicate";
-                    shortcut-hint: "Ctrl+D";
-                    triggered => {
-                        root.show-context-menu = false;
-                        root.execute-context-action("duplicate");
-                    }
-                }
-                if !root.context-is-blank : ContextMenuItem {
-                    icon-kind: "link";
-                    label: "Create Symlink";
-                    triggered => {
-                        root.show-context-menu = false;
-                        root.execute-context-action("make_alias");
-                    }
-                }
-                ContextMenuItem {
-                    icon-kind: "terminal";
-                    label: "Open in Bottom Terminal";
-                    triggered => {
-                        root.show-context-menu = false;
-                        root.open-terminal-here();
-                    }
-                }
-                ContextMenuItem {
-                    icon-kind: "external";
-                    label: "Open in OS File Manager";
-                    triggered => {
-                        root.show-context-menu = false;
-                        root.execute-context-action("reveal_in_finder");
-                    }
-                }
-
-                Rectangle { height: 1px; background: #323238; }
-
-                if !root.context-is-blank : ContextMenuItem {
-                    icon-kind: "scissors";
-                    label: root.context-selected-count > 1
-                        ? ("Cut " + root.context-selected-count + " Items")
-                        : ("Cut \"" + root.context-target-name + "\"");
-                    shortcut-hint: "Ctrl+X";
-                    triggered => {
-                        root.show-context-menu = false;
-                        root.execute-context-action("cut");
-                    }
-                }
-                if !root.context-is-blank : ContextMenuItem {
-                    icon-kind: "copy";
-                    label: root.context-selected-count > 1
-                        ? ("Copy " + root.context-selected-count + " Items")
-                        : ("Copy \"" + root.context-target-name + "\"");
-                    shortcut-hint: "Ctrl+C";
-                    triggered => {
-                        root.show-context-menu = false;
-                        root.execute-context-action("copy");
-                    }
-                }
-                if root.has-clipboard-item : ContextMenuItem {
-                    icon-kind: "downloads";
-                    label: "Paste Item Here";
-                    shortcut-hint: "Ctrl+V";
-                    triggered => {
-                        root.show-context-menu = false;
-                        root.execute-context-action("paste");
-                    }
-                }
-                ContextMenuItem {
-                    icon-kind: "link";
-                    label: "Copy Path";
-                    shortcut-hint: "Ctrl+Shift+C";
-                    triggered => {
-                        root.show-context-menu = false;
-                        root.execute-context-action("copy_path");
-                    }
-                }
-
-                Rectangle { height: 1px; background: #323238; }
-
-                ContextMenuItem {
                     icon-kind: "sliders";
-                    label: "Show View Options";
-                    shortcut-hint: "Ctrl+J";
+                    label: "More Actions";
+                    has-submenu: true;
+                    is-submenu-open: root.context-active-submenu == "more";
+                    hovered(iy) => {
+                        root.context-submenu-y = iy;
+                        root.context-active-submenu = "more";
+                    }
                     triggered => {
-                        root.show-context-menu = false;
-                        root.execute-context-action("show_view_options");
+                        root.context-active-submenu = root.context-active-submenu == "more" ? "" : "more";
                     }
                 }
 
@@ -1544,6 +1595,7 @@ export component WindowOverlays inherits Rectangle {
                             swatch-color: #FF453A;
                             selected: root.inspector-color-index == 6;
                             clicked => {
+                                root.context-active-submenu = "";
                                 root.show-context-menu = false;
                                 root.set-selected-color-label(6);
                             }
@@ -1552,6 +1604,7 @@ export component WindowOverlays inherits Rectangle {
                             swatch-color: #FF9F0A;
                             selected: root.inspector-color-index == 7;
                             clicked => {
+                                root.context-active-submenu = "";
                                 root.show-context-menu = false;
                                 root.set-selected-color-label(7);
                             }
@@ -1560,6 +1613,7 @@ export component WindowOverlays inherits Rectangle {
                             swatch-color: #FFD60A;
                             selected: root.inspector-color-index == 5;
                             clicked => {
+                                root.context-active-submenu = "";
                                 root.show-context-menu = false;
                                 root.set-selected-color-label(5);
                             }
@@ -1568,6 +1622,7 @@ export component WindowOverlays inherits Rectangle {
                             swatch-color: #5AC85A;
                             selected: root.inspector-color-index == 2;
                             clicked => {
+                                root.context-active-submenu = "";
                                 root.show-context-menu = false;
                                 root.set-selected-color-label(2);
                             }
@@ -1576,6 +1631,7 @@ export component WindowOverlays inherits Rectangle {
                             swatch-color: #0A84FF;
                             selected: root.inspector-color-index == 4;
                             clicked => {
+                                root.context-active-submenu = "";
                                 root.show-context-menu = false;
                                 root.set-selected-color-label(4);
                             }
@@ -1584,6 +1640,7 @@ export component WindowOverlays inherits Rectangle {
                             swatch-color: #AF52DE;
                             selected: root.inspector-color-index == 3;
                             clicked => {
+                                root.context-active-submenu = "";
                                 root.show-context-menu = false;
                                 root.set-selected-color-label(3);
                             }
@@ -1592,6 +1649,7 @@ export component WindowOverlays inherits Rectangle {
                             swatch-color: #8E8E93;
                             selected: root.inspector-color-index == 1;
                             clicked => {
+                                root.context-active-submenu = "";
                                 root.show-context-menu = false;
                                 root.set-selected-color-label(1);
                             }
@@ -1600,9 +1658,184 @@ export component WindowOverlays inherits Rectangle {
                             is-none: true;
                             selected: root.inspector-color-index == 0;
                             clicked => {
+                                root.context-active-submenu = "";
                                 root.show-context-menu = false;
                                 root.set-selected-color-label(0);
                             }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Cascading Flyout Submenu (Open With / New / More Actions)
+        if !root.context-is-blank && root.context-active-submenu != "" : Rectangle {
+            property <length> main-x: Math.clamp(root.context-menu-x, 8px, root.width - 270px);
+            x: main-x + 252px + 236px > root.width - 8px ? Math.max(8px, main-x - 232px) : main-x + 252px;
+            y: Math.clamp(root.context-submenu-y - 6px, 8px, Math.max(8px, root.height - ctx-submenu-layout.preferred-height - 8px));
+            width: 236px;
+            height: ctx-submenu-layout.preferred-height;
+            border-radius: 8px;
+            opacity: 1.0;
+            background: #202024;
+            border-width: 1px;
+            border-color: #323238;
+            drop-shadow-offset-y: 10px;
+            drop-shadow-blur: 24px;
+            drop-shadow-color: #00000073;
+            clip: true;
+
+            TouchArea {}
+
+            ctx-submenu-layout := VerticalLayout {
+                padding: 6px;
+                spacing: 2px;
+
+                if root.context-active-submenu == "open_with" : VerticalLayout {
+                    spacing: 2px;
+                    for app in root.context-open-with-apps : ContextMenuItem {
+                        icon-kind: app.icon-kind != "" ? app.icon-kind : "applications";
+                        label: app.name;
+                        is-checked: app.is-default;
+                        triggered => {
+                            root.context-active-submenu = "";
+                            root.show-context-menu = false;
+                            root.open-with-quick-app(app.id);
+                        }
+                    }
+                    if root.context-open-with-apps.length > 0 : Rectangle { height: 1px; background: #323238; }
+                    ContextMenuItem {
+                        icon-kind: "sliders";
+                        label: "Choose Application…";
+                        triggered => {
+                            root.context-active-submenu = "";
+                            root.show-context-menu = false;
+                            root.execute-context-action("open_with");
+                        }
+                    }
+                }
+
+                if root.context-active-submenu == "new" : VerticalLayout {
+                    spacing: 2px;
+                    ContextMenuItem {
+                        icon-kind: "folder";
+                        label: "New Folder";
+                        shortcut-hint: "Ctrl+N";
+                        triggered => {
+                            root.context-active-submenu = "";
+                            root.show-context-menu = false;
+                            root.execute-context-action("new_folder");
+                        }
+                    }
+                    ContextMenuItem {
+                        icon-kind: "file";
+                        label: "New File";
+                        triggered => {
+                            root.context-active-submenu = "";
+                            root.show-context-menu = false;
+                            root.execute-context-action("new_file");
+                        }
+                    }
+                    if root.context-selected-count > 1 : Rectangle { height: 1px; background: #323238; }
+                    if root.context-selected-count > 1 : ContextMenuItem {
+                        icon-kind: "folder";
+                        label: "New Folder with Selection";
+                        triggered => {
+                            root.context-active-submenu = "";
+                            root.show-context-menu = false;
+                            root.execute-context-action("new_folder_with_selection");
+                        }
+                    }
+                }
+
+                if root.context-active-submenu == "more" : VerticalLayout {
+                    spacing: 2px;
+                    if !root.context-target-is-archive : ContextMenuItem {
+                        icon-kind: "archive";
+                        label: root.context-selected-count > 1
+                            ? ("Compress " + root.context-selected-count + " Items")
+                            : "Compress…";
+                        triggered => {
+                            root.context-active-submenu = "";
+                            root.show-context-menu = false;
+                            root.execute-context-action("compress");
+                        }
+                    }
+                    ContextMenuItem {
+                        icon-kind: "link";
+                        label: "Create Symlink";
+                        triggered => {
+                            root.context-active-submenu = "";
+                            root.show-context-menu = false;
+                            root.execute-context-action("make_alias");
+                        }
+                    }
+                    ContextMenuItem {
+                        icon-kind: "link";
+                        label: "Copy Path";
+                        shortcut-hint: "Ctrl+Shift+C";
+                        triggered => {
+                            root.context-active-submenu = "";
+                            root.show-context-menu = false;
+                            root.execute-context-action("copy_path");
+                        }
+                    }
+                    if root.context-target-is-dir && !root.context-target-is-favorite : ContextMenuItem {
+                        icon-kind: "star";
+                        label: "Add to Favorites";
+                        triggered => {
+                            root.context-active-submenu = "";
+                            root.show-context-menu = false;
+                            root.execute-context-action("add_favorite");
+                        }
+                    }
+                    if root.context-target-is-dir && root.context-target-is-favorite : ContextMenuItem {
+                        icon-kind: "eject";
+                        label: "Remove from Favorites";
+                        triggered => {
+                            root.context-active-submenu = "";
+                            root.show-context-menu = false;
+                            root.execute-context-action("remove_favorite");
+                        }
+                    }
+                    Rectangle { height: 1px; background: #323238; }
+                    ContextMenuItem {
+                        icon-kind: "terminal";
+                        label: "Open in Bottom Terminal";
+                        triggered => {
+                            root.context-active-submenu = "";
+                            root.show-context-menu = false;
+                            root.open-terminal-here();
+                        }
+                    }
+                    ContextMenuItem {
+                        icon-kind: "external";
+                        label: "Open in OS File Manager";
+                        triggered => {
+                            root.context-active-submenu = "";
+                            root.show-context-menu = false;
+                            root.execute-context-action("reveal_in_finder");
+                        }
+                    }
+                    ContextMenuItem {
+                        icon-kind: "sliders";
+                        label: "Show View Options";
+                        shortcut-hint: "Ctrl+J";
+                        triggered => {
+                            root.context-active-submenu = "";
+                            root.show-context-menu = false;
+                            root.execute-context-action("show_view_options");
+                        }
+                    }
+                    Rectangle { height: 1px; background: #323238; }
+                    ContextMenuItem {
+                        icon-kind: "close";
+                        label: "Permanent Delete";
+                        shortcut-hint: "Shift+Del";
+                        triggered => {
+                            root.context-active-submenu = "";
+                            root.show-context-menu = false;
+                            root.execute-context-action("delete_permanent");
                         }
                     }
                 }
@@ -1925,8 +2158,8 @@ export component WindowOverlays inherits Rectangle {
 
         Rectangle {
             width: Math.clamp(
-                (root.input-modal-mode == "compress" ? 450px : 420px) + root.font-size-delta * 18,
-                390px,
+                (root.input-modal-mode == "compress" ? 490px : 520px) + root.font-size-delta * 18,
+                420px,
                 root.width - 40px
             );
             height: input-modal-layout.preferred-height;
@@ -1939,6 +2172,7 @@ export component WindowOverlays inherits Rectangle {
             drop-shadow-offset-y: 12px;
             drop-shadow-blur: 28px;
             drop-shadow-color: #00000088;
+            clip: true;
 
             TouchArea {}
 
@@ -1971,19 +2205,22 @@ export component WindowOverlays inherits Rectangle {
                     }
                     VerticalLayout {
                         horizontal-stretch: 1;
+                        min-width: 0px;
                         spacing: 3px;
                         alignment: center;
                         Text {
                             width: 100%;
+                            min-width: 0px;
                             text: root.input-modal-title;
                             color: root.theme-text-primary;
                             font-family: root.resolved-font-family;
                             font-size: 14px + root.font-size-delta;
                             font-weight: 700;
-                            wrap: word-wrap;
+                            overflow: elide;
                         }
                         if root.input-modal-mode == "compress" && root.compress-items-summary != "" : Text {
                             width: 100%;
+                            min-width: 0px;
                             text: root.compress-items-summary;
                             color: root.theme-text-secondary;
                             font-family: root.resolved-font-family;
@@ -2504,8 +2741,8 @@ export component WindowOverlays inherits Rectangle {
         }
 
         Rectangle {
-            width: Math.clamp(460px + root.font-size-delta * 18, 430px, root.width - 40px);
-            height: Math.clamp(420px + root.font-size-delta * 16, 390px, root.height - 60px);
+            width: Math.clamp(520px + root.font-size-delta * 18, 460px, root.width - 40px);
+            height: Math.clamp(500px + root.font-size-delta * 16, 430px, root.height - 60px);
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
             border-radius: 12px;
@@ -2515,22 +2752,24 @@ export component WindowOverlays inherits Rectangle {
             drop-shadow-offset-y: 12px;
             drop-shadow-blur: 28px;
             drop-shadow-color: #00000088;
+            clip: true;
 
             TouchArea {}
 
             VerticalLayout {
                 padding: 18px;
-                spacing: 12px;
+                spacing: 10px;
 
                 HorizontalLayout {
                     spacing: 10px;
                     alignment: space-between;
                     HorizontalLayout {
                         horizontal-stretch: 1;
+                        min-width: 0px;
                         spacing: 10px;
                         Rectangle {
-                            width: 30px;
-                            height: 30px;
+                            width: 32px;
+                            height: 32px;
                             y: (parent.height - self.height) / 2;
                             border-radius: 8px;
                             background: #0D52BF22;
@@ -2539,20 +2778,34 @@ export component WindowOverlays inherits Rectangle {
                             LucideIcon {
                                 x: (parent.width - self.width) / 2;
                                 y: (parent.height - self.height) / 2;
-                                icon-size: 15px;
+                                icon-size: 16px;
                                 kind: "external";
                                 icon-color: root.theme-text-primary;
                             }
                         }
-                        Text {
+                        VerticalLayout {
                             horizontal-stretch: 1;
-                            text: "Open \"" + root.open-with-target-name + "\" With…";
-                            color: root.theme-text-primary;
-                            font-family: root.resolved-font-family;
-                            font-size: 14px + root.font-size-delta;
-                            font-weight: 700;
-                            wrap: word-wrap;
-                            vertical-alignment: center;
+                            min-width: 0px;
+                            spacing: 2px;
+                            alignment: center;
+                            Text {
+                                min-width: 0px;
+                                text: "Open With…";
+                                color: root.theme-text-primary;
+                                font-family: root.resolved-font-family;
+                                font-size: 14px + root.font-size-delta;
+                                font-weight: 700;
+                                overflow: elide;
+                            }
+                            Text {
+                                min-width: 0px;
+                                text: root.open-with-target-name;
+                                color: root.theme-text-secondary;
+                                font-family: root.resolved-font-family;
+                                font-size: 11.5px + root.font-size-delta * 0.5;
+                                font-weight: 500;
+                                overflow: elide;
+                            }
                         }
                     }
                     ToolbarButton {
@@ -2563,6 +2816,20 @@ export component WindowOverlays inherits Rectangle {
                             root.show-open-with-modal = false;
                             root.focus-key-router();
                         }
+                    }
+                }
+
+                CleanLineEdit {
+                    height: 28px + Math.max(0px, root.font-size-delta);
+                    text <=> root.open-with-filter;
+                    placeholder-text: "Filter applications…";
+                    font-size: 12px + root.font-size-delta * 0.5;
+                    edited(val) => {
+                        root.filter-open-with-apps(val);
+                    }
+                    escape-pressed => {
+                        root.show-open-with-modal = false;
+                        root.focus-key-router();
                     }
                 }
 
@@ -2577,13 +2844,13 @@ export component WindowOverlays inherits Rectangle {
                     ScrollView {
                         width: parent.width;
                         height: parent.height;
-                        viewport-height: Math.max(self.height, root.open-with-apps.length * (36px + root.font-size-delta * 1.5) + 12px);
+                        viewport-height: Math.max(self.height, root.open-with-apps.length * (46px + root.font-size-delta * 1.5) + 12px);
                         VerticalLayout {
                             padding: 6px;
                             spacing: 2px;
                             alignment: start;
                             for app[app-idx] in root.open-with-apps : Rectangle {
-                                height: 34px + Math.max(0px, root.font-size-delta * 1.5);
+                                height: 44px + Math.max(0px, root.font-size-delta * 1.5);
                                 border-radius: 6px;
                                 background: root.open-with-selected-idx == app-idx
                                     ? root.theme-accent
@@ -2594,27 +2861,55 @@ export component WindowOverlays inherits Rectangle {
                                     spacing: 10px;
                                     LucideIcon {
                                         y: (parent.height - self.height) / 2;
-                                        icon-size: 15px;
+                                        icon-size: 16px;
                                         kind: app.icon-kind != "" ? app.icon-kind : "applications";
                                         icon-color: root.open-with-selected-idx == app-idx ? #FFFFFF : root.theme-text-secondary;
                                     }
-                                    Text {
-                                        text: app.name;
-                                        color: root.open-with-selected-idx == app-idx ? #FFFFFF : root.theme-text-primary;
-                                        font-family: root.resolved-font-family;
-                                        font-size: 13px + root.font-size-delta;
-                                        font-weight: root.open-with-selected-idx == app-idx ? 700 : 500;
+                                    VerticalLayout {
                                         horizontal-stretch: 1;
-                                        overflow: elide;
-                                        vertical-alignment: center;
-                                    }
-                                    Text {
-                                        text: app.detail;
-                                        color: root.open-with-selected-idx == app-idx ? #E2E8F0 : root.theme-text-secondary;
-                                        font-family: root.resolved-font-family;
-                                        font-size: 11px + root.font-size-delta * 0.5;
-                                        vertical-alignment: center;
-                                        overflow: elide;
+                                        min-width: 0px;
+                                        spacing: 2px;
+                                        alignment: center;
+                                        HorizontalLayout {
+                                            spacing: 6px;
+                                            min-width: 0px;
+                                            Text {
+                                                text: app.name;
+                                                color: root.open-with-selected-idx == app-idx ? #FFFFFF : root.theme-text-primary;
+                                                font-family: root.resolved-font-family;
+                                                font-size: 13px + root.font-size-delta;
+                                                font-weight: root.open-with-selected-idx == app-idx ? 700 : 600;
+                                                horizontal-stretch: 1;
+                                                min-width: 0px;
+                                                overflow: elide;
+                                                vertical-alignment: center;
+                                            }
+                                            if app.is-default : Rectangle {
+                                                width: ow-def-txt.preferred-width + 10px;
+                                                height: 16px;
+                                                y: (parent.height - self.height) / 2;
+                                                border-radius: 8px;
+                                                background: root.open-with-selected-idx == app-idx ? #FFFFFF33 : #0D52BF44;
+                                                border-width: 1px;
+                                                border-color: root.open-with-selected-idx == app-idx ? #FFFFFF66 : root.theme-accent;
+                                                ow-def-txt := Text {
+                                                    text: "Default";
+                                                    color: #FFFFFF;
+                                                    font-size: 9.5px;
+                                                    font-weight: 700;
+                                                    horizontal-alignment: center;
+                                                    vertical-alignment: center;
+                                                }
+                                            }
+                                        }
+                                        Text {
+                                            min-width: 0px;
+                                            text: app.detail;
+                                            color: root.open-with-selected-idx == app-idx ? #E2E8F0 : root.theme-text-secondary;
+                                            font-family: root.resolved-font-family;
+                                            font-size: 11px + root.font-size-delta * 0.5;
+                                            overflow: elide;
+                                        }
                                     }
                                 }
                                 ow-app-touch := TouchArea {
@@ -2626,7 +2921,7 @@ export component WindowOverlays inherits Rectangle {
                                     double-clicked => {
                                         root.show-open-with-modal = false;
                                         root.focus-key-router();
-                                        root.confirm-open-with(app.id);
+                                        root.confirm-open-with(app.id, root.open-with-always-use);
                                     }
                                 }
                             }
@@ -2651,7 +2946,7 @@ export component WindowOverlays inherits Rectangle {
                         accepted(val) => {
                             root.show-open-with-modal = false;
                             root.focus-key-router();
-                            root.confirm-open-with(val);
+                            root.confirm-open-with(val, root.open-with-always-use);
                         }
                         escape-pressed => {
                             root.show-open-with-modal = false;
@@ -2660,36 +2955,64 @@ export component WindowOverlays inherits Rectangle {
                     }
                 }
 
+                if root.open-with-target-ext != "" : ViewOptionCheckboxRow {
+                    label: "Always open ." + root.open-with-target-ext + " files with this application";
+                    checked: root.open-with-always-use;
+                    accent-bg: root.theme-accent;
+                    surface-bg: root.theme-bg-surface;
+                    border-brush: root.theme-border;
+                    text-brush: root.theme-text-primary;
+                    font-family: root.resolved-font-family;
+                    toggled => {
+                        root.open-with-always-use = !root.open-with-always-use;
+                    }
+                }
+
                 Rectangle { height: 1px; background: root.theme-border; }
 
                 HorizontalLayout {
-                    alignment: end;
+                    alignment: space-between;
                     spacing: 10px;
-                    ToolbarButton {
-                        label: "Cancel";
-                        font-family: root.resolved-font-family;
-                        font-delta: root.font-size-delta;
-                        accent-bg: root.theme-accent;
-                        clicked => {
-                            root.show-open-with-modal = false;
-                            root.focus-key-router();
+                    HorizontalLayout {
+                        spacing: 8px;
+                        if root.open-with-has-custom-default : ToolbarButton {
+                            label: "Reset Default";
+                            font-family: root.resolved-font-family;
+                            font-delta: root.font-size-delta;
+                            accent-bg: root.theme-accent;
+                            clicked => {
+                                root.reset-open-with-default();
+                            }
                         }
                     }
-                    ToolbarButton {
-                        label: "Open";
-                        active: true;
-                        font-family: root.resolved-font-family;
-                        font-delta: root.font-size-delta;
-                        accent-bg: root.theme-accent;
-                        clicked => {
-                            root.show-open-with-modal = false;
-                            root.focus-key-router();
-                            if root.open-with-custom-cmd != "" {
-                                root.confirm-open-with(root.open-with-custom-cmd);
-                            } else if root.open-with-selected-idx >= 0 && root.open-with-selected-idx < root.open-with-apps.length {
-                                root.confirm-open-with(root.open-with-apps[root.open-with-selected-idx].id);
-                            } else {
-                                root.confirm-open-with("");
+                    HorizontalLayout {
+                        spacing: 10px;
+                        ToolbarButton {
+                            label: "Cancel";
+                            font-family: root.resolved-font-family;
+                            font-delta: root.font-size-delta;
+                            accent-bg: root.theme-accent;
+                            clicked => {
+                                root.show-open-with-modal = false;
+                                root.focus-key-router();
+                            }
+                        }
+                        ToolbarButton {
+                            label: "Open";
+                            active: true;
+                            font-family: root.resolved-font-family;
+                            font-delta: root.font-size-delta;
+                            accent-bg: root.theme-accent;
+                            clicked => {
+                                root.show-open-with-modal = false;
+                                root.focus-key-router();
+                                if root.open-with-custom-cmd != "" {
+                                    root.confirm-open-with(root.open-with-custom-cmd, root.open-with-always-use);
+                                } else if root.open-with-selected-idx >= 0 && root.open-with-selected-idx < root.open-with-apps.length {
+                                    root.confirm-open-with(root.open-with-apps[root.open-with-selected-idx].id, root.open-with-always-use);
+                                } else {
+                                    root.confirm-open-with("", root.open-with-always-use);
+                                }
                             }
                         }
                     }
@@ -6038,7 +6361,9 @@ export component WindowOverlays inherits Rectangle {
         border-radius: 14px;
         background: #202024EE;
         border-width: 1px;
-        border-color: root.drag-target-hint != "" ? root.theme-accent : #3A3A44;
+        border-color: root.drag-target-hint != ""
+            ? (root.drag-is-move ? #FF9F0A : root.theme-accent)
+            : #3A3A44;
         drop-shadow-offset-y: 4px;
         drop-shadow-blur: 12px;
         drop-shadow-color: #00000099;
@@ -6052,8 +6377,12 @@ export component WindowOverlays inherits Rectangle {
             LucideIcon {
                 y: (parent.height - self.height) / 2;
                 icon-size: 13px;
-                kind: root.drag-target-hint != "" ? "folder" : "copy";
-                icon-color: root.drag-target-hint != "" ? #E1E1E6 : #B4B4BE;
+                kind: root.drag-target-hint != ""
+                    ? (root.drag-is-move ? "scissors" : "folder")
+                    : (root.drag-is-move ? "scissors" : "copy");
+                icon-color: root.drag-target-hint != ""
+                    ? (root.drag-is-move ? #FFD60A : #E1E1E6)
+                    : #B4B4BE;
             }
 
             Text {
@@ -6067,7 +6396,7 @@ export component WindowOverlays inherits Rectangle {
 
             if root.drag-target-hint != "" : Text {
                 text: root.drag-target-hint;
-                color: #B4B4BE;
+                color: root.drag-is-move ? #FFD60A : #B4B4BE;
                 font-size: 11px;
                 font-weight: 600;
                 vertical-alignment: center;

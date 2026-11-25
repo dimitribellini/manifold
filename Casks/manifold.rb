@@ -1,6 +1,6 @@
 cask "manifold" do
-  version "0.7.8"
-  sha256 "b4e57693a4ed8ac184220830e75b90be89bbc7b46eaf0800e9d2b7f92ab43050"
+  version "0.8.0"
+  sha256 "162ec7b66da9cdd7e509acb009e661d76779d64713231868858eebef3ad516ef"
 
   url "https://github.com/dimitribellini/manifold/releases/download/v#{version}/manifold-v#{version}-macos-arm64.tar.gz"
   name "Manifold"
@@ -8,7 +8,7 @@ cask "manifold" do
   homepage "https://github.com/dimitribellini/manifold"
 
   depends_on arch: :arm64
-  depends_on macos: ">= :big_sur"
+  depends_on macos: :big_sur
 
   app "Manifold.app"
 

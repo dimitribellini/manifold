@@ -64,13 +64,14 @@ Expand-Archive -Path manifold-windows-x86_64.zip -DestinationPath .
 
 ## Features
 
-- **Single & Dual-Pane Layouts**: Switch between single, side-by-side, and top/bottom dual panes (`Cmd/Ctrl + Alt + T`) with independent per-tab history and automatic session restore.
+- **Single & Dual-Pane Layouts**: Switch between single, side-by-side, and top/bottom dual panes (`Cmd/Ctrl + Alt + T`) with independent per-tab history, non-blocking background tab loading, and automatic session restore.
 - **Four View Modes**: Browse `500,000+` entry directories smoothly in **Icons**, **List**, **Columns** (Miller view), or **Tree** (`Cmd/Ctrl + 1..4`).
 - **Recursive Search**: Filter the current folder and subfolders using wildcards (`*`, `?`), and jump to any result's parent folder with **Show in Enclosing Folder**.
+- **Context Menus & Open With…**: Compact right-click menus with cascading submenus (**Open With ▸**, **New ▸**, **More Actions ▸**) and per-file-type default application persistence (`Always open .ext files with this application`).
 - **Inspector & Quick Look**: Inspect file metadata, media details, color tags, and `R/W/X` permissions (`Cmd/Ctrl + I`), or preview files with `Space`.
 - **Built-in Terminal**: Integrated terminal drawer (`>_`) running your local shell (`zsh`, `bash`, `PowerShell`) or an interactive remote `ssh` session when browsing SFTP servers, with one-click **Sync CWD**.
 - **Archives & Packages**: Create `.zip` and `.tar.gz` archives, browse `.zip` and `.tar.*` archives virtually in place (`archive://`) or via **Show Archive Contents**, and safely extract `.zip`, `.tar.*`, `.7z`, `.rar`, `.gz`, `.bz2`, and `.xz` files with automatic Zip-Slip/Tar-Slip traversal protection.
-- **File Transfers**: Background copy and move queue with transactional `.part` staging, Pause/Resume/Cancel controls, a 5-stop bandwidth rate-limiting slider (`Unlimited`, `5`, `20`, `50`, `100 MB/s`), conflict resolution (`Replace`, `Replace Older`, `Keep Both`, `Skip`), and remote edit-in-place with automatic SHA-256 re-upload.
+- **File Transfers & Drag-and-Drop**: Background copy and move queue with transactional `.part` staging, Pause/Resume/Cancel controls, a 5-stop bandwidth rate-limiting slider (`Unlimited`, `5`, `20`, `50`, `100 MB/s`), conflict resolution (`Replace`, `Replace Older`, `Keep Both`, `Skip`), remote edit-in-place with automatic SHA-256 re-upload, and `Ctrl`/`Cmd`+Drag to force-move (`Alt`/Option+Drag to force-copy) across panes, tabs, folders, and sidebar targets.
 - **Multi-Rename & Directory Sync**: Multi-step batch file renamer with saved presets and live preview (`F2` with multiple items selected), plus an interactive **Directory Sync & Diff** preview accessible from the top toolbar or `Cmd/Ctrl + Shift + Y`.
 - **Themes & Fonts**: Six built-in color themes and adjustable UI font family, size, and weight (`Cmd/Ctrl + ,`).
 

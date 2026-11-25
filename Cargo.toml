@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.7.8"
+version = "0.8.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Manifold Contributors"]
@@ -82,6 +82,9 @@ incremental = false
 [profile.test]
 debug = 0
 incremental = false
+
+[profile.test.package.manifold-ui]
+codegen-units = 256
 
 [profile.release]
 debug = false

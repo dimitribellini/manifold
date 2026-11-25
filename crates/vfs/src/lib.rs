@@ -839,19 +839,49 @@ impl LocalFsBackend {
     }
 
     fn build_metadata(&self, path: &Path) -> Result<FileMetadata, VfsError> {
-        let sym_meta = fs::symlink_metadata(path).map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => VfsError::NotFound(path.display().to_string()),
-            std::io::ErrorKind::PermissionDenied => {
-                VfsError::PermissionDenied(path.display().to_string())
-            }
-            _ => VfsError::IoError(e),
-        })?;
+        self.build_metadata_with_opts(path, None, true)
+    }
 
-        let is_symlink = sym_meta.file_type().is_symlink();
-        let target_meta = if is_symlink {
-            fs::metadata(path).unwrap_or(sym_meta)
+    fn build_metadata_from_dir_entry(
+        &self,
+        entry: &fs::DirEntry,
+    ) -> Result<FileMetadata, VfsError> {
+        let path = entry.path();
+        let sym_meta = if let Ok(ft) = entry.file_type() {
+            if ft.is_symlink() {
+                None
+            } else {
+                entry.metadata().ok()
+            }
         } else {
-            sym_meta
+            None
+        };
+        self.build_metadata_with_opts(&path, sym_meta, false)
+    }
+
+    fn build_metadata_with_opts(
+        &self,
+        path: &Path,
+        preloaded_non_symlink_meta: Option<fs::Metadata>,
+        compute_bundle_size: bool,
+    ) -> Result<FileMetadata, VfsError> {
+        let (is_symlink, target_meta) = if let Some(meta) = preloaded_non_symlink_meta {
+            (false, meta)
+        } else {
+            let sym_meta = fs::symlink_metadata(path).map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => VfsError::NotFound(path.display().to_string()),
+                std::io::ErrorKind::PermissionDenied => {
+                    VfsError::PermissionDenied(path.display().to_string())
+                }
+                _ => VfsError::IoError(e),
+            })?;
+            let is_sym = sym_meta.file_type().is_symlink();
+            let t_meta = if is_sym {
+                fs::metadata(path).unwrap_or(sym_meta)
+            } else {
+                sym_meta
+            };
+            (is_sym, t_meta)
         };
         let is_dir = target_meta.is_dir();
 
@@ -870,7 +900,10 @@ impl LocalFsBackend {
                 .and_then(|cache| cache.get(path).copied());
             if cached.is_some() {
                 cached
-            } else if cfg!(target_os = "macos") && extension.as_deref() == Some("app") {
+            } else if compute_bundle_size
+                && cfg!(target_os = "macos")
+                && extension.as_deref() == Some("app")
+            {
                 let total = shallow_dir_bundle_size(path, 3);
                 if let Ok(mut guard) = self.dir_size_cache.write() {
                     guard.insert(path.to_path_buf(), total);
@@ -1055,7 +1088,7 @@ impl FileSystemBackend for LocalFsBackend {
         let mut items = Vec::new();
         for entry in read_dir {
             let entry = entry?;
-            if let Ok(meta) = self.build_metadata(&entry.path()) {
+            if let Ok(meta) = self.build_metadata_from_dir_entry(&entry) {
                 items.push(meta);
             }
         }

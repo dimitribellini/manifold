@@ -178,11 +178,24 @@ fn test_external_directory_fingerprint_detects_new_and_deleted_entries() {
     rt.local_vfs.create_dir(watch_dir).unwrap();
     rt.navigate_to_path(false, watch_dir.to_string());
 
-    assert!(!rt.poll_external_directory_changes());
+    let pump_watch = |rt: &mut GuiRuntime| -> bool {
+        rt.request_bg_external_dir_watch();
+        let mut changed = false;
+        for _ in 0..100 {
+            changed |= rt.poll_bg_dir_watch();
+            if !rt.watch_in_flight {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        changed
+    };
+
+    assert!(!pump_watch(&mut rt));
 
     let ext_file = format!("{watch_dir}/created_outside.txt");
     std::fs::write(&ext_file, b"hello").unwrap();
-    assert!(rt.poll_external_directory_changes());
+    assert!(pump_watch(&mut rt));
     let found_after_add = rt
         .left_entries
         .iter()
@@ -190,7 +203,7 @@ fn test_external_directory_fingerprint_detects_new_and_deleted_entries() {
     assert!(found_after_add);
 
     std::fs::remove_file(&ext_file).unwrap();
-    assert!(rt.poll_external_directory_changes());
+    assert!(pump_watch(&mut rt));
     let found_after_del = rt
         .left_entries
         .iter()
@@ -862,12 +875,16 @@ fn test_v070_per_tab_history_split_vertical_drop_and_500k_window_slice() {
     // 2. BUG-04 & GAP-07: Non-macOS edge drag does NOT trigger external drop, and SplitVertical
     // resolves drops in the bottom pane to the Right/Bottom pane directory.
     let items = [sample_meta("payload.bin")];
+    let no_ext_opts = DragDropOptions {
+        allow_external_os_drop: false,
+        modifier_mode: DragModifierMode::Default,
+    };
     let edge_non_mac = rt.resolve_drop_target_for_os(
         false,
         &items,
         (4.0, 300.0, 700.0, 0.0, 0.0),
         (200.0, 1280.0, 800.0),
-        false,
+        no_ext_opts,
     );
     assert!(edge_non_mac.dst_dir.is_none());
 
@@ -881,7 +898,7 @@ fn test_v070_per_tab_history_split_vertical_drop_and_500k_window_slice() {
         &items,
         (500.0, 650.0, 900.0, 0.0, 0.0),
         (200.0, 1280.0, 800.0),
-        false,
+        no_ext_opts,
     );
     assert_eq!(bottom_drop.dst_dir.as_deref(), Some(dir_c.as_str()));
     assert!(bottom_drop.hover_right_pane);
@@ -1148,4 +1165,144 @@ fn test_archive_virtual_copy_preserves_macos_app_executable_bit() {
         assert_ne!(mode & 0o111, 0, "expected +x mode on Contents/MacOS/Mini");
     }
     let _ = std::fs::remove_dir_all(&work_dir);
+}
+
+#[test]
+fn test_drag_modifier_force_move_and_force_copy() {
+    let mut rt = GuiRuntime::new(ManifoldAppState::new_reference_workspace());
+    rt.app_state.dual_pane_enabled = true;
+    rt.app_state.panes_layout = PanesLayout::SplitHorizontal;
+    let items = vec![sample_meta("archive.tar.gz")];
+    let bounds = (205.0, 1400.0, 860.0);
+    // Drop onto Right Pane viewport -> normally Copy, ForceMove -> Move
+    let coords = (1050.0, 320.0, 560.0, 0.0, 0.0);
+
+    let def_res = rt.resolve_drop_target_for_os(
+        false,
+        &items,
+        coords,
+        bounds,
+        DragDropOptions {
+            allow_external_os_drop: false,
+            modifier_mode: DragModifierMode::Default,
+        },
+    );
+    assert!(def_res.dst_dir.is_some());
+    assert!(!def_res.is_move);
+    assert!(def_res.dst_label.starts_with("Copy → "));
+
+    let move_res = rt.resolve_drop_target_for_os(
+        false,
+        &items,
+        coords,
+        bounds,
+        DragDropOptions {
+            allow_external_os_drop: false,
+            modifier_mode: DragModifierMode::ForceMove,
+        },
+    );
+    assert_eq!(move_res.dst_dir, def_res.dst_dir);
+    assert!(move_res.is_move);
+    assert!(move_res.dst_label.starts_with("Move → "));
+
+    // Drop onto Sidebar favorite -> ForceMove sets is_move = true
+    let sb_coords = (80.0, 180.0, 560.0, 0.0, 0.0);
+    let sb_move = rt.resolve_drop_target_for_os(
+        false,
+        &items,
+        sb_coords,
+        bounds,
+        DragDropOptions {
+            allow_external_os_drop: false,
+            modifier_mode: DragModifierMode::ForceMove,
+        },
+    );
+    if sb_move.dst_dir.is_some() {
+        assert!(sb_move.is_move);
+        assert!(sb_move.dst_label.starts_with("Move → "));
+    }
+}
+
+#[test]
+fn test_discover_open_with_marks_default_and_custom_cmd() {
+    let mut pdf = sample_meta("contract.pdf");
+    pdf.extension = Some("pdf".to_string());
+
+    let def_apps = discover_open_with_apps_with_default(&pdf, None);
+    assert_eq!(def_apps[0].id.as_str(), "__DEFAULT__");
+    assert!(def_apps[0].is_default);
+
+    let custom = "my-custom-pdf-viewer --single";
+    let custom_apps = discover_open_with_apps_with_default(&pdf, Some(custom));
+    assert!(!custom_apps[0].is_default);
+    let custom_entry = custom_apps
+        .iter()
+        .find(|a| a.id.as_str() == custom)
+        .expect("custom app inserted");
+    assert!(custom_entry.is_default);
+
+    let quick = discover_quick_open_with_apps(&pdf, Some(custom));
+    assert!(quick
+        .iter()
+        .any(|a| a.id.as_str() == custom && a.is_default));
+}
+
+#[test]
+fn test_scoped_cache_invalidation_and_async_dir_load_generations() {
+    let mut rt = GuiRuntime::new(ManifoldAppState::new_reference_workspace());
+    let dir_a = "/tmp/manifold_cache_scope_a";
+    let dir_b = "/tmp/manifold_cache_scope_b";
+    let _ = std::fs::remove_dir_all(dir_a);
+    let _ = std::fs::remove_dir_all(dir_b);
+    std::fs::create_dir_all(dir_a).unwrap();
+    std::fs::create_dir_all(dir_b).unwrap();
+    std::fs::write(format!("{dir_a}/alpha.txt"), b"a").unwrap();
+    std::fs::write(format!("{dir_b}/beta.txt"), b"b").unwrap();
+
+    let _ = rt.list_raw_dir_cached(dir_a);
+    let _ = rt.list_raw_dir_cached(dir_b);
+    assert!(rt.dir_cache.borrow().contains_key(dir_a));
+    assert!(rt.dir_cache.borrow().contains_key(dir_b));
+
+    rt.invalidate_dir_paths(&[dir_a]);
+    assert!(!rt.dir_cache.borrow().contains_key(dir_a));
+    assert!(rt.dir_cache.borrow().contains_key(dir_b));
+
+    // Verify generation guard discards stale directory load events
+    rt.navigate_to_path(false, dir_a.to_string());
+    let cur_gen = rt.left_dir_load_gen.load(Ordering::Relaxed);
+    let _ = rt.dir_load_tx.send(BgDirLoadEvent {
+        is_right: false,
+        gen_id: cur_gen.wrapping_add(99),
+        dir_path: dir_a.to_string(),
+        entries: vec![sample_meta("stale_entry.txt")],
+        fingerprint: Some(42),
+        mtime: None,
+        vol_stats: None,
+    });
+    assert!(!rt.poll_bg_dir_loads());
+    assert!(!rt
+        .left_entries
+        .iter()
+        .any(|e| e.meta.name == "stale_entry.txt"));
+
+    // Verify matching generation applies entries cleanly
+    let fresh = vec![sample_meta("alpha.txt"), sample_meta("gamma.txt")];
+    let fp = compute_dir_fingerprint_from_meta(&fresh);
+    rt.left_dir_loading = true;
+    let _ = rt.dir_load_tx.send(BgDirLoadEvent {
+        is_right: false,
+        gen_id: cur_gen,
+        dir_path: dir_a.to_string(),
+        entries: fresh,
+        fingerprint: Some(fp),
+        mtime: None,
+        vol_stats: None,
+    });
+    assert!(rt.poll_bg_dir_loads());
+    assert!(!rt.left_dir_loading);
+    assert!(rt.left_entries.iter().any(|e| e.meta.name == "gamma.txt"));
+
+    let _ = std::fs::remove_dir_all(dir_a);
+    let _ = std::fs::remove_dir_all(dir_b);
 }

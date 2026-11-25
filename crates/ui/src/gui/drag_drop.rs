@@ -1,5 +1,31 @@
 use super::*;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(super) enum DragModifierMode {
+    #[default]
+    Default,
+    ForceMove,
+    ForceCopy,
+}
+
+impl DragModifierMode {
+    pub(super) const fn from_flags(force_move: bool, force_copy: bool) -> Self {
+        if force_move {
+            Self::ForceMove
+        } else if force_copy {
+            Self::ForceCopy
+        } else {
+            Self::Default
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct DragDropOptions {
+    pub(super) allow_external_os_drop: bool,
+    pub(super) modifier_mode: DragModifierMode,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(super) struct ResolvedDropTarget {
     pub(super) dst_dir: Option<String>,
@@ -12,6 +38,23 @@ pub(super) struct ResolvedDropTarget {
     pub(super) hover_right_row: i32,
     pub(super) hover_left_pane: bool,
     pub(super) hover_right_pane: bool,
+}
+
+fn format_drop_hint(is_move: bool, target_name: &str) -> String {
+    if is_move {
+        format!("Move → {target_name}")
+    } else {
+        format!("Copy → {target_name}")
+    }
+}
+
+fn apply_drag_modifier(res: &mut ResolvedDropTarget, target_name: &str, mode: DragModifierMode) {
+    match mode {
+        DragModifierMode::ForceMove => res.is_move = true,
+        DragModifierMode::ForceCopy => res.is_move = false,
+        DragModifierMode::Default => {}
+    }
+    res.dst_label = format_drop_hint(res.is_move, target_name);
 }
 
 impl GuiRuntime {
@@ -41,7 +84,11 @@ impl GuiRuntime {
         coords: (f32, f32, f32, f32, f32),
         bounds: (f32, f32, f32),
     ) -> ResolvedDropTarget {
-        self.resolve_drop_target_for_os(from_right, items, coords, bounds, true)
+        let opts = DragDropOptions {
+            allow_external_os_drop: true,
+            modifier_mode: DragModifierMode::Default,
+        };
+        self.resolve_drop_target_for_os(from_right, items, coords, bounds, opts)
     }
 
     pub(super) fn resolve_drop_target_for_os(
@@ -50,7 +97,7 @@ impl GuiRuntime {
         items: &[FileMetadata],
         coords: (f32, f32, f32, f32, f32),
         bounds: (f32, f32, f32),
-        allow_external_os_drop: bool,
+        opts: DragDropOptions,
     ) -> ResolvedDropTarget {
         let mut res = ResolvedDropTarget {
             dst_dir: None,
@@ -75,7 +122,7 @@ impl GuiRuntime {
             || abs_y < 14.0
             || (win_w > 120.0 && abs_x > win_w - 14.0)
             || (win_h > 120.0 && abs_y > win_h - 14.0);
-        if is_outside_window && allow_external_os_drop {
+        if is_outside_window && opts.allow_external_os_drop {
             res.dst_dir = Some("__EXTERNAL_OS_DROP__".to_string());
             res.dst_label = "→ Drop Outside Manifold (OS Drag & Drop)".to_string();
             return res;
@@ -100,8 +147,8 @@ impl GuiRuntime {
                         let target = vfs_url_to_target(&item.vfs_url);
                         if !target.is_empty() && target != "connect://dialog" {
                             res.dst_dir = Some(target);
-                            res.dst_label = format!("→ {}", item.label);
                             res.hover_sidebar_idx = sb_idx as i32;
+                            apply_drag_modifier(&mut res, &item.label, opts.modifier_mode);
                             return res;
                         }
                     }
@@ -112,8 +159,8 @@ impl GuiRuntime {
                             let target = vfs_url_to_target(&child.vfs_url);
                             if !target.is_empty() && target != "connect://dialog" {
                                 res.dst_dir = Some(target);
-                                res.dst_label = format!("→ {}", child.label);
                                 res.hover_sidebar_idx = sb_idx as i32;
+                                apply_drag_modifier(&mut res, &child.label, opts.modifier_mode);
                                 return res;
                             }
                         }
@@ -181,7 +228,8 @@ impl GuiRuntime {
                 };
                 if let Some(tab) = tab_opt {
                     res.dst_dir = Some(tab.current_path.clone());
-                    res.dst_label = format!("→ Tab: {}", tab.title);
+                    let tab_lbl = format!("Tab: {}", tab.title);
+                    apply_drag_modifier(&mut res, &tab_lbl, opts.modifier_mode);
                     if target_is_right {
                         res.hover_right_tab = tab_idx as i32;
                     } else {
@@ -203,12 +251,8 @@ impl GuiRuntime {
             };
             let title = vfs_display_title(&dst);
             res.dst_dir = Some(dst);
-            res.dst_label = if same_pane {
-                format!("Move to {title}")
-            } else {
-                format!("→ {title}")
-            };
             res.is_move = same_pane;
+            apply_drag_modifier(&mut res, &title, opts.modifier_mode);
             if target_is_right {
                 res.hover_right_pane = true;
             } else {
@@ -287,12 +331,8 @@ impl GuiRuntime {
                 if valid_folder {
                     let same_pane = target_is_right == from_right;
                     res.dst_dir = Some(entry.meta.path.clone());
-                    res.dst_label = if same_pane {
-                        format!("Move to {}", entry.meta.name)
-                    } else {
-                        format!("→ {}", entry.meta.name)
-                    };
                     res.is_move = same_pane;
+                    apply_drag_modifier(&mut res, &entry.meta.name, opts.modifier_mode);
                     if target_is_right {
                         res.hover_right_row = hovered_idx as i32;
                     } else {
@@ -307,8 +347,8 @@ impl GuiRuntime {
             let dst = self.current_pane_path(target_is_right);
             let title = vfs_display_title(&dst);
             res.dst_dir = Some(dst);
-            res.dst_label = format!("→ {title}");
             res.is_move = false;
+            apply_drag_modifier(&mut res, &title, opts.modifier_mode);
             if target_is_right {
                 res.hover_right_pane = true;
             } else {
@@ -322,8 +362,8 @@ impl GuiRuntime {
             if from_sub {
                 let title = vfs_display_title(&pane_dir);
                 res.dst_dir = Some(pane_dir);
-                res.dst_label = format!("Move to {title}");
                 res.is_move = true;
+                apply_drag_modifier(&mut res, &title, opts.modifier_mode);
                 if target_is_right {
                     res.hover_right_pane = true;
                 } else {
@@ -552,7 +592,9 @@ impl GuiRuntime {
             };
             let toast = format!("{label} to {dst_title}");
             self.start_tracked_task(&label, &batch.dst_dir, batch.sync_bytes, toast, "success");
-            self.invalidate_dir_cache();
+            let l_cur = self.current_pane_path(false);
+            let r_cur = self.current_pane_path(true);
+            self.invalidate_dir_paths(&[&batch.dst_dir, &l_cur, &r_cur]);
             self.reload_pane_entries(false);
             self.reload_pane_entries(true);
         }
